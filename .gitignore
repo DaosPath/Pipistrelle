@@ -1,0 +1,6 @@
+/target
+/credentials.json
+/pipistrelle.db
+/pipistrelle.db-journal
+/pipistrelle.db-wal
+/*.pem

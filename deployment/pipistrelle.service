@@ -1,0 +1,18 @@
+[Unit]
+Description=Pipistrelle High-Performance MQTT v5.0 Broker
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pipistrelle
+Restart=always
+RestartSec=5
+# Run under a low-privilege user for security
+User=nobody
+Group=nogroup
+
+# Optimization for Orange Pi / Raspberry Pi to handle many concurrent TCP connections
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

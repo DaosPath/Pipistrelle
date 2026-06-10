@@ -1,0 +1,3 @@
+# Configuration for cross-compiling Pipistrelle with bundled SQLite (C dependency) to ARM64
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
