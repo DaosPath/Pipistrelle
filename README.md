@@ -1,4 +1,4 @@
-# <svg width="36" height="36" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M12 21C12 21 8.5 17.5 3 17.5C3 12.5 5 9 10 9C9 7.5 9.5 5.5 11 4.5C11.5 5.5 12 5.5 12 5.5C12 5.5 12.5 5.5 13 4.5C14.5 5.5 15 7.5 14 9C19 9 21 12.5 21 17.5C15.5 17.5 12 21 12 21Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg> Pipistrelle MQTT v5.0 Broker
+# <img src="https://api.iconify.design/mdi:bat.svg?color=%233b82f6" width="36" height="36" style="vertical-align: middle; margin-right: 8px;" /> Pipistrelle MQTT v5.0 Broker
 
 ¡Bienvenido a **Pipistrelle**, un broker MQTT v5.0 ultraligero y de alto rendimiento escrito en **Rust**! Diseñado específicamente para sistemas embebidos, computadoras de placa única (SBCs como Raspberry Pi u Orange Pi) y entornos de producción modernos. 
 
@@ -6,7 +6,7 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z" stroke="currentColor" stroke-width="2"/><path d="M12 6L9 11H15L12 6Z" fill="currentColor"/><path d="M12 11V16" stroke="currentColor" stroke-width="2"/></svg> Características Destacadas
+## <img src="https://api.iconify.design/lucide:rocket.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Características Destacadas
 
 *   **Arquitectura Zero-Copy & Concurrente:** El decodificador de paquetes (`src/codec.rs`) realiza cortes de memoria (*slices*) directamente del búfer de red utilizando tiempos de vida de Rust, minimizando las asignaciones de memoria y maximizando el rendimiento bajo alta concurrencia de clientes.
 *   **Criptografía Post-Cuántica (PQC) TLS 1.3:** Integrado con `tokio-rustls` y el proveedor criptográfico `aws-lc-rs`, priorizando el algoritmo híbrido **`X25519MLKEM768`** para proteger tus comunicaciones IoT contra futuras amenazas de descifrado cuántico.
@@ -19,7 +19,7 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><rect x="3" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2"/><rect x="14" y="3" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2"/><rect x="8.5" y="14" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="2"/><path d="M6.5 10V12H8.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M17.5 10V12H15.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> Arquitectura del Sistema
+## <img src="https://api.iconify.design/lucide:network.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Arquitectura del Sistema
 
 El broker está estructurado de manera modular para garantizar legibilidad y escalabilidad:
 
@@ -44,7 +44,7 @@ graph TD
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M21 7.5L12 3L3 7.5L12 12L21 7.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M3 7.5V16.5L12 21V12L3 7.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M21 7.5V16.5L12 21V12L21 7.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg> Despliegue con Docker Compose
+## <img src="https://api.iconify.design/simple-icons:docker.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Despliegue con Docker Compose
 
 El broker se distribuye mediante un contenedor Docker multi-etapa optimizado que reduce al mínimo el tamaño de la imagen y garantiza compatibilidad con la librería de C de SQLite.
 
@@ -75,7 +75,7 @@ El contenedor iniciará y levantará los siguientes servicios expuestos al host:
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M4 6H14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M20 6H18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="6" r="2" stroke="currentColor" stroke-width="2"/><path d="M4 12H8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M20 12H12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="10" cy="12" r="2" stroke="currentColor" stroke-width="2"/><path d="M4 18H16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M20 18H20" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="18" cy="18" r="2" stroke="currentColor" stroke-width="2"/></svg> Variables de Entorno y Configuración
+## <img src="https://api.iconify.design/lucide:sliders.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Variables de Entorno y Configuración
 
 Puedes personalizar el comportamiento del broker modificando las variables de entorno dentro del archivo `docker-compose.yml`:
 
@@ -93,7 +93,7 @@ Puedes personalizar el comportamiento del broker modificando las variables de en
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><circle cx="8" cy="12" r="4" stroke="currentColor" stroke-width="2"/><path d="M12 12H20V15H18V12.5H16V15H14V12H12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Gestión de Usuarios y ACLs
+## <img src="https://api.iconify.design/lucide:key-round.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Gestión de Usuarios y ACLs
 
 Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. A continuación, se muestra un ejemplo básico con permisos granulares:
 
@@ -133,7 +133,7 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M9 3H15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M10 3V10L6 18C5 20 6.5 21 8.5 21H15.5C17.5 21 19 20 18 18L14 10V3" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg> Pruebas de Integración
+## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración
 
 Pipistrelle incluye un completo conjunto de pruebas de integración automatizadas escritas en Python para validar todos sus puertos expuestos.
 
@@ -158,7 +158,7 @@ El script validará automáticamente los siguientes 6 escenarios:
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M18.5 4L16 6.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M14 8.5L5.5 17C4 18.5 4 20 5.5 20C7 21.5 8.5 21.5 10 20L18.5 11.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M8 6L11 9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M15 13L18 16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> Conexión con Simulación Wokwi (ESP32)
+## <img src="https://api.iconify.design/lucide:cpu.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Conexión con Simulación Wokwi (ESP32)
 
 Si tienes un proyecto de simulación IoT en VS Code con **Wokwi** (utilizando la biblioteca `PubSubClient` de Arduino), puedes apuntarlo directamente a tu máquina host:
 
@@ -173,7 +173,7 @@ Si tienes un proyecto de simulación IoT en VS Code con **Wokwi** (utilizando la
 
 ---
 
-## <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align: middle; margin-right: 8px;"><path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z" stroke="currentColor" stroke-width="2"/><path d="M9 12L11 14L15 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> Licencia
+## <img src="https://api.iconify.design/lucide:scale.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Licencia
 
 Este proyecto se distribuye bajo la licencia **MIT**. Consulta el archivo [LICENSE](file:///C:/Hijosdelsol/pipistrelle/LICENSE) para más detalles.
 
