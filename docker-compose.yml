@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  pipistrelle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pipistrelle_broker
+    command: ["--cert", "/app/config/cert.pem", "--key", "/app/config/key.pem"]
+    restart: unless-stopped
+    ports:
+      - "1883:1883" # Plain TCP MQTT
+      - "8883:8883" # Secure TLS MQTT (Auto-Quantum)
+      - "8083:8083" # WebSockets MQTT
+      - "9095:9090" # Prometheus Metrics Exporter
+    environment:
+      - PIPISTRELLE_PORT_TCP=1883
+      - PIPISTRELLE_PORT_TLS=8883
+      - PIPISTRELLE_PORT_WS=8083
+      - PIPISTRELLE_PORT_METRICS=9090
+      - PIPISTRELLE_DB_PATH=/app/data/pipistrelle.db
+      - PIPISTRELLE_CREDENTIALS_PATH=/app/config/credentials.json
+      # Bridge parameters (Optional - uncomment and configure to enable bridging)
+      - PIPISTRELLE_BRIDGE_HOST=f1e5c65e95904262b7153afb0b8a0c11.s1.eu.hivemq.cloud
+      - PIPISTRELLE_BRIDGE_USER=Jordy123
+      - PIPISTRELLE_BRIDGE_PASS=Jordy123
+    volumes:
+      - ./config:/app/config # Store credentials.json and optionally cert.pem/key.pem
+      - ./data:/app/data     # Persist the SQLite WAL database
+    working_dir: /app

@@ -102,6 +102,11 @@ pub struct BrokerState {
     pub db: Arc<crate::persistence::Persistence>,
     // Round-robin counters for shared subscription groups
     shared_group_counters: RwLock<HashMap<String, AtomicUsize>>,
+    // Prometheus Metrics
+    pub metrics_messages_published: AtomicUsize,
+    pub metrics_subscriptions: AtomicUsize,
+    // Bridge channel
+    pub bridge_sender: RwLock<Option<mpsc::UnboundedSender<(String, Vec<u8>)>>>,
 }
 
 impl BrokerState {
@@ -112,6 +117,9 @@ impl BrokerState {
             auth: crate::config::AuthConfig::load(),
             db: Arc::new(crate::persistence::Persistence::new()),
             shared_group_counters: RwLock::new(HashMap::new()),
+            metrics_messages_published: AtomicUsize::new(0),
+            metrics_subscriptions: AtomicUsize::new(0),
+            bridge_sender: RwLock::new(None),
         }
     }
 
@@ -216,6 +224,7 @@ impl BrokerState {
 
     /// Processes subscription request and registers it in the router
     pub fn subscribe(&self, client_id: &str, topic_filter: &str, qos: u8, subscription_identifier: Option<u32>) {
+        self.metrics_subscriptions.fetch_add(1, Ordering::Relaxed);
         self.router.subscribe(client_id, topic_filter, qos, subscription_identifier);
         debug!("Client {} subscribed to {} with QoS {}", client_id, topic_filter, qos);
 
@@ -245,8 +254,16 @@ impl BrokerState {
         removed
     }
 
-    /// Routes a PUBLISH packet to all matching subscribers (normal and shared)
     pub fn route_publish(&self, _from_client: &str, topic: &str, payload: &[u8], qos: u8, retain: bool) {
+        self.metrics_messages_published.fetch_add(1, Ordering::Relaxed);
+        
+        // Forward local publish to the bridge if it didn't originate from the bridge itself
+        if _from_client != "bridge_client" {
+            if let Some(tx) = &*self.bridge_sender.read() {
+                let _ = tx.send((topic.to_string(), payload.to_vec()));
+            }
+        }
+
         let route = self.router.match_topic(topic);
 
         // 1. Deliver to normal subscribers
@@ -331,4 +348,23 @@ impl BrokerState {
             }
         }
     }
+
+    /// Gracefully disconnects all active client sessions.
+    pub fn graceful_shutdown(&self) {
+        info!("Gracefully disconnecting all clients...");
+        let sessions = self.sessions.read();
+        for (client_id, session) in sessions.iter() {
+            let disconnect_pkt = Packet::Disconnect(crate::codec::Disconnect {
+                reason_code: 0x00, // Normal disconnection
+                properties: Default::default(),
+            });
+            let mut buf = Vec::new();
+            encode_packet(&disconnect_pkt, &mut buf);
+            if let Err(e) = session.sender.send(buf) {
+                debug!("Failed to send DISCONNECT to client {}: {}", client_id, e);
+            }
+        }
+        info!("Sent DISCONNECT to all connected clients.");
+    }
 }
+
