@@ -5,4 +5,7 @@
 /pipistrelle.db-wal
 /pipistrelle.db-shm
 /*.pem
+/config/credentials.json
+/config/*.pem
+/data/
 

@@ -9,7 +9,9 @@ pub struct Persistence {
 
 impl Persistence {
     pub fn new() -> Self {
-        let conn = Connection::open("pipistrelle.db").expect("Failed to open database pipistrelle.db");
+        let db_path = std::env::var("PIPISTRELLE_DB_PATH")
+            .unwrap_or_else(|_| "pipistrelle.db".to_string());
+        let conn = Connection::open(&db_path).expect(&format!("Failed to open database {}", db_path));
         
         // Configure WAL (Write-Ahead Logging) mode and synchronous normal to resist sudden power losses on ARM
         conn.execute_batch(
@@ -52,7 +54,7 @@ impl Persistence {
             [],
         ).expect("Failed to create in_flight table");
 
-        info!("SQLite persistence engine initialized (pipistrelle.db)");
+        info!("SQLite persistence engine initialized ({})", db_path);
 
         Self {
             conn: Arc::new(Mutex::new(conn)),

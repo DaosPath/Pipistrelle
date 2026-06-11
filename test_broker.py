@@ -221,7 +221,7 @@ def run_test_admin_tls():
     try:
         # We set check_hostname to False because CN=localhost and we might connect using 'localhost' or '127.0.0.1'
         # cert.pem contains the public certificate to trust.
-        client.tls_set(ca_certs="cert.pem", certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS_CLIENT)
+        client.tls_set(ca_certs="config/cert.pem", certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS_CLIENT)
         # Disable hostname verification for self-signed certificates in local tests if needed, 
         # but we set CN=localhost so it should match 'localhost'
         client.tls_insecure_set(True)
@@ -281,6 +281,90 @@ def run_test_admin_tls():
     client.loop_stop()
     return False
 
+def run_test_websockets():
+    print("\n--- Test 5: WebSocket Connection (Port 8083) ---")
+    waiter = MQTTEventWaiter()
+    
+    client = mqtt.Client(callback_api_version=CallbackAPI, protocol=mqtt.MQTTv5, transport="websockets", client_id="test_ws")
+    client.username_pw_set("admin", "admin123")
+    
+    def on_connect(client, userdata, flags, reason_code, properties):
+        print(f"  [Callback] WS Connected with reason code: {reason_code}")
+        waiter.connect_reason = reason_code
+        waiter.connect_event.set()
+        
+    def on_subscribe(client, userdata, mid, reason_codes, properties):
+        waiter.subscribe_reasons = reason_codes
+        waiter.subscribe_event.set()
+        
+    def on_message(client, userdata, msg):
+        waiter.received_message = msg
+        waiter.message_event.set()
+
+    client.on_connect = on_connect
+    client.on_subscribe = on_subscribe
+    client.on_message = on_message
+    
+    try:
+        client.connect("localhost", 8083, keepalive=60)
+        client.loop_start()
+    except Exception as e:
+        print(f"  [FAIL] WebSocket Connection failed to connect: {e}")
+        return False
+        
+    if not waiter.connect_event.wait(timeout=5):
+        print("  [FAIL] Timeout waiting for WS CONNECT response.")
+        client.loop_stop()
+        return False
+        
+    if waiter.connect_reason != 0:
+        print(f"  [FAIL] WS Connection failed: {waiter.connect_reason}")
+        client.loop_stop()
+        return False
+        
+    print("  [PASS] WebSocket connection established successfully!")
+    
+    # Subscribe and publish over WebSockets
+    client.subscribe("test/ws")
+    if waiter.subscribe_event.wait(timeout=3) and waiter.subscribe_reasons and waiter.subscribe_reasons[0] <= 2:
+        client.publish("test/ws", "Hello WS", qos=1)
+        if waiter.message_event.wait(timeout=3) and waiter.received_message.payload.decode() == "Hello WS":
+            print("  [PASS] Message published and received successfully over WebSockets!")
+            client.disconnect()
+            client.loop_stop()
+            return True
+            
+    print("  [FAIL] Failed to publish/subscribe over WebSockets.")
+    client.disconnect()
+    client.loop_stop()
+    return False
+
+def run_test_metrics():
+    print("\n--- Test 6: Prometheus Metrics Check (Port 9095) ---")
+    import urllib.request
+    try:
+        url = "http://localhost:9095/metrics"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=3) as response:
+            html = response.read().decode('utf-8')
+            
+        print("  Scraped metrics successfully:")
+        lines = html.strip().split('\n')
+        for line in lines:
+            if not line.startswith('#'):
+                print(f"    {line}")
+                
+        # Verify key metrics exist
+        if "pipistrelle_connections_total" in html and "pipistrelle_messages_published_total" in html:
+            print("  [PASS] Metrics exporter is functioning correctly and exposes expected metrics.")
+            return True
+        else:
+            print("  [FAIL] Metrics do not contain expected Pipistrelle gauges/counters.")
+            return False
+    except Exception as e:
+        print(f"  [FAIL] Failed to scrape metrics endpoint: {e}")
+        return False
+
 if __name__ == "__main__":
     print("==================================================")
     print("Starting Pipistrelle MQTT Integration Test Suite")
@@ -318,6 +402,22 @@ if __name__ == "__main__":
             success = False
     except Exception as e:
         print(f"  [ERROR] Exception in admin TLS test: {e}")
+        success = False
+        
+    # 5. WebSockets
+    try:
+        if not run_test_websockets():
+            success = False
+    except Exception as e:
+        print(f"  [ERROR] Exception in WebSocket test: {e}")
+        success = False
+
+    # 6. Metrics
+    try:
+        if not run_test_metrics():
+            success = False
+    except Exception as e:
+        print(f"  [ERROR] Exception in metrics test: {e}")
         success = False
         
     print("\n==================================================")

@@ -3,6 +3,14 @@ mod router;
 mod session;
 mod config;
 mod persistence;
+mod tls;
+mod websocket;
+mod metrics;
+mod bridge;
+
+
+
+
 
 
 
@@ -35,6 +43,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting Pipistrelle MQTT v5.0 Broker...");
+
+    // Read environment variables for port overrides
+    let port_tcp = std::env::var("PIPISTRELLE_PORT_TCP")
+        .unwrap_or_else(|_| "1883".to_string())
+        .parse::<u16>()
+        .unwrap_or(1883);
+
+    let port_tls = std::env::var("PIPISTRELLE_PORT_TLS")
+        .unwrap_or_else(|_| "8883".to_string())
+        .parse::<u16>()
+        .unwrap_or(8883);
+
+    let port_ws = std::env::var("PIPISTRELLE_PORT_WS")
+        .unwrap_or_else(|_| "8083".to_string())
+        .parse::<u16>()
+        .unwrap_or(8083);
+
+    let port_metrics = std::env::var("PIPISTRELLE_PORT_METRICS")
+        .unwrap_or_else(|_| "9090".to_string())
+        .parse::<u16>()
+        .unwrap_or(9090);
+
+
+
 
     // Parse CLI arguments
     let mut cert_path = None;
@@ -73,6 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cert_file = cert_path.unwrap_or_else(|| PathBuf::from("cert.pem"));
     let key_file = key_path.unwrap_or_else(|| PathBuf::from("key.pem"));
 
+    // Ensure certificates exist (autogenerate if missing)
+    if let Err(e) = tls::ensure_certificates(&cert_file, &key_file) {
+        error!("Failed to ensure TLS certificates: {:?}", e);
+    }
+
     // Check if certificates exist and load TLS acceptor
     let tls_acceptor = if cert_file.exists() && key_file.exists() {
         info!("Loading TLS certificates from: {:?}", cert_file);
@@ -110,9 +147,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore persistent sessions and subscriptions from database on startup
     broker_state.restore_sessions_from_db().await;
 
-    // 1. Start plain TCP listener on port 1883
-    let plain_addr = "0.0.0.0:1883";
-    let plain_listener = TcpListener::bind(plain_addr).await?;
+    // Start Prometheus metrics exporter
+    metrics::start_metrics_server(port_metrics, broker_state.clone()).await;
+
+    // Start MQTT Bridging engine to HiveMQ Cloud
+    bridge::start_bridge_engine(broker_state.clone()).await;
+
+
+
+    // 1. Start plain TCP listener
+    let plain_addr = format!("0.0.0.0:{}", port_tcp);
+    let plain_listener = TcpListener::bind(&plain_addr).await?;
     info!("Plain TCP listening on: {}", plain_addr);
 
     let state_clone = broker_state.clone();
@@ -134,10 +179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 2. Start TLS listener on port 8883 if enabled
+    // 2. Start TLS listener if enabled
     if let Some(acceptor) = tls_acceptor {
-        let tls_addr = "0.0.0.0:8883";
-        let tls_listener = TcpListener::bind(tls_addr).await?;
+        let tls_addr = format!("0.0.0.0:{}", port_tls);
+        let tls_listener = TcpListener::bind(&tls_addr).await?;
         info!("Secure TLS listening on: {}", tls_addr);
 
         let state_clone = broker_state.clone();
@@ -168,8 +213,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Keep the main thread alive indefinitely
-    std::future::pending::<()>().await;
+    // 3. Start WebSocket listener on port 8083
+    let ws_addr = format!("0.0.0.0:{}", port_ws);
+    let ws_listener = TcpListener::bind(&ws_addr).await?;
+    info!("WebSocket TCP listening on: {}", ws_addr);
+
+    let state_clone = broker_state.clone();
+    tokio::spawn(async move {
+        loop {
+            match ws_listener.accept().await {
+                Ok((socket, addr)) => {
+                    let state = state_clone.clone();
+                    tokio::spawn(async move {
+                        match tokio_tungstenite::accept_async(socket).await {
+                            Ok(ws_stream) => {
+                                let adapter = websocket::WebSocketStreamAdapter::new(ws_stream);
+                                if let Err(e) = handle_connection(adapter, addr, state).await {
+                                    debug!("WebSocket connection closed with error: {:?}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("WebSocket handshake failed for {}: {:?}", addr, e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to accept WebSocket connection: {:?}", e);
+                }
+            }
+        }
+    });
+
+
+    // Wait for Ctrl-C shutdown signal
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        error!("Failed to register Ctrl-C shutdown handler: {:?}", e);
+    }
+
+    info!("Shutdown signal received. Initiating graceful shutdown...");
+    broker_state.graceful_shutdown();
+
+    // Let connection channels flush before exiting
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    info!("Pipistrelle Broker shutdown complete.");
     Ok(())
 }
 

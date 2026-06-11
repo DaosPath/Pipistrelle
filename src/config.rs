@@ -31,9 +31,11 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     pub fn load() -> Self {
-        let path = Path::new("credentials.json");
+        let path_str = std::env::var("PIPISTRELLE_CREDENTIALS_PATH")
+            .unwrap_or_else(|_| "credentials.json".to_string());
+        let path = Path::new(&path_str);
         if !path.exists() {
-            warn!("credentials.json not found. Running in Open Access (Anonymous) mode.");
+            warn!("Credentials file {:?} not found. Running in Open Access (Anonymous) mode.", path);
             return Self { users: None };
         }
 
@@ -41,7 +43,7 @@ impl AuthConfig {
             Ok(mut file) => {
                 let mut content = String::new();
                 if let Err(e) = file.read_to_string(&mut content) {
-                    error!("Failed to read credentials.json: {:?}", e);
+                    error!("Failed to read credentials file {:?}: {:?}", path, e);
                     return Self { users: None };
                 }
 
@@ -51,11 +53,11 @@ impl AuthConfig {
                         for user in config.users {
                             map.insert(user.username.clone(), user);
                         }
-                        info!("Loaded {} user(s) from credentials.json", map.len());
+                        info!("Loaded {} user(s) from {}", map.len(), path_str);
                         Self { users: Some(map) }
                     }
                     Err(e) => {
-                        error!("Failed to parse credentials.json: {:?}", e);
+                        error!("Failed to parse credentials file {}: {:?}", path_str, e);
                         Self { users: None }
                     }
                 }
