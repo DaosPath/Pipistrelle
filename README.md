@@ -14,7 +14,7 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 *   **Persistencia Resistente a Pérdida de Energía (SQLite WAL):** Base de datos embebida SQLite con modo **WAL (Write-Ahead Logging)** habilitado por defecto. Ofrece una resiliencia extrema ante apagones repentinos en placas ARM y recupera automáticamente sesiones, suscripciones y mensajes QoS 1 en tránsito.
 *   **Exportador de Métricas Prometheus (Puerto 9090):** Expone un endpoint HTTP `/metrics` listo para ser recolectado por instancias de Prometheus. Monitorea conexiones activas, mensajes publicados, suscripciones y rendimiento del broker en tiempo real.
 *   **Puente Bidireccional Integrado:** Conectividad automática a brokers remotos (ej. **HiveMQ Cloud**) para reenviar tópicos locales (ej. `sensor/#`) hacia la nube y recibir comandos remotos (ej. `alerts/#`) localmente.
-*   **Autenticación & ACLs Dinámicas:** Validación dinámica de usuarios a través de `credentials.json` mediante hash SHA-256 de alta velocidad y reglas de control de acceso granulares a nivel de lectura/escritura en tópicos.
+*   **Autenticación & ACLs Seguras:** Validación mediante `credentials.json` con contraseñas protegidas por **Argon2id**, ACLs granulares y política **fail-closed** por defecto.
 *   **Generación Automática de Certificados:** Si los archivos `cert.pem` y `key.pem` no están en el volumen, Pipistrelle genera automáticamente certificados auto-firmados válidos para `localhost`, `127.0.0.1`, `10.0.1.2` y `host.wokwi.internal`.
 
 ---
@@ -58,11 +58,17 @@ El broker se distribuye mediante un contenedor Docker multi-etapa optimizado que
     git clone https://github.com/DaosPath/Pipistrelle.git
     cd Pipistrelle
     ```
-2.  Inicia el broker y sus dependencias en segundo plano:
+2.  Crea la configuración local (estos archivos no se versionan):
     ```bash
-    docker compose up -d
+    mkdir -p config
+    cp credentials.json.example config/credentials.json
+    cp .env.example .env
     ```
-3.  Verifica el estado del broker y sus logs de inicio:
+3.  Inicia el broker en segundo plano:
+    ```bash
+    docker compose up -d --build
+    ```
+4.  Verifica el estado del broker y sus logs de inicio:
     ```bash
     docker compose logs -f
     ```
@@ -87,9 +93,11 @@ Puedes personalizar el comportamiento del broker modificando las variables de en
 | `PIPISTRELLE_PORT_METRICS` | Puerto interno para métricas Prometheus. | `9090` |
 | `PIPISTRELLE_DB_PATH` | Ruta interna de persistencia SQLite. | `/app/data/pipistrelle.db` |
 | `PIPISTRELLE_CREDENTIALS_PATH`| Ruta del archivo de usuarios y ACLs. | `/app/config/credentials.json` |
+| `PIPISTRELLE_ALLOW_ANONYMOUS` | Permite acceso anónimo solo si se establece explícitamente en `true`. | `false` |
 | `PIPISTRELLE_BRIDGE_HOST` | Host remoto de HiveMQ Cloud para puente. | *Desactivado por defecto* |
 | `PIPISTRELLE_BRIDGE_USER` | Usuario de autenticación del puente. | *Ninguno* |
 | `PIPISTRELLE_BRIDGE_PASS` | Contraseña de autenticación del puente. | *Ninguna* |
+| `PIPISTRELLE_BRIDGE_PORT` | Puerto TLS del broker remoto. | `8883` |
 
 ---
 
@@ -102,7 +110,7 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
   "users": [
     {
       "username": "admin",
-      "password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",
+      "password_hash": "$argon2id$v=19$m=65536,t=3,p=1$ZDhmMWVlOGMxMTZlOTAwYzJhZGIzMDBlYWJjZWJlZmY$r+HP8qLT3CpBzxqniOJShpDgZ/O95L8TaQGBQKB573o",
       "acl": [
         {
           "topic": "#",
@@ -112,7 +120,7 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
     },
     {
       "username": "sensor",
-      "password_hash": "ad819504d45f07d7b60a3678614bfd4d606ecaad65e049c9dacda7267ac2e884",
+      "password_hash": "$argon2id$v=19$m=65536,t=3,p=1$OTJjMzk4ZGI4MWVkOGY2YmQxZTkwZTEzNTJmZDNiNTg$qDifFTnyEciQ+xDk1HKKD3dInnUXupgBkWJNuGOQYkE",
       "acl": [
         {
           "topic": "sensor/+",
@@ -128,8 +136,18 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
 }
 ```
 
-> [!NOTE]
-> Las contraseñas en el archivo JSON se almacenan cifradas en formato hexadecimal con **SHA-256**. El ejemplo anterior contiene las contraseñas `admin123` para el usuario `admin`, y `sensor123` para `sensor`.
+> [!IMPORTANT]
+> `password_hash` usa **Argon2id (formato PHC)**. Las contraseñas `admin123` y `sensor123` existen únicamente para pruebas y deben cambiarse antes de exponer el broker. Si `credentials.json` falta o es inválido, Pipistrelle **rechaza todas las conexiones** por defecto. El acceso anónimo solo se habilita con `PIPISTRELLE_ALLOW_ANONYMOUS=true`.
+
+Para generar un hash Argon2id en Linux sin guardar la contraseña en el historial del shell:
+```bash
+read -s PIPISTRELLE_PASSWORD
+printf '%s' "$PIPISTRELLE_PASSWORD" | argon2 "$(openssl rand -hex 16)" -id -t 3 -m 16 -p 1 -e
+unset PIPISTRELLE_PASSWORD
+```
+
+> [!WARNING]
+> Nunca guardes credenciales reales del bridge en `docker-compose.yml` ni las subas a Git. Usa `.env`; el repositorio ignora `.env` y solo versiona `.env.example`.
 
 ---
 
@@ -169,12 +187,12 @@ Si tienes un proyecto de simulación IoT en VS Code con **Wokwi** (utilizando la
     const char* mqtt_user = "sensor";      // Usuario autorizado por ACL
     const char* mqtt_pass = "sensor123";   // Contraseña
     ```
-2.  Inicia la simulación del ESP32. Los mensajes que el ESP32 publique en `sensor/temp` pasarán al broker local, y gracias al **Puente MQTT**, ¡se reenviarán automáticamente en tiempo real a tu panel en la nube de HiveMQ Cloud!
+2.  Inicia la simulación del ESP32. Los mensajes que el ESP32 publique en `sensor/temp` pasarán al broker local, y si configuras `PIPISTRELLE_BRIDGE_HOST` en tu `.env`, el **Puente MQTT** podrá reenviarlos al broker remoto configurado.
 
 ---
 
 ## <img src="https://api.iconify.design/lucide:scale.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Licencia
 
-Este proyecto se distribuye bajo la licencia **MIT**. Consulta el archivo [LICENSE](file:///C:/Hijosdelsol/pipistrelle/LICENSE) para más detalles.
+Este proyecto se distribuye bajo la licencia **MIT**. Consulta el archivo [LICENSE](LICENSE) para más detalles.
 
 Desarrollado con pasión por el equipo DaosPath utilizando Rust y tecnologías Web seguras.

@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   pipistrelle:
     build:
@@ -10,21 +8,22 @@ services:
     restart: unless-stopped
     ports:
       - "1883:1883" # Plain TCP MQTT
-      - "8883:8883" # Secure TLS MQTT (Auto-Quantum)
+      - "8883:8883" # Secure TLS MQTT
       - "8083:8083" # WebSockets MQTT
       - "9095:9090" # Prometheus Metrics Exporter
     environment:
-      - PIPISTRELLE_PORT_TCP=1883
-      - PIPISTRELLE_PORT_TLS=8883
-      - PIPISTRELLE_PORT_WS=8083
-      - PIPISTRELLE_PORT_METRICS=9090
-      - PIPISTRELLE_DB_PATH=/app/data/pipistrelle.db
-      - PIPISTRELLE_CREDENTIALS_PATH=/app/config/credentials.json
-      # Bridge parameters (Optional - uncomment and configure to enable bridging)
-      - PIPISTRELLE_BRIDGE_HOST=${PIPISTRELLE_BRIDGE_HOST}
-      - PIPISTRELLE_BRIDGE_USER=${PIPISTRELLE_BRIDGE_USER}
-      - PIPISTRELLE_BRIDGE_PASS=${PIPISTRELLE_BRIDGE_PASS}
+      PIPISTRELLE_PORT_TCP: "1883"
+      PIPISTRELLE_PORT_TLS: "8883"
+      PIPISTRELLE_PORT_WS: "8083"
+      PIPISTRELLE_PORT_METRICS: "9090"
+      PIPISTRELLE_DB_PATH: /app/data/pipistrelle.db
+      PIPISTRELLE_CREDENTIALS_PATH: /app/config/credentials.json
+      PIPISTRELLE_ALLOW_ANONYMOUS: "${PIPISTRELLE_ALLOW_ANONYMOUS:-false}"
+      PIPISTRELLE_BRIDGE_HOST: "${PIPISTRELLE_BRIDGE_HOST:-}"
+      PIPISTRELLE_BRIDGE_USER: "${PIPISTRELLE_BRIDGE_USER:-}"
+      PIPISTRELLE_BRIDGE_PASS: "${PIPISTRELLE_BRIDGE_PASS:-}"
+      PIPISTRELLE_BRIDGE_PORT: "${PIPISTRELLE_BRIDGE_PORT:-8883}"
     volumes:
-      - ./config:/app/config # Store credentials.json and optionally cert.pem/key.pem
-      - ./data:/app/data     # Persist the SQLite WAL database
+      - ./config:/app/config
+      - ./data:/app/data
     working_dir: /app

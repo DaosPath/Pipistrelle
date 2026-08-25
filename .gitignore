@@ -9,3 +9,8 @@
 /config/*.pem
 /data/
 
+# Local environment/secrets
+.env
+.env.*
+!.env.example
+/docker-compose.orange-pi.yml

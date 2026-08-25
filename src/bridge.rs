@@ -12,9 +12,9 @@ use crate::session::BrokerState;
 
 pub async fn start_bridge_engine(state: Arc<BrokerState>) {
     let host = match std::env::var("PIPISTRELLE_BRIDGE_HOST") {
-        Ok(h) => h,
-        Err(_) => {
-            info!("PIPISTRELLE_BRIDGE_HOST not set. MQTT bridging is disabled.");
+        Ok(h) if !h.trim().is_empty() => h,
+        _ => {
+            info!("PIPISTRELLE_BRIDGE_HOST is empty or unset. MQTT bridging is disabled.");
             return;
         }
     };
