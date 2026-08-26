@@ -141,6 +141,30 @@ impl AuthConfig {
         .unwrap_or(false)
     }
 
+    /// Returns true when a session can cache unconditional access for an action.
+    /// This removes user-map and ACL traversal work from the per-packet hot path
+    /// for common administrative/service accounts using a `#` ACL.
+    pub fn authorizes_all(&self, username: &str, action: &str) -> bool {
+        let users = match &self.users {
+            Some(users) => users,
+            None => return true,
+        };
+        let Some(user) = users.get(username) else {
+            return false;
+        };
+        user.acl.iter().any(|rule| {
+            if rule.topic != "#" {
+                return false;
+            }
+            match rule.access.as_str() {
+                "readwrite" => true,
+                "read" => action == "read",
+                "write" => action == "write",
+                _ => false,
+            }
+        })
+    }
+
     /// Authorizes an action ("read" or "write") for a user on a given topic.
     pub fn authorize(&self, username: &str, topic: &str, action: &str) -> bool {
         let users = match &self.users {
@@ -199,24 +223,28 @@ fn verify_password(password: &str, encoded_hash: &str) -> bool {
 /// Matches a publish topic or subscription topic filter against an ACL filter pattern.
 /// E.g. topic "sensor/opi_zero" matches filter "sensor/+" and "sensor/#"
 pub fn topic_matches_acl_filter(topic: &str, filter: &str) -> bool {
-    let topic_levels: Vec<&str> = topic.split('/').collect();
-    let filter_levels: Vec<&str> = filter.split('/').collect();
-
-    let mut i = 0;
-    while i < filter_levels.len() {
-        if filter_levels[i] == "#" {
-            return true;
-        }
-        if i >= topic_levels.len() {
-            return false;
-        }
-        if filter_levels[i] != "+" && filter_levels[i] != topic_levels[i] {
-            return false;
-        }
-        i += 1;
+    // Common ACLs should be nearly free in the publish hot path.
+    if filter == "#" {
+        return true;
+    }
+    if !filter.as_bytes().contains(&b'+') && !filter.as_bytes().contains(&b'#') {
+        return topic == filter;
     }
 
-    i == topic_levels.len()
+    // Walk both strings directly. No Vec allocation per authorization check.
+    let mut topic_levels = topic.split('/');
+    for filter_level in filter.split('/') {
+        if filter_level == "#" {
+            return true;
+        }
+        let Some(topic_level) = topic_levels.next() else {
+            return false;
+        };
+        if filter_level != "+" && filter_level != topic_level {
+            return false;
+        }
+    }
+    topic_levels.next().is_none()
 }
 
 #[cfg(test)]
@@ -228,6 +256,24 @@ mod tests {
         let hash = "$argon2id$v=19$m=19456,t=2,p=1$MjY4NGRlMWY5YzliZDUwNjBhOGJhYTJhZDM1OWViZTE$qjlHo3ALKgMXLw1bgRz/p7LGhqvC4RKrgxMuvgPNNfg";
         assert!(verify_password("admin123", hash));
         assert!(!verify_password("wrongpassword", hash));
+    }
+
+    #[test]
+    fn test_global_acl_cache_detection() {
+        let user = UserConfig {
+            username: "admin".to_string(),
+            password_hash: "unused".to_string(),
+            acl: vec![AclRule {
+                topic: "#".to_string(),
+                access: "readwrite".to_string(),
+            }],
+        };
+        let mut users = HashMap::new();
+        users.insert(user.username.clone(), user);
+        let auth = AuthConfig::with_users(Some(users));
+        assert!(auth.authorizes_all("admin", "read"));
+        assert!(auth.authorizes_all("admin", "write"));
+        assert!(!auth.authorizes_all("missing", "write"));
     }
 
     #[test]

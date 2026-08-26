@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionInfo {
@@ -31,6 +32,7 @@ impl TrieNode {
 
 pub struct TopicRouter {
     root: RwLock<TrieNode>,
+    active_routes: AtomicUsize,
 }
 
 /// Represents matching subscribers.
@@ -46,6 +48,7 @@ impl TopicRouter {
     pub fn new() -> Self {
         Self {
             root: RwLock::new(TrieNode::default()),
+            active_routes: AtomicUsize::new(0),
         }
     }
 
@@ -91,18 +94,24 @@ impl TopicRouter {
             subscription_identifier,
         };
 
-        if let Some(grp) = group {
+        let inserted_new = if let Some(grp) = group {
             let list = current
                 .shared_subscriptions
                 .entry(grp.to_string())
                 .or_default();
-            // Avoid duplicate registrations for the same client in the same group
+            let existed = list.iter().any(|s| s.client_id == client_id);
+            // Avoid duplicate registrations for the same client in the same group.
             list.retain(|s| s.client_id != client_id);
             list.push(sub_info);
+            !existed
         } else {
             current
                 .subscriptions
-                .insert(client_id.to_string(), sub_info);
+                .insert(client_id.to_string(), sub_info)
+                .is_none()
+        };
+        if inserted_new {
+            self.active_routes.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -183,6 +192,9 @@ impl TopicRouter {
         }
 
         let (removed, _) = unsubscribe_recursive(&mut *root, client_id, &segments, group);
+        if removed {
+            self.active_routes.fetch_sub(1, Ordering::Release);
+        }
         removed
     }
 
@@ -221,11 +233,20 @@ impl TopicRouter {
         }
 
         let mut root = self.root.write();
-        remove_recursive(&mut root, client_id)
+        let removed = remove_recursive(&mut root, client_id);
+        if removed > 0 {
+            self.active_routes.fetch_sub(removed, Ordering::Release);
+        }
+        removed
     }
 
     /// Matches a publish topic against all active subscriptions.
     /// Resolves wildcards (`+`, `#`) and aggregates results.
+    #[inline]
+    pub fn has_routes(&self) -> bool {
+        self.active_routes.load(Ordering::Acquire) != 0
+    }
+
     pub fn match_topic(&self, topic: &str) -> RouteResult {
         let root = self.root.read();
         let segments: Vec<&str> = topic.split('/').collect();
@@ -379,5 +400,9 @@ mod tests {
 
         let jobs = router.match_topic("jobs/one");
         assert!(jobs.shared.is_empty());
+        assert!(router.has_routes());
+
+        assert_eq!(router.remove_client("client-b"), 1);
+        assert!(!router.has_routes());
     }
 }

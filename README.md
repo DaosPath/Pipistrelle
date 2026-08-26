@@ -167,6 +167,8 @@ Desde `2.0.0.1`, las colas de salida por cliente son **bounded**. `PIPISTRELLE_C
 
 Desde `2.0.0.2`, también hay cuotas y aislamiento configurables: `PIPISTRELLE_MAX_SUBSCRIPTIONS_PER_CLIENT`, política de slow consumer (`backpressure|disconnect`), cola bounded del bridge (`drop-newest|backpressure`) y telemetría de latencia p50/p95/p99 muestreada con `PIPISTRELLE_LATENCY_SAMPLE_RATE` (default `64`). `/info` publica la configuración efectiva y `/metrics` expone los contadores asociados.
 
+Desde `2.0.0.3`, el hot path QoS 0 sin subscribers/bridge supera **20 M PUBLISH/s** en la Orange Pi con el benchmark Rust nativo. La validación sostenida de 200 millones de mensajes alcanzó **21.463 M msg/s** con contador Prometheus exacto y 0 fallos. Esta cifra es ingest puro; el routing end-to-end se mide y documenta por separado.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración

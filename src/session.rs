@@ -75,6 +75,8 @@ pub struct ClientSession {
     pub client_id: String,
     pub username: Option<String>,
     pub clean_start: bool,
+    pub allow_all_read: bool,
+    pub allow_all_write: bool,
     pub keep_alive: u16,
     pub session_expiry_interval: u32,
     pub last_activity: RwLock<Instant>,
@@ -87,6 +89,9 @@ pub struct ClientSession {
 
     // Subscription/quota state
     pub subscriptions: RwLock<HashSet<String>>,
+
+    // Per-session publish counter avoids a globally contended cache line.
+    pub published_messages: AtomicU64,
 
     // QoS 1/2 state
     next_packet_id: AtomicU16,
@@ -102,6 +107,8 @@ impl ClientSession {
         client_id: String,
         username: Option<String>,
         clean_start: bool,
+        allow_all_read: bool,
+        allow_all_write: bool,
         keep_alive: u16,
         session_expiry_interval: u32,
         sender: mpsc::Sender<Vec<u8>>,
@@ -110,12 +117,15 @@ impl ClientSession {
             client_id,
             username,
             clean_start,
+            allow_all_read,
+            allow_all_write,
             keep_alive,
             session_expiry_interval,
             last_activity: RwLock::new(Instant::now()),
             sender,
             topic_aliases: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashSet::new()),
+            published_messages: AtomicU64::new(0),
             next_packet_id: AtomicU16::new(1),
             in_flight: RwLock::new(HashMap::new()),
             disconnect_requested: AtomicBool::new(false),
@@ -185,7 +195,7 @@ pub struct BrokerState {
     // Round-robin counters for shared subscription groups
     shared_group_counters: RwLock<HashMap<String, AtomicUsize>>,
     // Prometheus Metrics
-    pub metrics_messages_published: AtomicUsize,
+    pub metrics_messages_published_retired: AtomicU64,
     pub metrics_subscriptions: AtomicUsize,
     pub metrics_tls_pqc_handshakes: AtomicUsize,
     pub metrics_tls_classical_handshakes: AtomicUsize,
@@ -208,6 +218,7 @@ pub struct BrokerState {
     pub bridge_queue_policy: BridgeQueuePolicy,
 
     // Bridge channel
+    pub bridge_active: AtomicBool,
     pub bridge_sender: RwLock<Option<BridgeQueueHandle>>,
 }
 
@@ -269,7 +280,7 @@ impl BrokerState {
             auth: crate::config::AuthConfig::load(),
             db: Arc::new(crate::persistence::Persistence::new()),
             shared_group_counters: RwLock::new(HashMap::new()),
-            metrics_messages_published: AtomicUsize::new(0),
+            metrics_messages_published_retired: AtomicU64::new(0),
             metrics_subscriptions: AtomicUsize::new(0),
             metrics_tls_pqc_handshakes: AtomicUsize::new(0),
             metrics_tls_classical_handshakes: AtomicUsize::new(0),
@@ -288,6 +299,7 @@ impl BrokerState {
             slow_consumer_timeout,
             bridge_queue_capacity,
             bridge_queue_policy,
+            bridge_active: AtomicBool::new(false),
             bridge_sender: RwLock::new(None),
         }
     }
@@ -303,10 +315,15 @@ impl BrokerState {
                 for (client_id, username, clean_start, expiry) in sessions_loaded {
                     // Create offline session with dummy sender channel (replaced when client reconnects)
                     let (tx, _) = mpsc::channel::<Vec<u8>>(self.client_queue_capacity);
+                    let auth_username = username.as_deref().unwrap_or("");
+                    let allow_all_read = self.auth.authorizes_all(auth_username, "read");
+                    let allow_all_write = self.auth.authorizes_all(auth_username, "write");
                     let session = Arc::new(ClientSession::new(
                         client_id.clone(),
                         username,
                         clean_start,
+                        allow_all_read,
+                        allow_all_write,
                         0, // keep-alive is 0 while offline
                         expiry,
                         tx,
@@ -366,6 +383,9 @@ impl BrokerState {
         let expiry = session.session_expiry_interval;
 
         if let Some(old) = sessions.insert(client_id.clone(), session.clone()) {
+            let retired = old.published_messages.load(Ordering::Relaxed);
+            self.metrics_messages_published_retired
+                .fetch_add(retired, Ordering::Relaxed);
             info!("Replacing existing session for client: {}", old.client_id);
         }
 
@@ -383,6 +403,9 @@ impl BrokerState {
     pub fn remove_session(&self, client_id: &str) {
         let mut sessions = self.sessions.write();
         if let Some(session) = sessions.remove(client_id) {
+            let retired = session.published_messages.load(Ordering::Relaxed);
+            self.metrics_messages_published_retired
+                .fetch_add(retired, Ordering::Relaxed);
             info!("Removed session for client: {}", client_id);
 
             // A clean/non-persistent session must leave no routing state behind.
@@ -472,12 +495,20 @@ impl BrokerState {
         payload: &[u8],
         qos: u8,
         retain: bool,
+        publish_sequence: u64,
     ) {
-        let publish_sequence = self
-            .metrics_messages_published
-            .fetch_add(1, Ordering::Relaxed);
-        let sample_latency = publish_sequence & (self.publish_route_latency_sample_rate - 1) == 0;
+        let sample_latency =
+            publish_sequence & (self.publish_route_latency_sample_rate as u64 - 1) == 0;
         let route_started = sample_latency.then(Instant::now);
+
+        // The dominant ingest case has no matching subscribers and no active bridge.
+        // Avoid router/bridge locks and all routing allocations in that case.
+        if !self.router.has_routes() && !self.bridge_active.load(Ordering::Relaxed) {
+            if let Some(route_started) = route_started {
+                self.publish_route_latency.record(route_started.elapsed());
+            }
+            return;
+        }
 
         // The remote bridge is isolated behind its own bounded queue. Only topics
         // matching the bridge prefix are queued, so unrelated traffic never pays
@@ -706,7 +737,7 @@ mod policy_tests {
     #[test]
     fn disconnect_request_is_idempotent() {
         let (tx, _rx) = mpsc::channel(1);
-        let session = ClientSession::new("slow".to_string(), None, true, 60, 0, tx);
+        let session = ClientSession::new("slow".to_string(), None, true, false, false, 60, 0, tx);
         assert!(session.request_disconnect());
         assert!(!session.request_disconnect());
         assert!(session.disconnect_requested());

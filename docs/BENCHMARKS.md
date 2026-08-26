@@ -133,3 +133,47 @@ The new policies were exercised against dedicated temporary broker instances:
 - Subscription quota set to 2: the first two subscriptions were granted and the third returned MQTT v5 reason **`0x97`**; `pipistrelle_subscription_quota_rejections_total` increased to 1.
 - Remote bridge unavailable, queue capacity 16, `drop-newest`: after 100 matching `sensor/` publishes, the queue held **16**, and exactly **84** additional messages were counted in both bridge-full and bridge-drop counters.
 - Slow consumer with queue capacity 16, `disconnect`, 100 ms timeout: a raw MQTT subscriber stopped reading from its socket; the broker recorded **84** queue-pressure events, disconnected that client exactly once, removed the active connection, and the publisher completed successfully.
+
+## V2 2.0.0.3 — 20M/s ingest milestone
+
+The `2.0.0.3` optimization target was **20 M msg/s** for native TCP QoS 0 ingest. This is an **ingest ceiling** measurement: there are no subscribers and no remote bridge, so it measures MQTT decode/auth/accounting/intake rather than fan-out delivery.
+
+### Optimization progression
+
+Using the same 50-client, 128-byte, QoS 0 native Rust workload on the Orange Pi:
+
+| Step | Sustained result |
+|---|---:|
+| V2.0.0.2 pre-hot-path range | ~3.0–3.4 M msg/s |
+| Allocation-free ACL + zero-route router bypass | **13.32 M msg/s** |
+| Cached global ACL permissions | **13.58 M msg/s** |
+| Per-session publish counters | **18.91 M msg/s** |
+| Synchronous zero-routing QoS 0 decode fast path | **21.31 M msg/s** |
+| After integration + exact route-count recovery | **21.68 M msg/s** |
+
+### 200-million-message sustained validation
+
+A clean run sent **200,000,000 QoS 0 messages** using 50 clients and 128-byte payloads in **9.318 s**:
+
+- **21.463 M msg/s sustained**
+- **2,620 MiB/s payload throughput**
+- Prometheus delta: exactly **200,000,050** (200M messages + 50 QoS 1 completion markers)
+- **0 benchmark failures**
+- Broker CPU samples: roughly **4.9–6.3 CPU cores**
+- Native generator: roughly **1.8–2.1 CPU cores**
+- Broker memory observed during the run: roughly **98–121 MiB**
+- Broker memory after the run: roughly **80 MiB**
+
+The result therefore exceeded the 20 M msg/s target over a sustained 200M-message run rather than only a short burst.
+
+### Full-routing regression gate
+
+The same build delivered **10,000,000 QoS 0 loopback messages** with 10 clients at **906.9 k msg/s**. Broker memory was about **104 MiB** after the run, so the ingest optimization did not undo bounded-memory routing.
+
+### Hybrid PQC regression gate
+
+A 10-client TLS 1.3 loopback test delivered **200,000 messages at 634.2 k msg/s**, with all 10 connections negotiating **`X25519MLKEM768`** and zero failures.
+
+### Interpretation
+
+The **20+ M msg/s** figure must not be interpreted as 20M end-to-end delivered messages/s. It is the current single-node **QoS 0 intake ceiling** for the optimized zero-routing case. Fan-out/routing, QoS 1 persistence, WebSockets, and TLS have different ceilings and must be benchmarked independently.

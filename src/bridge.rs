@@ -43,6 +43,9 @@ pub async fn start_bridge_engine(state: Arc<BrokerState>) {
         sender: tx,
         topic_prefix: Arc::<str>::from(local_pub_pattern),
     });
+    state
+        .bridge_active
+        .store(true, std::sync::atomic::Ordering::Release);
 
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -210,7 +213,19 @@ async fn connect_and_run_bridge(
                         Ok((Packet::Publish(pkt), consumed)) => {
                             debug!("Bridge received remote publish: topic='{}'", pkt.topic);
                             // Route locally (prevent loops by using special sender name)
-                            state.route_publish("bridge_client", pkt.topic, pkt.payload, pkt.qos, pkt.retain).await;
+                            let publish_sequence = state
+                                .metrics_messages_published_retired
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            state
+                                .route_publish(
+                                    "bridge_client",
+                                    pkt.topic,
+                                    pkt.payload,
+                                    pkt.qos,
+                                    pkt.retain,
+                                    publish_sequence,
+                                )
+                                .await;
                             read_buf.advance(consumed);
                         }
                         Ok((Packet::PingResp, consumed)) => {

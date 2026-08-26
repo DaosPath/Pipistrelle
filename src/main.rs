@@ -15,7 +15,8 @@ use std::io::{self, BufReader};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -379,10 +380,15 @@ where
     // 2. Set up channels for sending outgoing packets to this client
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(state.client_queue_capacity);
 
+    let auth_username = username.as_deref().unwrap_or("");
+    let allow_all_read = state.auth.authorizes_all(auth_username, "read");
+    let allow_all_write = state.auth.authorizes_all(auth_username, "write");
     let session = Arc::new(ClientSession::new(
         client_id.clone(),
         username,
         clean_start,
+        allow_all_read,
+        allow_all_write,
         keep_alive,
         session_expiry_interval,
         tx,
@@ -457,6 +463,31 @@ where
                     loop {
                         match decode_packet(&read_buf) {
                             Ok((packet, bytes_read)) => {
+                                // Zero-routing QoS 0 fast path: authenticated sessions with a
+                                // cached global write ACL need no async dispatch, router lock,
+                                // bridge lock, allocation, ACK, or persistence work.
+                                if let Packet::Publish(pkt) = &packet {
+                                    if pkt.qos == 0
+                                        && !pkt.retain
+                                        && session.allow_all_write
+                                        && !state.router.has_routes()
+                                        && !state.bridge_active.load(Ordering::Relaxed)
+                                    {
+                                        let sequence = session
+                                            .published_messages
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        if sequence
+                                            & (state.publish_route_latency_sample_rate as u64 - 1)
+                                            == 0
+                                        {
+                                            let started = Instant::now();
+                                            state.publish_route_latency.record(started.elapsed());
+                                        }
+                                        read_buf.advance(bytes_read);
+                                        continue;
+                                    }
+                                }
+
                                 process_client_packet(&packet, &state, &session).await?;
                                 read_buf.advance(bytes_read);
                             }
@@ -506,7 +537,7 @@ async fn process_client_packet(
 
             // Check write authorization
             let username = session.username.as_deref().unwrap_or("");
-            if !state.auth.authorize(username, pkt.topic, "write") {
+            if !session.allow_all_write && !state.auth.authorize(username, pkt.topic, "write") {
                 warn!(
                     "Client '{}' (user: '{}') not authorized to publish on topic '{}'",
                     session.client_id, username, pkt.topic
@@ -526,6 +557,7 @@ async fn process_client_packet(
                 return Ok(());
             }
 
+            let publish_sequence = session.published_messages.fetch_add(1, Ordering::Relaxed);
             state
                 .route_publish(
                     &session.client_id,
@@ -533,6 +565,7 @@ async fn process_client_packet(
                     pkt.payload,
                     pkt.qos,
                     pkt.retain,
+                    publish_sequence,
                 )
                 .await;
 
@@ -557,7 +590,9 @@ async fn process_client_packet(
 
             for sub in &pkt.subscriptions {
                 // Check read authorization
-                if state.auth.authorize(username, sub.topic_filter, "read") {
+                if session.allow_all_read
+                    || state.auth.authorize(username, sub.topic_filter, "read")
+                {
                     let accepted = state.subscribe(
                         &session.client_id,
                         sub.topic_filter,

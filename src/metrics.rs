@@ -51,6 +51,7 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     queued_messages,
                                     queue_capacity_total,
                                     current_subscriptions,
+                                    active_published_messages,
                                 ) = {
                                     let sessions = state.sessions.read();
                                     let queued_messages = sessions
@@ -70,11 +71,18 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                         .values()
                                         .map(|session| session.subscription_count())
                                         .sum::<usize>();
+                                    let active_published_messages = sessions
+                                        .values()
+                                        .map(|session| {
+                                            session.published_messages.load(Ordering::Relaxed)
+                                        })
+                                        .sum::<u64>();
                                     (
                                         sessions.len(),
                                         queued_messages,
                                         queue_capacity_total,
                                         current_subscriptions,
+                                        active_published_messages,
                                     )
                                 };
                                 let (bridge_queued_messages, bridge_queue_capacity) = state
@@ -92,8 +100,10 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     })
                                     .unwrap_or((0, 0));
 
-                                let messages_published =
-                                    state.metrics_messages_published.load(Ordering::Relaxed);
+                                let messages_published = state
+                                    .metrics_messages_published_retired
+                                    .load(Ordering::Relaxed)
+                                    .saturating_add(active_published_messages);
                                 let subscriptions =
                                     state.metrics_subscriptions.load(Ordering::Relaxed);
                                 let tls_pqc =
