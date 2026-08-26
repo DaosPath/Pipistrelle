@@ -1,13 +1,64 @@
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::codec::{Packet, Publish, PublishProperties, encode_packet};
+use crate::latency::LatencyHistogram;
 use crate::router::TopicRouter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlowConsumerPolicy {
+    Backpressure,
+    Disconnect,
+}
+
+impl SlowConsumerPolicy {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disconnect" => Self::Disconnect,
+            _ => Self::Backpressure,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Backpressure => "backpressure",
+            Self::Disconnect => "disconnect",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeQueuePolicy {
+    DropNewest,
+    Backpressure,
+}
+
+impl BridgeQueuePolicy {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "backpressure" => Self::Backpressure,
+            _ => Self::DropNewest,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DropNewest => "drop-newest",
+            Self::Backpressure => "backpressure",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BridgeQueueHandle {
+    pub sender: mpsc::Sender<(String, Vec<u8>)>,
+    pub topic_prefix: Arc<str>,
+}
 
 /// Information about a message currently in-flight (QoS > 0)
 #[derive(Debug, Clone)]
@@ -34,9 +85,16 @@ pub struct ClientSession {
     // Topic aliases sent by the client: Alias ID -> Topic String
     pub topic_aliases: RwLock<HashMap<u16, String>>,
 
+    // Subscription/quota state
+    pub subscriptions: RwLock<HashSet<String>>,
+
     // QoS 1/2 state
     next_packet_id: AtomicU16,
     pub in_flight: RwLock<HashMap<u16, InFlightMessage>>,
+
+    // Slow-consumer cancellation path
+    disconnect_requested: AtomicBool,
+    pub disconnect_notify: Notify,
 }
 
 impl ClientSession {
@@ -57,8 +115,11 @@ impl ClientSession {
             last_activity: RwLock::new(Instant::now()),
             sender,
             topic_aliases: RwLock::new(HashMap::new()),
+            subscriptions: RwLock::new(HashSet::new()),
             next_packet_id: AtomicU16::new(1),
             in_flight: RwLock::new(HashMap::new()),
+            disconnect_requested: AtomicBool::new(false),
+            disconnect_notify: Notify::new(),
         }
     }
 
@@ -89,6 +150,27 @@ impl ClientSession {
     pub fn remove_in_flight(&self, packet_id: u16) -> Option<InFlightMessage> {
         self.in_flight.write().remove(&packet_id)
     }
+
+    pub fn request_disconnect(&self) -> bool {
+        if self
+            .disconnect_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.disconnect_notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn disconnect_requested(&self) -> bool {
+        self.disconnect_requested.load(Ordering::Acquire)
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.read().len()
+    }
 }
 
 /// Global shared state of the Pipistrelle broker
@@ -109,9 +191,24 @@ pub struct BrokerState {
     pub metrics_tls_classical_handshakes: AtomicUsize,
     pub metrics_client_queue_backpressure_events: AtomicUsize,
     pub metrics_client_queue_backpressure_wait_ns: AtomicU64,
+    pub metrics_slow_consumer_disconnects: AtomicUsize,
+    pub metrics_subscription_quota_rejections: AtomicUsize,
+    pub metrics_bridge_queue_backpressure_events: AtomicUsize,
+    pub metrics_bridge_queue_backpressure_wait_ns: AtomicU64,
+    pub metrics_bridge_queue_dropped: AtomicUsize,
+    pub publish_route_latency: LatencyHistogram,
+    pub publish_route_latency_sample_rate: usize,
+
+    // Runtime limits/policies
     pub client_queue_capacity: usize,
+    pub max_subscriptions_per_client: usize,
+    pub slow_consumer_policy: SlowConsumerPolicy,
+    pub slow_consumer_timeout: Duration,
+    pub bridge_queue_capacity: usize,
+    pub bridge_queue_policy: BridgeQueuePolicy,
+
     // Bridge channel
-    pub bridge_sender: RwLock<Option<mpsc::UnboundedSender<(String, Vec<u8>)>>>,
+    pub bridge_sender: RwLock<Option<BridgeQueueHandle>>,
 }
 
 impl BrokerState {
@@ -121,9 +218,49 @@ impl BrokerState {
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(16, 65_536))
             .unwrap_or(1_024);
+        let max_subscriptions_per_client =
+            std::env::var("PIPISTRELLE_MAX_SUBSCRIPTIONS_PER_CLIENT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .map(|value| value.clamp(1, 65_535))
+                .unwrap_or(256);
+        let slow_consumer_policy = SlowConsumerPolicy::parse(
+            &std::env::var("PIPISTRELLE_SLOW_CONSUMER_POLICY")
+                .unwrap_or_else(|_| "backpressure".to_string()),
+        );
+        let slow_consumer_timeout = Duration::from_millis(
+            std::env::var("PIPISTRELLE_SLOW_CONSUMER_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|value| value.clamp(10, 60_000))
+                .unwrap_or(5_000),
+        );
+        let bridge_queue_capacity = std::env::var("PIPISTRELLE_BRIDGE_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(16, 262_144))
+            .unwrap_or(4_096);
+        let bridge_queue_policy = BridgeQueuePolicy::parse(
+            &std::env::var("PIPISTRELLE_BRIDGE_QUEUE_POLICY")
+                .unwrap_or_else(|_| "drop-newest".to_string()),
+        );
+        let publish_route_latency_sample_rate = std::env::var("PIPISTRELLE_LATENCY_SAMPLE_RATE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 65_536).next_power_of_two().min(65_536))
+            .unwrap_or(64);
         info!(
-            "Per-client outbound queue capacity: {} messages",
-            client_queue_capacity
+            "Client limits: outbound_queue={}, subscriptions={}, slow_consumer={} ({} ms)",
+            client_queue_capacity,
+            max_subscriptions_per_client,
+            slow_consumer_policy.as_str(),
+            slow_consumer_timeout.as_millis(),
+        );
+        info!(
+            "Bridge queue: capacity={}, policy={}; latency sample rate=1/{}",
+            bridge_queue_capacity,
+            bridge_queue_policy.as_str(),
+            publish_route_latency_sample_rate,
         );
 
         Self {
@@ -138,7 +275,19 @@ impl BrokerState {
             metrics_tls_classical_handshakes: AtomicUsize::new(0),
             metrics_client_queue_backpressure_events: AtomicUsize::new(0),
             metrics_client_queue_backpressure_wait_ns: AtomicU64::new(0),
+            metrics_slow_consumer_disconnects: AtomicUsize::new(0),
+            metrics_subscription_quota_rejections: AtomicUsize::new(0),
+            metrics_bridge_queue_backpressure_events: AtomicUsize::new(0),
+            metrics_bridge_queue_backpressure_wait_ns: AtomicU64::new(0),
+            metrics_bridge_queue_dropped: AtomicUsize::new(0),
+            publish_route_latency: LatencyHistogram::new(),
+            publish_route_latency_sample_rate,
             client_queue_capacity,
+            max_subscriptions_per_client,
+            slow_consumer_policy,
+            slow_consumer_timeout,
+            bridge_queue_capacity,
+            bridge_queue_policy,
             bridge_sender: RwLock::new(None),
         }
     }
@@ -175,6 +324,9 @@ impl BrokerState {
         match self.db.load_all_subscriptions().await {
             Ok(subs_loaded) => {
                 for (client_id, topic_filter, qos, sub_id) in subs_loaded {
+                    if let Some(session) = self.sessions.read().get(&client_id).cloned() {
+                        session.subscriptions.write().insert(topic_filter.clone());
+                    }
                     self.router
                         .subscribe(&client_id, &topic_filter, qos, sub_id);
                 }
@@ -251,14 +403,30 @@ impl BrokerState {
         }
     }
 
-    /// Processes subscription request and registers it in the router
+    /// Processes a subscription request and enforces the per-client quota.
+    /// Returns false when the client has exhausted its subscription allowance.
     pub fn subscribe(
         &self,
         client_id: &str,
         topic_filter: &str,
         qos: u8,
         subscription_identifier: Option<u32>,
-    ) {
+    ) -> bool {
+        if let Some(session) = self.sessions.read().get(client_id).cloned() {
+            let mut subscriptions = session.subscriptions.write();
+            let is_new = !subscriptions.contains(topic_filter);
+            if is_new && subscriptions.len() >= self.max_subscriptions_per_client {
+                self.metrics_subscription_quota_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "Client {} exceeded subscription quota ({})",
+                    client_id, self.max_subscriptions_per_client
+                );
+                return false;
+            }
+            subscriptions.insert(topic_filter.to_string());
+        }
+
         self.metrics_subscriptions.fetch_add(1, Ordering::Relaxed);
         self.router
             .subscribe(client_id, topic_filter, qos, subscription_identifier);
@@ -267,7 +435,6 @@ impl BrokerState {
             client_id, topic_filter, qos
         );
 
-        // Persist subscription
         let db = self.db.clone();
         let cid = client_id.to_string();
         let filter = topic_filter.to_string();
@@ -275,12 +442,16 @@ impl BrokerState {
             db.save_subscription(cid, filter, qos, subscription_identifier)
                 .await;
         });
+        true
     }
 
     /// Processes unsubscription request
     pub fn unsubscribe(&self, client_id: &str, topic_filter: &str) -> bool {
         let removed = self.router.unsubscribe(client_id, topic_filter);
         if removed {
+            if let Some(session) = self.sessions.read().get(client_id).cloned() {
+                session.subscriptions.write().remove(topic_filter);
+            }
             debug!("Client {} unsubscribed from {}", client_id, topic_filter);
 
             // Delete persistent subscription
@@ -302,20 +473,48 @@ impl BrokerState {
         qos: u8,
         retain: bool,
     ) {
-        self.metrics_messages_published
+        let publish_sequence = self
+            .metrics_messages_published
             .fetch_add(1, Ordering::Relaxed);
+        let sample_latency = publish_sequence & (self.publish_route_latency_sample_rate - 1) == 0;
+        let route_started = sample_latency.then(Instant::now);
 
-        // Forward local publish to the bridge if it didn't originate from the bridge itself.
+        // The remote bridge is isolated behind its own bounded queue. Only topics
+        // matching the bridge prefix are queued, so unrelated traffic never pays
+        // for a slow or disconnected remote broker.
         if _from_client != "bridge_client" {
-            if let Some(tx) = &*self.bridge_sender.read() {
-                let _ = tx.send((topic.to_string(), payload.to_vec()));
+            let bridge = self.bridge_sender.read().clone();
+            if let Some(bridge) = bridge {
+                if topic.starts_with(bridge.topic_prefix.as_ref()) {
+                    let message = (topic.to_string(), payload.to_vec());
+                    match bridge.sender.try_send(message) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(message)) => {
+                            self.metrics_bridge_queue_backpressure_events
+                                .fetch_add(1, Ordering::Relaxed);
+                            match self.bridge_queue_policy {
+                                BridgeQueuePolicy::DropNewest => {
+                                    self.metrics_bridge_queue_dropped
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                BridgeQueuePolicy::Backpressure => {
+                                    let started = Instant::now();
+                                    let _ = bridge.sender.send(message).await;
+                                    let waited_ns =
+                                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                                    self.metrics_bridge_queue_backpressure_wait_ns
+                                        .fetch_add(waited_ns, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
+                    }
+                }
             }
         }
 
         let route = self.router.match_topic(topic);
 
-        // Deliver normal subscriptions. A full per-client queue applies backpressure
-        // to the publisher instead of allowing unbounded memory growth.
         for sub in route.normal {
             self.send_publish_to_client(
                 &sub.client_id,
@@ -328,7 +527,6 @@ impl BrokerState {
             .await;
         }
 
-        // Deliver one member from each shared subscription group.
         for (group, subs) in route.shared {
             if subs.is_empty() {
                 continue;
@@ -357,6 +555,10 @@ impl BrokerState {
             )
             .await;
         }
+
+        if let Some(route_started) = route_started {
+            self.publish_route_latency.record(route_started.elapsed());
+        }
     }
 
     /// Sends bytes to a client using a bounded queue. The fast path is non-blocking;
@@ -369,20 +571,40 @@ impl BrokerState {
                 self.metrics_client_queue_backpressure_events
                     .fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
-                let result = session.sender.send(bytes).await;
+
+                let result = match self.slow_consumer_policy {
+                    SlowConsumerPolicy::Backpressure => {
+                        session.sender.send(bytes).await.map_err(|_| ())
+                    }
+                    SlowConsumerPolicy::Disconnect => {
+                        match tokio::time::timeout(
+                            self.slow_consumer_timeout,
+                            session.sender.send(bytes),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(_)) => Err(()),
+                            Err(_) => {
+                                if session.request_disconnect() {
+                                    self.metrics_slow_consumer_disconnects
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        "Disconnecting slow consumer {} after {} ms of queue saturation",
+                                        session.client_id,
+                                        self.slow_consumer_timeout.as_millis(),
+                                    );
+                                }
+                                Err(())
+                            }
+                        }
+                    }
+                };
+
                 let waited_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 self.metrics_client_queue_backpressure_wait_ns
                     .fetch_add(waited_ns, Ordering::Relaxed);
-
-                if let Err(e) = result {
-                    warn!(
-                        "Failed to send packet after backpressure wait for client {}: {}",
-                        session.client_id, e
-                    );
-                    false
-                } else {
-                    true
-                }
+                result.is_ok()
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 debug!("Outbound queue closed for client {}", session.client_id);
@@ -454,5 +676,39 @@ impl BrokerState {
             let _ = self.send_to_session(&session, buf).await;
         }
         info!("Sent DISCONNECT to all connected clients.");
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn policy_parsing_is_stable() {
+        assert_eq!(
+            SlowConsumerPolicy::parse("disconnect"),
+            SlowConsumerPolicy::Disconnect
+        );
+        assert_eq!(
+            SlowConsumerPolicy::parse("anything"),
+            SlowConsumerPolicy::Backpressure
+        );
+        assert_eq!(
+            BridgeQueuePolicy::parse("backpressure"),
+            BridgeQueuePolicy::Backpressure
+        );
+        assert_eq!(
+            BridgeQueuePolicy::parse("drop-newest"),
+            BridgeQueuePolicy::DropNewest
+        );
+    }
+
+    #[test]
+    fn disconnect_request_is_idempotent() {
+        let (tx, _rx) = mpsc::channel(1);
+        let session = ClientSession::new("slow".to_string(), None, true, 60, 0, tx);
+        assert!(session.request_disconnect());
+        assert!(!session.request_disconnect());
+        assert!(session.disconnect_requested());
     }
 }

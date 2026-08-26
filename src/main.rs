@@ -1,6 +1,7 @@
 mod bridge;
 mod codec;
 mod config;
+mod latency;
 mod metrics;
 mod persistence;
 mod router;
@@ -429,9 +430,19 @@ where
 
     let result: Result<(), Box<dyn std::error::Error>> = async {
         loop {
-            // Read next bytes with a timeout based on keep-alive
-            let read_result =
-                tokio::time::timeout(keep_alive_duration, read_half.read_buf(&mut read_buf)).await;
+            if session.disconnect_requested() {
+                warn!("Disconnect requested for client '{}'", client_id);
+                break;
+            }
+
+            // Slow-consumer policy can interrupt an otherwise idle socket read.
+            let read_result = tokio::select! {
+                _ = session.disconnect_notify.notified() => {
+                    warn!("Slow-consumer disconnect triggered for client '{}'", client_id);
+                    break;
+                }
+                result = tokio::time::timeout(keep_alive_duration, read_half.read_buf(&mut read_buf)) => result,
+            };
 
             match read_result {
                 Ok(Ok(0)) => {
@@ -547,13 +558,17 @@ async fn process_client_packet(
             for sub in &pkt.subscriptions {
                 // Check read authorization
                 if state.auth.authorize(username, sub.topic_filter, "read") {
-                    state.subscribe(
+                    let accepted = state.subscribe(
                         &session.client_id,
                         sub.topic_filter,
                         sub.options & 0x03,
                         pkt.properties.subscription_identifier,
                     );
-                    reason_codes.push(sub.options & 0x03);
+                    if accepted {
+                        reason_codes.push(sub.options & 0x03);
+                    } else {
+                        reason_codes.push(0x97); // Quota exceeded
+                    }
                 } else {
                     warn!(
                         "Client '{}' (user: '{}') not authorized to subscribe to filter '{}'",

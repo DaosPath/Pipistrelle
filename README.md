@@ -165,6 +165,8 @@ La metodología y los resultados de referencia ARM64 están documentados en [`do
 
 Desde `2.0.0.1`, las colas de salida por cliente son **bounded**. `PIPISTRELLE_CLIENT_QUEUE_CAPACITY` (default `1024`) limita los paquetes pendientes por cliente; si un consumidor no drena lo suficientemente rápido, Pipistrelle aplica backpressure al productor en vez de dejar crecer la memoria sin límite. Prometheus expone profundidad de cola, capacidad, eventos de presión y tiempo acumulado de espera.
 
+Desde `2.0.0.2`, también hay cuotas y aislamiento configurables: `PIPISTRELLE_MAX_SUBSCRIPTIONS_PER_CLIENT`, política de slow consumer (`backpressure|disconnect`), cola bounded del bridge (`drop-newest|backpressure`) y telemetría de latencia p50/p95/p99 muestreada con `PIPISTRELLE_LATENCY_SAMPLE_RATE` (default `64`). `/info` publica la configuración efectiva y `/metrics` expone los contadores asociados.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración

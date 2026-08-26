@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::codec::{Connect, Packet, Subscribe, Subscription, decode_packet, encode_packet};
 use crate::crypto::{self, TlsProfile};
-use crate::session::BrokerState;
+use crate::session::{BridgeQueueHandle, BrokerState};
 
 pub async fn start_bridge_engine(state: Arc<BrokerState>) {
     let host = match std::env::var("PIPISTRELLE_BRIDGE_HOST") {
@@ -38,8 +38,11 @@ pub async fn start_bridge_engine(state: Arc<BrokerState>) {
         host, port
     );
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
-    *state.bridge_sender.write() = Some(tx);
+    let (tx, mut rx) = mpsc::channel::<(String, Vec<u8>)>(state.bridge_queue_capacity);
+    *state.bridge_sender.write() = Some(BridgeQueueHandle {
+        sender: tx,
+        topic_prefix: Arc::<str>::from(local_pub_pattern),
+    });
 
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -90,7 +93,7 @@ async fn connect_and_run_bridge(
     remote_sub_filter: &str,
     local_pub_pattern: &str,
     state: Arc<BrokerState>,
-    local_rx: &mut mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+    local_rx: &mut mpsc::Receiver<(String, Vec<u8>)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Establish TCP connection
     let addr = format!("{}:{}", host, port);

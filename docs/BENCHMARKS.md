@@ -101,3 +101,35 @@ The per-client outbound queue is not exercised by the `ingest` benchmark because
 ### TLS/PQC regression check
 
 A native 10-client TLS loopback run negotiated `X25519MLKEM768` on all 10 connections and completed 200,000 messages at **706.9 k msg/s** with zero failures. The cryptographic mode therefore remains operational after the backpressure refactor. Short TLS throughput runs show substantial run-to-run variance on the shared Orange Pi and are not used as a release gate.
+
+## V2 2.0.0.2 isolation / observability validation
+
+`2.0.0.2` keeps the bounded client queues from `2.0.0.1` and adds policy/bridge isolation plus sampled latency telemetry. Benchmarks below were run on the same Orange Pi with the native Rust generator. Because this SBC also runs other services, short-run throughput can vary materially; release conclusions use clean-container runs and treat later hot-system runs as variance rather than exact regressions.
+
+### Clean 10M routing gate
+
+A fresh-container run delivered **10,000,000 QoS 0 loopback messages** with 10 clients at **899.7 k msg/s**. Broker memory stayed around **105–106 MiB** during the run and about **104 MiB** after the run. This is effectively equal to the controlled `2.0.0.1` release gate of **900.3 k msg/s** while adding the new policies and telemetry.
+
+With the default latency sample rate of `64`, the 10M run produced exactly **156,250 latency samples**. The sampled histogram reported approximately:
+
+- p50: **<= 5 µs**
+- p95: **<= 5 µs**
+- p99: **<= 250 µs**
+
+These are bucket upper bounds for internal publish-routing time, including queue waits when sampled; they are not client-observed end-to-end network latency.
+
+### Sustained ingest
+
+Two 50-million-message sustained ingest runs during `2.0.0.2` development measured roughly **3.03–3.08 M msg/s** (about **370–377 MiB/s** of 128-byte payload). The ingest path is extremely sensitive to CPU scheduling and other workloads on the shared Orange Pi, so this range is recorded as an observed result rather than a hard capacity claim.
+
+### TLS hybrid PQC
+
+A native 10-client TLS 1.3 loopback check delivered **200,000 messages at 732.3 k msg/s** and all 10 connections negotiated **`X25519MLKEM768`**.
+
+### Policy validation
+
+The new policies were exercised against dedicated temporary broker instances:
+
+- Subscription quota set to 2: the first two subscriptions were granted and the third returned MQTT v5 reason **`0x97`**; `pipistrelle_subscription_quota_rejections_total` increased to 1.
+- Remote bridge unavailable, queue capacity 16, `drop-newest`: after 100 matching `sensor/` publishes, the queue held **16**, and exactly **84** additional messages were counted in both bridge-full and bridge-drop counters.
+- Slow consumer with queue capacity 16, `disconnect`, 100 ms timeout: a raw MQTT subscriber stopped reading from its socket; the broker recorded **84** queue-pressure events, disconnected that client exactly once, removed the active connection, and the publisher completed successfully.

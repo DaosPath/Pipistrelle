@@ -354,12 +354,25 @@ def run_test_metrics():
             if not line.startswith('#'):
                 print(f"    {line}")
                 
-        # Verify key metrics exist
-        if "pipistrelle_connections_total" in html and "pipistrelle_messages_published_total" in html:
+        # Verify core V2 observability exists.
+        required_metrics = [
+            "pipistrelle_connections_total",
+            "pipistrelle_messages_published_total",
+            "pipistrelle_client_queue_backpressure_total",
+            "pipistrelle_slow_consumer_disconnects_total",
+            "pipistrelle_subscription_quota_rejections_total",
+            "pipistrelle_bridge_queue_dropped_total",
+            "pipistrelle_publish_route_latency_p50_seconds",
+            "pipistrelle_publish_route_latency_p95_seconds",
+            "pipistrelle_publish_route_latency_p99_seconds",
+            "pipistrelle_build_info",
+        ]
+        missing = [name for name in required_metrics if name not in html]
+        if not missing:
             print("  [PASS] Metrics exporter is functioning correctly and exposes expected metrics.")
             return True
         else:
-            print("  [FAIL] Metrics do not contain expected Pipistrelle gauges/counters.")
+            print(f"  [FAIL] Missing Pipistrelle metrics: {missing}")
             return False
     except Exception as e:
         print(f"  [FAIL] Failed to scrape metrics endpoint: {e}")
