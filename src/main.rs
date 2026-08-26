@@ -286,7 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("Shutdown signal received. Initiating graceful shutdown...");
-    broker_state.graceful_shutdown();
+    broker_state.graceful_shutdown().await;
 
     // Let connection channels flush before exiting
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -376,7 +376,7 @@ where
     );
 
     // 2. Set up channels for sending outgoing packets to this client
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(state.client_queue_capacity);
 
     let session = Arc::new(ClientSession::new(
         client_id.clone(),
@@ -417,7 +417,7 @@ where
     });
     let mut connack_buf = Vec::new();
     encode_packet(&connack, &mut connack_buf);
-    let _ = session.sender.send(connack_buf);
+    let _ = state.send_to_session(&session, connack_buf).await;
 
     // 5. Main packet reading and processing loop
     let keep_alive_duration = if keep_alive > 0 {
@@ -446,7 +446,7 @@ where
                     loop {
                         match decode_packet(&read_buf) {
                             Ok((packet, bytes_read)) => {
-                                process_client_packet(&packet, &state, &session)?;
+                                process_client_packet(&packet, &state, &session).await?;
                                 read_buf.advance(bytes_read);
                             }
                             Err(codec::CodecError::Incomplete) => {
@@ -481,7 +481,7 @@ where
     result
 }
 
-fn process_client_packet(
+async fn process_client_packet(
     packet: &Packet<'_>,
     state: &BrokerState,
     session: &ClientSession,
@@ -509,19 +509,21 @@ fn process_client_packet(
                         });
                         let mut buf = Vec::new();
                         encode_packet(&puback, &mut buf);
-                        let _ = session.sender.send(buf);
+                        let _ = state.send_to_session(session, buf).await;
                     }
                 }
                 return Ok(());
             }
 
-            state.route_publish(
-                &session.client_id,
-                pkt.topic,
-                pkt.payload,
-                pkt.qos,
-                pkt.retain,
-            );
+            state
+                .route_publish(
+                    &session.client_id,
+                    pkt.topic,
+                    pkt.payload,
+                    pkt.qos,
+                    pkt.retain,
+                )
+                .await;
 
             // If QoS 1, respond with PUBACK
             if pkt.qos == 1 {
@@ -533,7 +535,7 @@ fn process_client_packet(
                     });
                     let mut buf = Vec::new();
                     encode_packet(&puback, &mut buf);
-                    let _ = session.sender.send(buf);
+                    let _ = state.send_to_session(session, buf).await;
                 }
             }
         }
@@ -568,7 +570,7 @@ fn process_client_packet(
             });
             let mut buf = Vec::new();
             encode_packet(&suback, &mut buf);
-            let _ = session.sender.send(buf);
+            let _ = state.send_to_session(session, buf).await;
         }
         Packet::PubAck(pkt) => {
             debug!(
@@ -590,7 +592,7 @@ fn process_client_packet(
             let pingresp = Packet::PingResp;
             let mut buf = Vec::new();
             encode_packet(&pingresp, &mut buf);
-            let _ = session.sender.send(buf);
+            let _ = state.send_to_session(session, buf).await;
         }
         Packet::Disconnect(_) => {
             info!("Received DISCONNECT from client '{}'", session.client_id);

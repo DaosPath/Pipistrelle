@@ -45,7 +45,23 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
 
                         let (status, content_type, body) = match path {
                             "/metrics" => {
-                                let active_connections = state.sessions.read().len();
+                                let (active_connections, queued_messages, queue_capacity_total) = {
+                                    let sessions = state.sessions.read();
+                                    let queued_messages = sessions
+                                        .values()
+                                        .map(|session| {
+                                            session
+                                                .sender
+                                                .max_capacity()
+                                                .saturating_sub(session.sender.capacity())
+                                        })
+                                        .sum::<usize>();
+                                    let queue_capacity_total = sessions
+                                        .values()
+                                        .map(|session| session.sender.max_capacity())
+                                        .sum::<usize>();
+                                    (sessions.len(), queued_messages, queue_capacity_total)
+                                };
                                 let messages_published =
                                     state.metrics_messages_published.load(Ordering::Relaxed);
                                 let subscriptions =
@@ -55,6 +71,14 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 let tls_classical = state
                                     .metrics_tls_classical_handshakes
                                     .load(Ordering::Relaxed);
+                                let queue_backpressure_events = state
+                                    .metrics_client_queue_backpressure_events
+                                    .load(Ordering::Relaxed);
+                                let queue_backpressure_wait_seconds = state
+                                    .metrics_client_queue_backpressure_wait_ns
+                                    .load(Ordering::Relaxed)
+                                    as f64
+                                    / 1_000_000_000.0;
                                 let body = format!(
                                     concat!(
                                         "# HELP pipistrelle_connections_total Active MQTT client connections\n",
@@ -70,6 +94,18 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                         "# TYPE pipistrelle_tls_handshakes_total counter\n",
                                         "pipistrelle_tls_handshakes_total{{kind=\"pqc\"}} {}\n",
                                         "pipistrelle_tls_handshakes_total{{kind=\"classical\"}} {}\n",
+                                        "# HELP pipistrelle_client_outbound_queue_messages Messages currently buffered across client outbound queues\n",
+                                        "# TYPE pipistrelle_client_outbound_queue_messages gauge\n",
+                                        "pipistrelle_client_outbound_queue_messages {}\n",
+                                        "# HELP pipistrelle_client_outbound_queue_capacity_messages Total bounded outbound queue capacity across connected clients\n",
+                                        "# TYPE pipistrelle_client_outbound_queue_capacity_messages gauge\n",
+                                        "pipistrelle_client_outbound_queue_capacity_messages {}\n",
+                                        "# HELP pipistrelle_client_queue_backpressure_total Number of times a client outbound queue filled and forced producer backpressure\n",
+                                        "# TYPE pipistrelle_client_queue_backpressure_total counter\n",
+                                        "pipistrelle_client_queue_backpressure_total {}\n",
+                                        "# HELP pipistrelle_client_queue_backpressure_wait_seconds_total Cumulative time producers waited for bounded client queue capacity\n",
+                                        "# TYPE pipistrelle_client_queue_backpressure_wait_seconds_total counter\n",
+                                        "pipistrelle_client_queue_backpressure_wait_seconds_total {:.9}\n",
                                         "# HELP pipistrelle_build_info Pipistrelle build information\n",
                                         "# TYPE pipistrelle_build_info gauge\n",
                                         "pipistrelle_build_info{{version=\"{}\",series=\"{}\",tls_profile=\"{}\"}} 1\n",
@@ -79,6 +115,10 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     subscriptions,
                                     tls_pqc,
                                     tls_classical,
+                                    queued_messages,
+                                    queue_capacity_total,
+                                    queue_backpressure_events,
+                                    queue_backpressure_wait_seconds,
                                     version::VERSION,
                                     version::SERIES,
                                     tls_profile.as_str(),
@@ -98,10 +138,11 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 "200 OK",
                                 "application/json; charset=utf-8",
                                 format!(
-                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\"}}\n",
+                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{}}}\n",
                                     version::VERSION,
                                     version::SERIES,
                                     tls_profile.as_str(),
+                                    state.client_queue_capacity,
                                 ),
                             ),
                             _ => (

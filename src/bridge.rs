@@ -207,7 +207,7 @@ async fn connect_and_run_bridge(
                         Ok((Packet::Publish(pkt), consumed)) => {
                             debug!("Bridge received remote publish: topic='{}'", pkt.topic);
                             // Route locally (prevent loops by using special sender name)
-                            state.route_publish("bridge_client", pkt.topic, pkt.payload, pkt.qos, pkt.retain);
+                            state.route_publish("bridge_client", pkt.topic, pkt.payload, pkt.qos, pkt.retain).await;
                             read_buf.advance(consumed);
                         }
                         Ok((Packet::PingResp, consumed)) => {

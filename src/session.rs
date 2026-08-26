@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -29,7 +29,7 @@ pub struct ClientSession {
     pub last_activity: RwLock<Instant>,
 
     // Channel to send raw serialized bytes to the client's TCP writer task
-    pub sender: mpsc::UnboundedSender<Vec<u8>>,
+    pub sender: mpsc::Sender<Vec<u8>>,
 
     // Topic aliases sent by the client: Alias ID -> Topic String
     pub topic_aliases: RwLock<HashMap<u16, String>>,
@@ -46,7 +46,7 @@ impl ClientSession {
         clean_start: bool,
         keep_alive: u16,
         session_expiry_interval: u32,
-        sender: mpsc::UnboundedSender<Vec<u8>>,
+        sender: mpsc::Sender<Vec<u8>>,
     ) -> Self {
         Self {
             client_id,
@@ -107,12 +107,25 @@ pub struct BrokerState {
     pub metrics_subscriptions: AtomicUsize,
     pub metrics_tls_pqc_handshakes: AtomicUsize,
     pub metrics_tls_classical_handshakes: AtomicUsize,
+    pub metrics_client_queue_backpressure_events: AtomicUsize,
+    pub metrics_client_queue_backpressure_wait_ns: AtomicU64,
+    pub client_queue_capacity: usize,
     // Bridge channel
     pub bridge_sender: RwLock<Option<mpsc::UnboundedSender<(String, Vec<u8>)>>>,
 }
 
 impl BrokerState {
     pub fn new() -> Self {
+        let client_queue_capacity = std::env::var("PIPISTRELLE_CLIENT_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(16, 65_536))
+            .unwrap_or(1_024);
+        info!(
+            "Per-client outbound queue capacity: {} messages",
+            client_queue_capacity
+        );
+
         Self {
             router: TopicRouter::new(),
             sessions: RwLock::new(HashMap::new()),
@@ -123,6 +136,9 @@ impl BrokerState {
             metrics_subscriptions: AtomicUsize::new(0),
             metrics_tls_pqc_handshakes: AtomicUsize::new(0),
             metrics_tls_classical_handshakes: AtomicUsize::new(0),
+            metrics_client_queue_backpressure_events: AtomicUsize::new(0),
+            metrics_client_queue_backpressure_wait_ns: AtomicU64::new(0),
+            client_queue_capacity,
             bridge_sender: RwLock::new(None),
         }
     }
@@ -137,7 +153,7 @@ impl BrokerState {
                 let mut sessions_guard = self.sessions.write();
                 for (client_id, username, clean_start, expiry) in sessions_loaded {
                     // Create offline session with dummy sender channel (replaced when client reconnects)
-                    let (tx, _) = mpsc::unbounded_channel::<Vec<u8>>();
+                    let (tx, _) = mpsc::channel::<Vec<u8>>(self.client_queue_capacity);
                     let session = Arc::new(ClientSession::new(
                         client_id.clone(),
                         username,
@@ -278,7 +294,7 @@ impl BrokerState {
         removed
     }
 
-    pub fn route_publish(
+    pub async fn route_publish(
         &self,
         _from_client: &str,
         topic: &str,
@@ -289,7 +305,7 @@ impl BrokerState {
         self.metrics_messages_published
             .fetch_add(1, Ordering::Relaxed);
 
-        // Forward local publish to the bridge if it didn't originate from the bridge itself
+        // Forward local publish to the bridge if it didn't originate from the bridge itself.
         if _from_client != "bridge_client" {
             if let Some(tx) = &*self.bridge_sender.read() {
                 let _ = tx.send((topic.to_string(), payload.to_vec()));
@@ -298,7 +314,8 @@ impl BrokerState {
 
         let route = self.router.match_topic(topic);
 
-        // 1. Deliver to normal subscribers
+        // Deliver normal subscriptions. A full per-client queue applies backpressure
+        // to the publisher instead of allowing unbounded memory growth.
         for sub in route.normal {
             self.send_publish_to_client(
                 &sub.client_id,
@@ -307,22 +324,24 @@ impl BrokerState {
                 qos,
                 retain,
                 sub.subscription_identifier,
-            );
+            )
+            .await;
         }
 
-        // 2. Deliver to shared subscribers (balance load per group using round-robin)
+        // Deliver one member from each shared subscription group.
         for (group, subs) in route.shared {
             if subs.is_empty() {
                 continue;
             }
 
-            let mut counters = self.shared_group_counters.write();
-            let counter = counters
-                .entry(group.clone())
-                .or_insert_with(|| AtomicUsize::new(0));
-
-            let index = counter.fetch_add(1, Ordering::Relaxed);
-            let selected_sub = &subs[index % subs.len()];
+            let selected_sub = {
+                let mut counters = self.shared_group_counters.write();
+                let counter = counters
+                    .entry(group.clone())
+                    .or_insert_with(|| AtomicUsize::new(0));
+                let index = counter.fetch_add(1, Ordering::Relaxed);
+                subs[index % subs.len()].clone()
+            };
 
             debug!(
                 "Routing shared publish for group {} to client {}",
@@ -335,12 +354,45 @@ impl BrokerState {
                 qos,
                 retain,
                 selected_sub.subscription_identifier,
-            );
+            )
+            .await;
         }
     }
 
-    /// Serializes and sends a publish message to a specific client session
-    fn send_publish_to_client(
+    /// Sends bytes to a client using a bounded queue. The fast path is non-blocking;
+    /// when the queue is full, pressure propagates back to the publisher until the
+    /// socket writer drains enough capacity.
+    pub async fn send_to_session(&self, session: &ClientSession, bytes: Vec<u8>) -> bool {
+        match session.sender.try_send(bytes) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(bytes)) => {
+                self.metrics_client_queue_backpressure_events
+                    .fetch_add(1, Ordering::Relaxed);
+                let started = Instant::now();
+                let result = session.sender.send(bytes).await;
+                let waited_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                self.metrics_client_queue_backpressure_wait_ns
+                    .fetch_add(waited_ns, Ordering::Relaxed);
+
+                if let Err(e) = result {
+                    warn!(
+                        "Failed to send packet after backpressure wait for client {}: {}",
+                        session.client_id, e
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                debug!("Outbound queue closed for client {}", session.client_id);
+                false
+            }
+        }
+    }
+
+    /// Serializes and sends a publish message to a specific client session.
+    async fn send_publish_to_client(
         &self,
         client_id: &str,
         topic: &str,
@@ -349,13 +401,13 @@ impl BrokerState {
         retain: bool,
         subscription_identifier: Option<u32>,
     ) {
-        let sessions = self.sessions.read();
-        if let Some(session) = sessions.get(client_id) {
+        let session = { self.sessions.read().get(client_id).cloned() };
+        if let Some(session) = session {
             let packet_id = if qos > 0 {
                 let pid = session.get_next_packet_id();
                 session.add_in_flight(pid, topic, payload, qos);
 
-                // Persist the in-flight QoS 1 message
+                // Persist the in-flight QoS 1 message.
                 let db = self.db.clone();
                 let cid = client_id.to_string();
                 let t = topic.to_string();
@@ -384,30 +436,22 @@ impl BrokerState {
 
             let mut buf = Vec::new();
             encode_packet(&publish_pkt, &mut buf);
-
-            if let Err(e) = session.sender.send(buf) {
-                warn!(
-                    "Failed to send packet to client channel for {}: {}",
-                    client_id, e
-                );
-            }
+            let _ = self.send_to_session(&session, buf).await;
         }
     }
 
     /// Gracefully disconnects all active client sessions.
-    pub fn graceful_shutdown(&self) {
+    pub async fn graceful_shutdown(&self) {
         info!("Gracefully disconnecting all clients...");
-        let sessions = self.sessions.read();
-        for (client_id, session) in sessions.iter() {
+        let sessions: Vec<Arc<ClientSession>> = self.sessions.read().values().cloned().collect();
+        for session in sessions {
             let disconnect_pkt = Packet::Disconnect(crate::codec::Disconnect {
-                reason_code: 0x00, // Normal disconnection
+                reason_code: 0x00,
                 properties: Default::default(),
             });
             let mut buf = Vec::new();
             encode_packet(&disconnect_pkt, &mut buf);
-            if let Err(e) = session.sender.send(buf) {
-                debug!("Failed to send DISCONNECT to client {}: {}", client_id, e);
-            }
+            let _ = self.send_to_session(&session, buf).await;
         }
         info!("Sent DISCONNECT to all connected clients.");
     }

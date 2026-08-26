@@ -163,6 +163,8 @@ cargo build --release --bin pipistrelle-bench
 
 La metodología y los resultados de referencia ARM64 están documentados en [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
+Desde `2.0.0.1`, las colas de salida por cliente son **bounded**. `PIPISTRELLE_CLIENT_QUEUE_CAPACITY` (default `1024`) limita los paquetes pendientes por cliente; si un consumidor no drena lo suficientemente rápido, Pipistrelle aplica backpressure al productor en vez de dejar crecer la memoria sin límite. Prometheus expone profundidad de cola, capacidad, eventos de presión y tiempo acumulado de espera.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración

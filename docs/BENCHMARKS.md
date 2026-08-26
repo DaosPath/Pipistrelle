@@ -73,3 +73,31 @@ FULL=1 ./scripts/bench-native-orange-pi.sh
 ```
 
 Results are written under `bench-results/`, which is ignored by Git.
+
+## V2 2.0.0.1 backpressure validation
+
+`2.0.0.1` replaces the unbounded per-client writer channel with a bounded queue (`PIPISTRELLE_CLIENT_QUEUE_CAPACITY`, default `1024`) and propagates queue pressure back to publishers. No intentional packet dropping is used.
+
+### Direct before/after
+
+For the release gate, both versions were started in fresh containers on the same Orange Pi and driven by the same native Rust load generator with the same 10-client / 10-million-message workload.
+
+| Scenario | 2.0.0.0 | 2.0.0.1 | Change |
+|---|---:|---:|---:|
+| Sustained TCP loopback, 10 clients, 10M QoS 0 | **928.8 k msg/s** | **900.3 k msg/s** | **-3.08%** |
+| Observed broker memory peak | **1.501 GiB** | **146.3 MiB** | **~90.5% lower** |
+| Broker memory ~2 s after the run | **1.055 GiB** | **123.1 MiB** | **~88.6% lower** |
+| TCP loopback, 50 clients, 1M QoS 0 | 673.5 k msg/s | **758.7 k msg/s** | **+12.7%** |
+| TCP loopback, 10 clients, 50k QoS 1 | 124.4 k msg/s | **130.3 k msg/s** | **+4.7%** |
+
+The controlled `2.0.0.1` run delivered all 10,000,000 loopback messages successfully. The bounded queues reached capacity **133,705** times and accumulated **65.441 seconds** of producer wait across concurrent tasks. This cumulative wait can exceed wall-clock time because multiple publishers may be waiting concurrently.
+
+The release trade-off is therefore explicit: about **3% lower throughput** in this sustained 10-client stress case in exchange for roughly a **10x reduction in observed peak broker memory** and elimination of unbounded per-client output growth. No messages were intentionally dropped.
+
+### Ingest ceiling
+
+The per-client outbound queue is not exercised by the `ingest` benchmark because there are no subscribers. Two sustained 50-million-message runs on `2.0.0.1` measured **3.288 M msg/s** and **3.403 M msg/s**, versus **3.476 M msg/s** for the earlier `2.0.0.0` reference run. This represents roughly 2–5% run-to-run/async-path overhead in the current measurements and should be profiled further rather than treated as a queue-backpressure cost.
+
+### TLS/PQC regression check
+
+A native 10-client TLS loopback run negotiated `X25519MLKEM768` on all 10 connections and completed 200,000 messages at **706.9 k msg/s** with zero failures. The cryptographic mode therefore remains operational after the backpressure refactor. Short TLS throughput runs show substantial run-to-run variance on the shared Orange Pi and are not used as a release gate.
