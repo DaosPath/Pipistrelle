@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -28,17 +30,24 @@ pub struct AuthConfig {
     // None means anonymous mode was explicitly enabled.
     // Some(map), including an empty map, means authentication is enforced.
     users: Option<HashMap<String, UserConfig>>,
+    // Argon2 is intentionally expensive. Bound concurrent verifications to protect RAM/CPU.
+    auth_limit: Arc<Semaphore>,
 }
 
 impl AuthConfig {
-    fn closed() -> Self {
+    fn with_users(users: Option<HashMap<String, UserConfig>>) -> Self {
         Self {
-            users: Some(HashMap::new()),
+            users,
+            auth_limit: Arc::new(Semaphore::new(max_auth_concurrency())),
         }
     }
 
+    fn closed() -> Self {
+        Self::with_users(Some(HashMap::new()))
+    }
+
     fn anonymous() -> Self {
-        Self { users: None }
+        Self::with_users(None)
     }
 
     pub fn load() -> Self {
@@ -79,8 +88,13 @@ impl AuthConfig {
                         for user in config.users {
                             map.insert(user.username.clone(), user);
                         }
-                        info!("Loaded {} user(s) from {}", map.len(), path_str);
-                        Self { users: Some(map) }
+                        info!(
+                            "Loaded {} user(s) from {} (max concurrent Argon2 verifications: {})",
+                            map.len(),
+                            path_str,
+                            max_auth_concurrency(),
+                        );
+                        Self::with_users(Some(map))
                     }
                     Err(e) => {
                         error!(
@@ -101,18 +115,30 @@ impl AuthConfig {
         }
     }
 
-    /// Authenticates a user with Argon2id.
+    /// Authenticates a user with Argon2id outside Tokio's async worker threads.
     /// Anonymous access is allowed only when explicitly enabled.
-    pub fn authenticate(&self, username: &str, password: &str) -> bool {
+    pub async fn authenticate(&self, username: &str, password: &str) -> bool {
         let users = match &self.users {
             Some(u) => u,
             None => return true,
         };
 
-        users
-            .get(username)
-            .map(|user| verify_password(password, &user.password_hash))
-            .unwrap_or(false)
+        let Some(user) = users.get(username) else {
+            return false;
+        };
+
+        let hash = user.password_hash.clone();
+        let password = password.to_string();
+        let Ok(permit) = self.auth_limit.clone().acquire_owned().await else {
+            return false;
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            verify_password(&password, &hash)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Authorizes an action ("read" or "write") for a user on a given topic.
@@ -139,6 +165,14 @@ impl AuthConfig {
 
         false
     }
+}
+
+fn max_auth_concurrency() -> usize {
+    std::env::var("PIPISTRELLE_MAX_AUTH_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 64))
+        .unwrap_or(4)
 }
 
 fn anonymous_access_enabled() -> bool {
@@ -191,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_argon2_password_verification() {
-        let hash = "$argon2id$v=19$m=65536,t=3,p=1$ZDhmMWVlOGMxMTZlOTAwYzJhZGIzMDBlYWJjZWJlZmY$r+HP8qLT3CpBzxqniOJShpDgZ/O95L8TaQGBQKB573o";
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$MjY4NGRlMWY5YzliZDUwNjBhOGJhYTJhZDM1OWViZTE$qjlHo3ALKgMXLw1bgRz/p7LGhqvC4RKrgxMuvgPNNfg";
         assert!(verify_password("admin123", hash));
         assert!(!verify_password("wrongpassword", hash));
     }
@@ -201,9 +235,18 @@ mod tests {
         assert!(topic_matches_acl_filter("a/b/c", "a/b/c"));
         assert!(!topic_matches_acl_filter("a/b/c", "a/b/d"));
         assert!(topic_matches_acl_filter("sensor/temperature", "sensor/+"));
-        assert!(topic_matches_acl_filter("sensor/temperature/cpu", "sensor/+/cpu"));
-        assert!(!topic_matches_acl_filter("sensor/temperature/cpu", "sensor/+"));
-        assert!(topic_matches_acl_filter("sensor/temperature/cpu", "sensor/#"));
+        assert!(topic_matches_acl_filter(
+            "sensor/temperature/cpu",
+            "sensor/+/cpu"
+        ));
+        assert!(!topic_matches_acl_filter(
+            "sensor/temperature/cpu",
+            "sensor/+"
+        ));
+        assert!(topic_matches_acl_filter(
+            "sensor/temperature/cpu",
+            "sensor/#"
+        ));
         assert!(topic_matches_acl_filter("sensor", "sensor/#"));
         assert!(topic_matches_acl_filter("a/b/c/d/e", "#"));
     }

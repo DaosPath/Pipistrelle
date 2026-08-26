@@ -1,13 +1,13 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::Instant;
-use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use tracing::{info, warn, debug, error};
+use tracing::{debug, error, info, warn};
 
-use crate::router::TopicRouter;
 use crate::codec::{Packet, Publish, PublishProperties, encode_packet};
+use crate::router::TopicRouter;
 
 /// Information about a message currently in-flight (QoS > 0)
 #[derive(Debug, Clone)]
@@ -27,13 +27,13 @@ pub struct ClientSession {
     pub keep_alive: u16,
     pub session_expiry_interval: u32,
     pub last_activity: RwLock<Instant>,
-    
+
     // Channel to send raw serialized bytes to the client's TCP writer task
     pub sender: mpsc::UnboundedSender<Vec<u8>>,
-    
+
     // Topic aliases sent by the client: Alias ID -> Topic String
     pub topic_aliases: RwLock<HashMap<u16, String>>,
-    
+
     // QoS 1/2 state
     next_packet_id: AtomicU16,
     pub in_flight: RwLock<HashMap<u16, InFlightMessage>>,
@@ -105,6 +105,8 @@ pub struct BrokerState {
     // Prometheus Metrics
     pub metrics_messages_published: AtomicUsize,
     pub metrics_subscriptions: AtomicUsize,
+    pub metrics_tls_pqc_handshakes: AtomicUsize,
+    pub metrics_tls_classical_handshakes: AtomicUsize,
     // Bridge channel
     pub bridge_sender: RwLock<Option<mpsc::UnboundedSender<(String, Vec<u8>)>>>,
 }
@@ -119,6 +121,8 @@ impl BrokerState {
             shared_group_counters: RwLock::new(HashMap::new()),
             metrics_messages_published: AtomicUsize::new(0),
             metrics_subscriptions: AtomicUsize::new(0),
+            metrics_tls_pqc_handshakes: AtomicUsize::new(0),
+            metrics_tls_classical_handshakes: AtomicUsize::new(0),
             bridge_sender: RwLock::new(None),
         }
     }
@@ -126,7 +130,7 @@ impl BrokerState {
     /// Restores all sessions, subscriptions, and in-flight messages from SQLite DB on boot.
     pub async fn restore_sessions_from_db(&self) {
         info!("Restoring persistent state from database...");
-        
+
         // 1. Restore sessions
         match self.db.load_all_sessions().await {
             Ok(sessions_loaded) => {
@@ -155,7 +159,8 @@ impl BrokerState {
         match self.db.load_all_subscriptions().await {
             Ok(subs_loaded) => {
                 for (client_id, topic_filter, qos, sub_id) in subs_loaded {
-                    self.router.subscribe(&client_id, &topic_filter, qos, sub_id);
+                    self.router
+                        .subscribe(&client_id, &topic_filter, qos, sub_id);
                 }
                 info!("Restored subscriptions from database");
             }
@@ -186,12 +191,12 @@ impl BrokerState {
     /// Registers a new client session, replacing any existing active session for the same client ID.
     pub fn register_session(&self, session: Arc<ClientSession>) {
         let mut sessions = self.sessions.write();
-        
+
         let client_id = session.client_id.clone();
         let username = session.username.clone();
         let clean_start = session.clean_start;
         let expiry = session.session_expiry_interval;
-        
+
         if let Some(old) = sessions.insert(client_id.clone(), session.clone()) {
             info!("Replacing existing session for client: {}", old.client_id);
         }
@@ -200,7 +205,8 @@ impl BrokerState {
         if expiry > 0 {
             let db = self.db.clone();
             tokio::spawn(async move {
-                db.save_session(client_id, username, clean_start, expiry).await;
+                db.save_session(client_id, username, clean_start, expiry)
+                    .await;
             });
         }
     }
@@ -210,9 +216,16 @@ impl BrokerState {
         let mut sessions = self.sessions.write();
         if let Some(session) = sessions.remove(client_id) {
             info!("Removed session for client: {}", client_id);
-            
-            // Delete persistent session from DB if it was clean start or session expired
+
+            // A clean/non-persistent session must leave no routing state behind.
             if session.clean_start || session.session_expiry_interval == 0 {
+                let removed = self.router.remove_client(client_id);
+                if removed > 0 {
+                    debug!(
+                        "Removed {} subscription(s) for disconnected client {}",
+                        removed, client_id
+                    );
+                }
                 let db = self.db.clone();
                 let cid = client_id.to_string();
                 tokio::spawn(async move {
@@ -223,17 +236,28 @@ impl BrokerState {
     }
 
     /// Processes subscription request and registers it in the router
-    pub fn subscribe(&self, client_id: &str, topic_filter: &str, qos: u8, subscription_identifier: Option<u32>) {
+    pub fn subscribe(
+        &self,
+        client_id: &str,
+        topic_filter: &str,
+        qos: u8,
+        subscription_identifier: Option<u32>,
+    ) {
         self.metrics_subscriptions.fetch_add(1, Ordering::Relaxed);
-        self.router.subscribe(client_id, topic_filter, qos, subscription_identifier);
-        debug!("Client {} subscribed to {} with QoS {}", client_id, topic_filter, qos);
+        self.router
+            .subscribe(client_id, topic_filter, qos, subscription_identifier);
+        debug!(
+            "Client {} subscribed to {} with QoS {}",
+            client_id, topic_filter, qos
+        );
 
         // Persist subscription
         let db = self.db.clone();
         let cid = client_id.to_string();
         let filter = topic_filter.to_string();
         tokio::spawn(async move {
-            db.save_subscription(cid, filter, qos, subscription_identifier).await;
+            db.save_subscription(cid, filter, qos, subscription_identifier)
+                .await;
         });
     }
 
@@ -242,7 +266,7 @@ impl BrokerState {
         let removed = self.router.unsubscribe(client_id, topic_filter);
         if removed {
             debug!("Client {} unsubscribed from {}", client_id, topic_filter);
-            
+
             // Delete persistent subscription
             let db = self.db.clone();
             let cid = client_id.to_string();
@@ -254,9 +278,17 @@ impl BrokerState {
         removed
     }
 
-    pub fn route_publish(&self, _from_client: &str, topic: &str, payload: &[u8], qos: u8, retain: bool) {
-        self.metrics_messages_published.fetch_add(1, Ordering::Relaxed);
-        
+    pub fn route_publish(
+        &self,
+        _from_client: &str,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+    ) {
+        self.metrics_messages_published
+            .fetch_add(1, Ordering::Relaxed);
+
         // Forward local publish to the bridge if it didn't originate from the bridge itself
         if _from_client != "bridge_client" {
             if let Some(tx) = &*self.bridge_sender.read() {
@@ -268,7 +300,14 @@ impl BrokerState {
 
         // 1. Deliver to normal subscribers
         for sub in route.normal {
-            self.send_publish_to_client(&sub.client_id, topic, payload, qos, retain, sub.subscription_identifier);
+            self.send_publish_to_client(
+                &sub.client_id,
+                topic,
+                payload,
+                qos,
+                retain,
+                sub.subscription_identifier,
+            );
         }
 
         // 2. Deliver to shared subscribers (balance load per group using round-robin)
@@ -284,8 +323,11 @@ impl BrokerState {
 
             let index = counter.fetch_add(1, Ordering::Relaxed);
             let selected_sub = &subs[index % subs.len()];
-            
-            debug!("Routing shared publish for group {} to client {}", group, selected_sub.client_id);
+
+            debug!(
+                "Routing shared publish for group {} to client {}",
+                group, selected_sub.client_id
+            );
             self.send_publish_to_client(
                 &selected_sub.client_id,
                 topic,
@@ -312,7 +354,7 @@ impl BrokerState {
             let packet_id = if qos > 0 {
                 let pid = session.get_next_packet_id();
                 session.add_in_flight(pid, topic, payload, qos);
-                
+
                 // Persist the in-flight QoS 1 message
                 let db = self.db.clone();
                 let cid = client_id.to_string();
@@ -321,7 +363,7 @@ impl BrokerState {
                 tokio::spawn(async move {
                     db.save_in_flight(cid, pid, t, p, qos).await;
                 });
-                
+
                 Some(pid)
             } else {
                 None
@@ -344,7 +386,10 @@ impl BrokerState {
             encode_packet(&publish_pkt, &mut buf);
 
             if let Err(e) = session.sender.send(buf) {
-                warn!("Failed to send packet to client channel for {}: {}", client_id, e);
+                warn!(
+                    "Failed to send packet to client channel for {}: {}",
+                    client_id, e
+                );
             }
         }
     }
@@ -367,4 +412,3 @@ impl BrokerState {
         info!("Sent DISCONNECT to all connected clients.");
     }
 }
-

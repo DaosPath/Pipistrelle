@@ -3,7 +3,7 @@ FROM rust:slim AS builder
 WORKDIR /app
 
 # Copy dependency manifests
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs VERSION ./
 
 # Create a dummy source to pre-compile and cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs

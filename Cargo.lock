@@ -615,7 +615,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pipistrelle"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "argon2",
  "bytes",
@@ -624,6 +624,7 @@ dependencies = [
  "pin-project",
  "rcgen",
  "rusqlite",
+ "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
  "serde",

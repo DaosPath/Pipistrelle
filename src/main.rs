@@ -1,19 +1,14 @@
+mod bridge;
 mod codec;
+mod config;
+mod metrics;
+mod persistence;
 mod router;
 mod session;
-mod config;
-mod persistence;
 mod tls;
 mod websocket;
-mod metrics;
-mod bridge;
 
-
-
-
-
-
-
+use bytes::{Buf, BytesMut};
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::net::SocketAddr;
@@ -23,26 +18,39 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug, Level};
+use tracing::{Level, debug, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
-use bytes::{BytesMut, Buf};
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
-use crate::codec::{Packet, decode_packet, encode_packet, ConnAck, SubAck, PubAck};
+use crate::codec::{ConnAck, Packet, PubAck, SubAck, decode_packet, encode_packet};
 use crate::session::{BrokerState, ClientSession};
+use pipistrelle::{crypto, version};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize high-performance logging subscriber
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
-        .finish();
+    // Keep benchmark/production logging cheap by default; DEBUG/TRACE are opt-in.
+    let log_level = match std::env::var("PIPISTRELLE_LOG_LEVEL")
+        .unwrap_or_else(|_| "info".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => Level::ERROR,
+        "warn" => Level::WARN,
+        "debug" => Level::DEBUG,
+        "trace" => Level::TRACE,
+        _ => Level::INFO,
+    };
+    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("Starting Pipistrelle MQTT v5.0 Broker...");
+    info!(
+        "Starting Pipistrelle {} {} MQTT v5.0 Broker...",
+        version::SERIES,
+        version::VERSION
+    );
 
     // Read environment variables for port overrides
     let port_tcp = std::env::var("PIPISTRELLE_PORT_TCP")
@@ -64,9 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "9090".to_string())
         .parse::<u16>()
         .unwrap_or(9090);
-
-
-
 
     // Parse CLI arguments
     let mut cert_path = None;
@@ -116,16 +121,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Loading TLS private key from: {:?}", key_file);
         match (load_certs(&cert_file), load_key(&key_file)) {
             (Ok(certs), Ok(key)) => {
-                // Configure ServerConfig with the aws-lc-rs crypto provider
-                let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
+                let tls_profile = crypto::TlsProfile::from_env(
+                    "PIPISTRELLE_TLS_PROFILE",
+                    crypto::TlsProfile::Hybrid,
+                );
+                let provider = crypto::provider(tls_profile);
                 let server_config = ServerConfig::builder_with_provider(Arc::new(provider))
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
+                    .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                
-                info!("Post-Quantum TLS 1.3 encryption engine initialized (using AWS-LC-RS / ML-KEM)");
+
+                info!(
+                    "TLS 1.3 crypto profile '{}' initialized: {}",
+                    tls_profile,
+                    tls_profile.description()
+                );
                 Some(TlsAcceptor::from(Arc::new(server_config)))
             }
             (Err(e), _) => {
@@ -143,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let broker_state = Arc::new(BrokerState::new());
-    
+
     // Restore persistent sessions and subscriptions from database on startup
     broker_state.restore_sessions_from_db().await;
 
@@ -152,8 +164,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start MQTT Bridging engine to HiveMQ Cloud
     bridge::start_bridge_engine(broker_state.clone()).await;
-
-
 
     // 1. Start plain TCP listener
     let plain_addr = format!("0.0.0.0:{}", port_tcp);
@@ -195,7 +205,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::spawn(async move {
                             match acceptor.accept(socket).await {
                                 Ok(tls_stream) => {
-                                    if let Err(e) = handle_connection(tls_stream, addr, state).await {
+                                    if let Some(group) = tls_stream
+                                        .get_ref()
+                                        .1
+                                        .negotiated_key_exchange_group()
+                                        .map(|group| group.name())
+                                    {
+                                        let is_pqc = matches!(
+                                            group,
+                                            tokio_rustls::rustls::NamedGroup::X25519MLKEM768
+                                                | tokio_rustls::rustls::NamedGroup::MLKEM768
+                                                | tokio_rustls::rustls::NamedGroup::MLKEM1024
+                                                | tokio_rustls::rustls::NamedGroup::secp256r1MLKEM768
+                                        );
+                                        if is_pqc {
+                                            state
+                                                .metrics_tls_pqc_handshakes
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        } else {
+                                            state
+                                                .metrics_tls_classical_handshakes
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        debug!("TLS negotiated key exchange group: {:?}", group);
+                                    }
+                                    if let Err(e) = handle_connection(tls_stream, addr, state).await
+                                    {
                                         debug!("TLS connection closed with error: {:?}", e);
                                     }
                                 }
@@ -245,7 +280,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-
     // Wait for Ctrl-C shutdown signal
     if let Err(e) = tokio::signal::ctrl_c().await {
         error!("Failed to register Ctrl-C shutdown handler: {:?}", e);
@@ -271,21 +305,31 @@ where
     debug!("New connection from: {}", addr);
 
     let mut read_buf = BytesMut::with_capacity(4096);
-    
+
     // 1. Wait for the CONNECT packet first.
     // It must be the first packet received within a reasonable time (e.g., 5 seconds).
-    let (client_id, keep_alive, clean_start, session_expiry_interval, username, password) = match tokio::time::timeout(Duration::from_secs(5), socket.read_buf(&mut read_buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            match decode_packet(&read_buf) {
+    let (client_id, keep_alive, clean_start, session_expiry_interval, username, password) =
+        match tokio::time::timeout(Duration::from_secs(5), socket.read_buf(&mut read_buf)).await {
+            Ok(Ok(n)) if n > 0 => match decode_packet(&read_buf) {
                 Ok((Packet::Connect(pkt), bytes_read)) => {
                     let client_id = pkt.client_id.to_string();
                     let keep_alive = pkt.keep_alive;
                     let clean_start = pkt.clean_start;
-                    let session_expiry_interval = pkt.properties.session_expiry_interval.unwrap_or(0);
+                    let session_expiry_interval =
+                        pkt.properties.session_expiry_interval.unwrap_or(0);
                     let username = pkt.username.map(|s| s.to_string());
-                    let password = pkt.password.map(|b| String::from_utf8_lossy(b).into_owned());
+                    let password = pkt
+                        .password
+                        .map(|b| String::from_utf8_lossy(b).into_owned());
                     read_buf.advance(bytes_read);
-                    (client_id, keep_alive, clean_start, session_expiry_interval, username, password)
+                    (
+                        client_id,
+                        keep_alive,
+                        clean_start,
+                        session_expiry_interval,
+                        username,
+                        password,
+                    )
                 }
                 Ok((other, _)) => {
                     warn!("First packet was not CONNECT: {:?}", other);
@@ -295,23 +339,25 @@ where
                     warn!("Failed to decode CONNECT packet: {:?}", e);
                     return Ok(());
                 }
+            },
+            _ => {
+                warn!("Timeout or connection closed before CONNECT received");
+                return Ok(());
             }
-        }
-        _ => {
-            warn!("Timeout or connection closed before CONNECT received");
-            return Ok(());
-        }
-    };
-    
+        };
+
     // Authenticate client
     let authenticated = match (&username, &password) {
-        (Some(u), Some(p)) => state.auth.authenticate(u, p),
-        (None, None) => state.auth.authenticate("", ""), // Try anonymous access
+        (Some(u), Some(p)) => state.auth.authenticate(u, p).await,
+        (None, None) => state.auth.authenticate("", "").await, // Try anonymous access
         _ => false, // Missing either username or password when the other is present
     };
 
     if !authenticated {
-        warn!("Authentication failed for client '{}' (username: {:?})", client_id, username);
+        warn!(
+            "Authentication failed for client '{}' (username: {:?})",
+            client_id, username
+        );
         let connack = Packet::ConnAck(ConnAck {
             session_present: false,
             reason_code: 0x86, // Bad User Name or Password
@@ -323,12 +369,15 @@ where
         let _ = socket.shutdown().await;
         return Ok(());
     }
-    
-    info!("Client '{}' (authenticated user: {:?}) connecting from {}", client_id, username, addr);
+
+    info!(
+        "Client '{}' (authenticated user: {:?}) connecting from {}",
+        client_id, username, addr
+    );
 
     // 2. Set up channels for sending outgoing packets to this client
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    
+
     let session = Arc::new(ClientSession::new(
         client_id.clone(),
         username,
@@ -343,7 +392,7 @@ where
     // 3. Spawn a dedicated TCP writer task for this client
     let (mut read_half, mut write_half) = tokio::io::split(socket);
     let client_id_clone = client_id.clone();
-    
+
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = rx.recv().await {
             if let Err(e) = write_half.write_all(&bytes).await {
@@ -381,10 +430,8 @@ where
     let result: Result<(), Box<dyn std::error::Error>> = async {
         loop {
             // Read next bytes with a timeout based on keep-alive
-            let read_result = tokio::time::timeout(
-                keep_alive_duration,
-                read_half.read_buf(&mut read_buf)
-            ).await;
+            let read_result =
+                tokio::time::timeout(keep_alive_duration, read_half.read_buf(&mut read_buf)).await;
 
             match read_result {
                 Ok(Ok(0)) => {
@@ -424,7 +471,8 @@ where
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
 
     // 6. Cleanup session on disconnect or error
     state.remove_session(&client_id);
@@ -440,12 +488,18 @@ fn process_client_packet(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match packet {
         Packet::Publish(pkt) => {
-            debug!("Received PUBLISH from client '{}' on topic '{}'", session.client_id, pkt.topic);
-            
+            debug!(
+                "Received PUBLISH from client '{}' on topic '{}'",
+                session.client_id, pkt.topic
+            );
+
             // Check write authorization
             let username = session.username.as_deref().unwrap_or("");
             if !state.auth.authorize(username, pkt.topic, "write") {
-                warn!("Client '{}' (user: '{}') not authorized to publish on topic '{}'", session.client_id, username, pkt.topic);
+                warn!(
+                    "Client '{}' (user: '{}') not authorized to publish on topic '{}'",
+                    session.client_id, username, pkt.topic
+                );
                 if pkt.qos == 1 {
                     if let Some(pid) = pkt.packet_id {
                         let puback = Packet::PubAck(PubAck {
@@ -461,8 +515,14 @@ fn process_client_packet(
                 return Ok(());
             }
 
-            state.route_publish(&session.client_id, pkt.topic, pkt.payload, pkt.qos, pkt.retain);
-            
+            state.route_publish(
+                &session.client_id,
+                pkt.topic,
+                pkt.payload,
+                pkt.qos,
+                pkt.retain,
+            );
+
             // If QoS 1, respond with PUBACK
             if pkt.qos == 1 {
                 if let Some(pid) = pkt.packet_id {
@@ -481,18 +541,26 @@ fn process_client_packet(
             debug!("Received SUBSCRIBE from client '{}'", session.client_id);
             let mut reason_codes = Vec::new();
             let username = session.username.as_deref().unwrap_or("");
-            
+
             for sub in &pkt.subscriptions {
                 // Check read authorization
                 if state.auth.authorize(username, sub.topic_filter, "read") {
-                    state.subscribe(&session.client_id, sub.topic_filter, sub.options & 0x03, pkt.properties.subscription_identifier);
+                    state.subscribe(
+                        &session.client_id,
+                        sub.topic_filter,
+                        sub.options & 0x03,
+                        pkt.properties.subscription_identifier,
+                    );
                     reason_codes.push(sub.options & 0x03);
                 } else {
-                    warn!("Client '{}' (user: '{}') not authorized to subscribe to filter '{}'", session.client_id, username, sub.topic_filter);
+                    warn!(
+                        "Client '{}' (user: '{}') not authorized to subscribe to filter '{}'",
+                        session.client_id, username, sub.topic_filter
+                    );
                     reason_codes.push(0x87); // Not Authorized
                 }
             }
-            
+
             let suback = Packet::SubAck(SubAck {
                 packet_id: pkt.packet_id,
                 properties: Default::default(),
@@ -503,9 +571,12 @@ fn process_client_packet(
             let _ = session.sender.send(buf);
         }
         Packet::PubAck(pkt) => {
-            debug!("Received PUBACK from client '{}' for packet ID {}", session.client_id, pkt.packet_id);
+            debug!(
+                "Received PUBACK from client '{}' for packet ID {}",
+                session.client_id, pkt.packet_id
+            );
             session.remove_in_flight(pkt.packet_id);
-            
+
             // Delete from database
             let db = state.db.clone();
             let cid = session.client_id.clone();
@@ -526,11 +597,17 @@ fn process_client_packet(
             // The read loop will naturally exit because we stop processing
         }
         Packet::Connect(_) => {
-            warn!("Client '{}' sent CONNECT packet mid-session, violating protocol", session.client_id);
+            warn!(
+                "Client '{}' sent CONNECT packet mid-session, violating protocol",
+                session.client_id
+            );
             return Err("Protocol violation: duplicate CONNECT".into());
         }
         other => {
-            warn!("Unsupported packet type from client '{}': {:?}", session.client_id, other);
+            warn!(
+                "Unsupported packet type from client '{}': {:?}",
+                session.client_id, other
+            );
         }
     }
     Ok(())

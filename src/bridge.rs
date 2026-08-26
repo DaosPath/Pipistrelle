@@ -1,13 +1,14 @@
+use bytes::{Buf, BytesMut};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tracing::{info, error, debug};
-use bytes::{BytesMut, Buf};
+use tracing::{debug, error, info};
 
-use crate::codec::{Packet, Connect, Subscribe, Subscription, decode_packet, encode_packet};
+use crate::codec::{Connect, Packet, Subscribe, Subscription, decode_packet, encode_packet};
+use crate::crypto::{self, TlsProfile};
 use crate::session::BrokerState;
 
 pub async fn start_bridge_engine(state: Arc<BrokerState>) {
@@ -32,7 +33,10 @@ pub async fn start_bridge_engine(state: Arc<BrokerState>) {
     let local_pub_pattern = "sensor/";
     let remote_sub_filter = "alerts/#";
 
-    info!("Starting MQTT Bridging engine to HiveMQ Cloud ({}:{})", host, port);
+    info!(
+        "Starting MQTT Bridging engine to HiveMQ Cloud ({}:{})",
+        host, port
+    );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, Vec<u8>)>();
     *state.bridge_sender.write() = Some(tx);
@@ -40,9 +44,12 @@ pub async fn start_bridge_engine(state: Arc<BrokerState>) {
     let state_clone = state.clone();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(5);
-        
+
         loop {
-            info!("Bridge attempting to connect to remote broker at {}:{}...", host, port);
+            info!(
+                "Bridge attempting to connect to remote broker at {}:{}...",
+                host, port
+            );
             match connect_and_run_bridge(
                 &host,
                 port,
@@ -52,14 +59,20 @@ pub async fn start_bridge_engine(state: Arc<BrokerState>) {
                 local_pub_pattern,
                 state_clone.clone(),
                 &mut rx,
-            ).await {
+            )
+            .await
+            {
                 Ok(_) => {
                     info!("Bridge connection closed cleanly. Reconnecting in 5s...");
                     backoff = Duration::from_secs(5);
                 }
                 Err(e) => {
                     let err_msg = format!("{:?}", e);
-                    error!("Bridge error: {}. Retrying in {}s...", err_msg, backoff.as_secs());
+                    error!(
+                        "Bridge error: {}. Retrying in {}s...",
+                        err_msg,
+                        backoff.as_secs()
+                    );
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, Duration::from_secs(60));
                 }
@@ -88,13 +101,19 @@ async fn connect_and_run_bridge(
     let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
     root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    // Use default provider
-    let provider = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider();
-    let client_config = tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_root_certificates(root_cert_store)
-        .with_no_client_auth();
+    let tls_profile = TlsProfile::from_env("PIPISTRELLE_BRIDGE_TLS_PROFILE", TlsProfile::Hybrid);
+    let provider = crypto::provider(tls_profile);
+    let client_config =
+        tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+    info!(
+        "Bridge TLS 1.3 crypto profile '{}': {}",
+        tls_profile,
+        tls_profile.description()
+    );
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
     let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
@@ -110,7 +129,11 @@ async fn connect_and_run_bridge(
         keep_alive: 60,
         clean_start: true,
         username: if !user.is_empty() { Some(user) } else { None },
-        password: if !pass.is_empty() { Some(pass.as_bytes()) } else { None },
+        password: if !pass.is_empty() {
+            Some(pass.as_bytes())
+        } else {
+            None
+        },
         properties: Default::default(),
     });
 
@@ -121,7 +144,8 @@ async fn connect_and_run_bridge(
 
     // 4. Wait for CONNACK
     let mut read_buf = BytesMut::with_capacity(4096);
-    let n = tokio::time::timeout(Duration::from_secs(10), tls_stream.read_buf(&mut read_buf)).await??;
+    let n =
+        tokio::time::timeout(Duration::from_secs(10), tls_stream.read_buf(&mut read_buf)).await??;
     if n == 0 {
         return Err("Connection closed before CONNACK received".into());
     }
@@ -129,7 +153,9 @@ async fn connect_and_run_bridge(
     match decode_packet(&read_buf) {
         Ok((Packet::ConnAck(connack), bytes_read)) => {
             if connack.reason_code != 0 {
-                return Err(format!("Bridge connection rejected: code {}", connack.reason_code).into());
+                return Err(
+                    format!("Bridge connection rejected: code {}", connack.reason_code).into(),
+                );
             }
             read_buf.advance(bytes_read);
             info!("Bridge successfully authenticated with HiveMQ Cloud.");

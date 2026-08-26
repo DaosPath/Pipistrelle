@@ -110,7 +110,7 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
   "users": [
     {
       "username": "admin",
-      "password_hash": "$argon2id$v=19$m=65536,t=3,p=1$ZDhmMWVlOGMxMTZlOTAwYzJhZGIzMDBlYWJjZWJlZmY$r+HP8qLT3CpBzxqniOJShpDgZ/O95L8TaQGBQKB573o",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$MjY4NGRlMWY5YzliZDUwNjBhOGJhYTJhZDM1OWViZTE$qjlHo3ALKgMXLw1bgRz/p7LGhqvC4RKrgxMuvgPNNfg",
       "acl": [
         {
           "topic": "#",
@@ -120,7 +120,7 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
     },
     {
       "username": "sensor",
-      "password_hash": "$argon2id$v=19$m=65536,t=3,p=1$OTJjMzk4ZGI4MWVkOGY2YmQxZTkwZTEzNTJmZDNiNTg$qDifFTnyEciQ+xDk1HKKD3dInnUXupgBkWJNuGOQYkE",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$OGI1ZWM3ZGY3MzE3YzFkNjJjYTQ2ZmQxZDQxNjFjZTM$ynDjPcANEe30mfdJLrzZKdWtclkC+v/SUcti/SYN/S0",
       "acl": [
         {
           "topic": "sensor/+",
@@ -137,17 +137,31 @@ Los usuarios y permisos se configuran en el archivo `/config/credentials.json`. 
 ```
 
 > [!IMPORTANT]
-> `password_hash` usa **Argon2id (formato PHC)**. Las contraseñas `admin123` y `sensor123` existen únicamente para pruebas y deben cambiarse antes de exponer el broker. Si `credentials.json` falta o es inválido, Pipistrelle **rechaza todas las conexiones** por defecto. El acceso anónimo solo se habilita con `PIPISTRELLE_ALLOW_ANONYMOUS=true`.
+> `password_hash` usa **Argon2id (formato PHC)**; los hashes de ejemplo usan 19 MiB, 2 iteraciones y paralelismo 1. Las contraseñas `admin123` y `sensor123` existen únicamente para pruebas y deben cambiarse antes de exponer el broker. Si `credentials.json` falta o es inválido, Pipistrelle **rechaza todas las conexiones** por defecto. El acceso anónimo solo se habilita con `PIPISTRELLE_ALLOW_ANONYMOUS=true`.
 
 Para generar un hash Argon2id en Linux sin guardar la contraseña en el historial del shell:
 ```bash
 read -s PIPISTRELLE_PASSWORD
-printf '%s' "$PIPISTRELLE_PASSWORD" | argon2 "$(openssl rand -hex 16)" -id -t 3 -m 16 -p 1 -e
+printf '%s' "$PIPISTRELLE_PASSWORD" | argon2 "$(openssl rand -hex 16)" -id -t 2 -k 19456 -p 1 -e
 unset PIPISTRELLE_PASSWORD
 ```
 
 > [!WARNING]
 > Nunca guardes credenciales reales del bridge en `docker-compose.yml` ni las subas a Git. Usa `.env`; el repositorio ignora `.env` y solo versiona `.env.example`.
+
+---
+
+## Benchmark Nativo V2
+
+V2 incluye `pipistrelle-bench`, un generador de carga ARM64/Rust que habla MQTT v5 directamente mediante Tokio, sin Python/Paho. Permite separar el techo de ingestión del routing end-to-end y comparar TCP, TLS clásico y TLS híbrido post-cuántico.
+
+```bash
+cargo build --release --bin pipistrelle-bench
+./target/release/pipistrelle-bench --mode ingest --clients 50 --messages 100000 --qos 0
+./target/release/pipistrelle-bench --tls --tls-profile hybrid --ca config/cert.pem --mode loopback --clients 10 --messages 20000
+```
+
+La metodología y los resultados de referencia ARM64 están documentados en [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ---
 

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionInfo {
@@ -66,14 +66,21 @@ impl TopicRouter {
         for &segment in &segments {
             match segment {
                 "+" => {
-                    current = current.plus_child.get_or_insert_with(|| Box::new(TrieNode::default()));
+                    current = current
+                        .plus_child
+                        .get_or_insert_with(|| Box::new(TrieNode::default()));
                 }
                 "#" => {
-                    current = current.hash_child.get_or_insert_with(|| Box::new(TrieNode::default()));
+                    current = current
+                        .hash_child
+                        .get_or_insert_with(|| Box::new(TrieNode::default()));
                     break; // '#' must be the last segment, so we stop here
                 }
                 _ => {
-                    current = current.children.entry(segment.to_string()).or_insert_with(TrieNode::default);
+                    current = current
+                        .children
+                        .entry(segment.to_string())
+                        .or_insert_with(TrieNode::default);
                 }
             }
         }
@@ -85,12 +92,17 @@ impl TopicRouter {
         };
 
         if let Some(grp) = group {
-            let list = current.shared_subscriptions.entry(grp.to_string()).or_default();
+            let list = current
+                .shared_subscriptions
+                .entry(grp.to_string())
+                .or_default();
             // Avoid duplicate registrations for the same client in the same group
             list.retain(|s| s.client_id != client_id);
             list.push(sub_info);
         } else {
-            current.subscriptions.insert(client_id.to_string(), sub_info);
+            current
+                .subscriptions
+                .insert(client_id.to_string(), sub_info);
         }
     }
 
@@ -131,7 +143,8 @@ impl TopicRouter {
             let (removed, _child_empty) = match segment {
                 "+" => {
                     if let Some(ref mut child) = node.plus_child {
-                        let (rem, empty) = unsubscribe_recursive(child, client_id, &segments[1..], group);
+                        let (rem, empty) =
+                            unsubscribe_recursive(child, client_id, &segments[1..], group);
                         if empty {
                             node.plus_child = None;
                         }
@@ -142,7 +155,8 @@ impl TopicRouter {
                 }
                 "#" => {
                     if let Some(ref mut child) = node.hash_child {
-                        let (rem, empty) = unsubscribe_recursive(child, client_id, &segments[1..], group);
+                        let (rem, empty) =
+                            unsubscribe_recursive(child, client_id, &segments[1..], group);
                         if empty {
                             node.hash_child = None;
                         }
@@ -153,7 +167,8 @@ impl TopicRouter {
                 }
                 _ => {
                     if let Some(child) = node.children.get_mut(segment) {
-                        let (rem, empty) = unsubscribe_recursive(child, client_id, &segments[1..], group);
+                        let (rem, empty) =
+                            unsubscribe_recursive(child, client_id, &segments[1..], group);
                         if empty {
                             node.children.remove(segment);
                         }
@@ -171,6 +186,44 @@ impl TopicRouter {
         removed
     }
 
+    /// Removes every normal/shared subscription owned by a client.
+    /// Used when a clean session ends so stale routing entries cannot accumulate.
+    pub fn remove_client(&self, client_id: &str) -> usize {
+        fn remove_recursive(node: &mut TrieNode, client_id: &str) -> usize {
+            let mut removed = usize::from(node.subscriptions.remove(client_id).is_some());
+
+            node.shared_subscriptions.retain(|_, list| {
+                let before = list.len();
+                list.retain(|sub| sub.client_id != client_id);
+                removed += before - list.len();
+                !list.is_empty()
+            });
+
+            node.children.retain(|_, child| {
+                removed += remove_recursive(child, client_id);
+                !child.is_empty()
+            });
+
+            if let Some(child) = node.plus_child.as_mut() {
+                removed += remove_recursive(child, client_id);
+                if child.is_empty() {
+                    node.plus_child = None;
+                }
+            }
+            if let Some(child) = node.hash_child.as_mut() {
+                removed += remove_recursive(child, client_id);
+                if child.is_empty() {
+                    node.hash_child = None;
+                }
+            }
+
+            removed
+        }
+
+        let mut root = self.root.write();
+        remove_recursive(&mut root, client_id)
+    }
+
     /// Matches a publish topic against all active subscriptions.
     /// Resolves wildcards (`+`, `#`) and aggregates results.
     pub fn match_topic(&self, topic: &str) -> RouteResult {
@@ -178,11 +231,7 @@ impl TopicRouter {
         let segments: Vec<&str> = topic.split('/').collect();
         let mut result = RouteResult::default();
 
-        fn match_recursive(
-            node: &TrieNode,
-            segments: &[&str],
-            result: &mut RouteResult,
-        ) {
+        fn match_recursive(node: &TrieNode, segments: &[&str], result: &mut RouteResult) {
             // Check if there is a '#' wildcard at the current node.
             // '#' matches 0 or more remaining segments.
             if let Some(ref hash_child) = node.hash_child {
@@ -305,7 +354,7 @@ mod tests {
     fn test_unsubscribe() {
         let router = TopicRouter::new();
         router.subscribe("client1", "sensor/temp", 1, None);
-        
+
         // Remove active sub
         assert!(router.unsubscribe("client1", "sensor/temp"));
         let res = router.match_topic("sensor/temp");
@@ -313,5 +362,22 @@ mod tests {
 
         // Remove non-existent sub
         assert!(!router.unsubscribe("client1", "sensor/temp"));
+    }
+
+    #[test]
+    fn test_remove_client_cleans_all_routes() {
+        let router = TopicRouter::new();
+        router.subscribe("client-a", "sensor/+", 0, None);
+        router.subscribe("client-a", "$share/workers/jobs/#", 1, None);
+        router.subscribe("client-b", "sensor/+", 0, None);
+
+        assert_eq!(router.remove_client("client-a"), 2);
+
+        let sensor = router.match_topic("sensor/temp");
+        assert_eq!(sensor.normal.len(), 1);
+        assert_eq!(sensor.normal[0].client_id, "client-b");
+
+        let jobs = router.match_topic("jobs/one");
+        assert!(jobs.shared.is_empty());
     }
 }
