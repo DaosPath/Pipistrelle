@@ -29,7 +29,8 @@ use tokio_rustls::rustls::ServerConfig;
 
 use crate::codec::{ConnAck, Packet, PubAck, SubAck, decode_packet, encode_packet};
 use crate::session::{
-    BrokerState, ClientSession, IncomingQos2Message, OutgoingQos2Phase, WillMessage,
+    ApplicationProperties, BrokerState, ClientSession, IncomingQos2Message, OutgoingQos2Phase,
+    WillMessage,
 };
 use pipistrelle::{crypto, version};
 
@@ -331,6 +332,7 @@ where
                         qos: will.qos,
                         retain: will.retain,
                         delay_interval: will.properties.will_delay_interval.unwrap_or(0),
+                        properties: ApplicationProperties::from_will(&will.properties),
                     });
                     read_buf.advance(bytes_read);
                     (
@@ -413,6 +415,26 @@ where
         return Ok(());
     }
 
+    if state
+        .pending_will_principal(&client_id)
+        .is_some_and(|owner| owner != username)
+    {
+        warn!(
+            "Rejecting ClientID '{}' because its persisted Will belongs to a different authenticated principal",
+            client_id
+        );
+        let connack = Packet::ConnAck(ConnAck {
+            session_present: false,
+            reason_code: 0x87,
+            properties: Default::default(),
+        });
+        let mut connack_buf = Vec::new();
+        encode_packet(&connack, &mut connack_buf);
+        let _ = socket.write_all(&connack_buf).await;
+        let _ = socket.shutdown().await;
+        return Ok(());
+    }
+
     let session_present = !clean_start
         && existing
             .as_ref()
@@ -423,7 +445,7 @@ where
     if clean_start {
         let _ = state.publish_pending_will_now(&client_id).await;
     } else {
-        state.cancel_pending_will(&client_id);
+        let _ = state.cancel_pending_will(&client_id).await;
     }
 
     // Clean Start discards the previous Session before the replacement is installed.
@@ -438,6 +460,7 @@ where
     let auth_username = username.as_deref().unwrap_or("");
     let allow_all_read = state.auth.authorizes_all(auth_username, "read");
     let allow_all_write = state.auth.authorizes_all(auth_username, "write");
+    let new_will = will.clone();
     let session = Arc::new(ClientSession::new(
         client_id.clone(),
         username,
@@ -478,13 +501,32 @@ where
                 // MQTT 5 suppresses the exiting connection's delayed Will only when
                 // the new connection continues the Session (Clean Start=0) and delay>0.
                 if clean_start || old_will.delay_interval == 0 || old.session_expiry() == 0 {
-                    state.publish_will_now(old_will).await;
+                    state.publish_will_for_client(&client_id, old_will).await;
+                } else {
+                    // Continuing the same Session before Will Delay expires suppresses
+                    // the exiting connection's Will, including its persisted copy.
+                    state.clear_persisted_will(&client_id).await;
                 }
+            } else {
+                state.clear_persisted_will(&client_id).await;
             }
             old.request_disconnect();
         }
     }
     drop(existing);
+
+    if let Some(ref message) = new_will {
+        state
+            .persist_connection_will(
+                &client_id,
+                session.username.clone(),
+                message,
+                session.session_expiry(),
+            )
+            .await;
+    } else {
+        state.clear_persisted_will(&client_id).await;
+    }
 
     // 3. Spawn a dedicated TCP writer task for this client
     let (mut read_half, mut write_half) = tokio::io::split(socket);
@@ -614,6 +656,11 @@ where
                                 if let Packet::Publish(pkt) = &packet {
                                     if pkt.qos == 0
                                         && !pkt.retain
+                                        && pkt.properties.subscription_identifiers.is_empty()
+                                        && pkt.properties.topic_alias.is_none()
+                                        && pkt.properties.response_topic.is_none()
+                                        && !pkt.topic.is_empty()
+                                        && !topic_contains_wildcard(pkt.topic)
                                         && session.allow_all_write
                                         && !state.router.has_routes()
                                         && !state.bridge_active.load(Ordering::Relaxed)
@@ -642,6 +689,11 @@ where
                             }
                             Err(e) => {
                                 warn!("Codec error processing client '{}': {:?}", client_id, e);
+                                let reason = match e {
+                                    codec::CodecError::ProtocolError => 0x82,
+                                    _ => 0x81,
+                                };
+                                disconnect_client_with_reason(&state, &session, reason).await;
                                 return Err(e.into());
                             }
                         }
@@ -668,8 +720,19 @@ where
         let will = { session.will.write().take() };
         if let Some(will) = will {
             if disconnect_reason != Some(0x00) {
-                state.schedule_will(client_id.clone(), will, session.session_expiry());
+                state
+                    .schedule_will(
+                        client_id.clone(),
+                        session.username.clone(),
+                        will,
+                        session.session_expiry(),
+                    )
+                    .await;
+            } else {
+                state.clear_persisted_will(&client_id).await;
             }
+        } else if disconnect_reason == Some(0x00) {
+            state.clear_persisted_will(&client_id).await;
         }
         if session.session_expiry() > 0 {
             state.schedule_session_expiry(session.clone());
@@ -684,6 +747,42 @@ where
     result
 }
 
+#[inline(always)]
+fn topic_contains_wildcard(topic: &str) -> bool {
+    topic
+        .as_bytes()
+        .iter()
+        .any(|byte| *byte == b'+' || *byte == b'#')
+}
+
+async fn disconnect_client_with_reason(
+    state: &BrokerState,
+    session: &ClientSession,
+    reason_code: u8,
+) {
+    let disconnect = Packet::Disconnect(crate::codec::Disconnect {
+        reason_code,
+        properties: Default::default(),
+    });
+    let mut buf = Vec::new();
+    encode_packet(&disconnect, &mut buf);
+    if state.send_to_session(session, buf).await {
+        // Protocol-error paths are cold. Give the dedicated writer a scheduling
+        // opportunity to put DISCONNECT on the wire before connection cleanup.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+async fn protocol_error<T>(
+    state: &BrokerState,
+    session: &ClientSession,
+    reason_code: u8,
+    message: &'static str,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    disconnect_client_with_reason(state, session, reason_code).await;
+    Err(message.into())
+}
+
 async fn process_client_packet(
     packet: &Packet<'_>,
     state: &BrokerState,
@@ -695,6 +794,66 @@ async fn process_client_packet(
                 "Received PUBLISH from client '{}' on topic '{}'",
                 session.client_id, pkt.topic
             );
+
+            // Subscription Identifiers in PUBLISH are Server->Client metadata.
+            if !pkt.properties.subscription_identifiers.is_empty() {
+                return protocol_error(
+                    state,
+                    session,
+                    0x82,
+                    "Client PUBLISH contained Subscription Identifier",
+                )
+                .await;
+            }
+            if pkt.topic.is_empty() {
+                return protocol_error(
+                    state,
+                    session,
+                    0x82,
+                    "Zero-length PUBLISH topic without supported Topic Alias",
+                )
+                .await;
+            }
+            if topic_contains_wildcard(pkt.topic) {
+                return protocol_error(
+                    state,
+                    session,
+                    0x82,
+                    "PUBLISH topic contains wildcard characters",
+                )
+                .await;
+            }
+            if let Some(response_topic) = pkt.properties.response_topic {
+                if response_topic.is_empty() || topic_contains_wildcard(response_topic) {
+                    return protocol_error(state, session, 0x82, "Invalid PUBLISH Response Topic")
+                        .await;
+                }
+            }
+            if let Some(pfi) = pkt.properties.payload_format_indicator {
+                if pfi > 1 {
+                    return protocol_error(
+                        state,
+                        session,
+                        0x82,
+                        "Invalid Payload Format Indicator",
+                    )
+                    .await;
+                }
+            }
+            // Pipistrelle currently advertises no Topic Alias Maximum, so a client
+            // must not send a Topic Alias. The property is connection-local and is
+            // never forwarded to subscribers.
+            if pkt.properties.topic_alias.is_some() {
+                return protocol_error(
+                    state,
+                    session,
+                    0x94,
+                    "Topic Alias received while server maximum is zero",
+                )
+                .await;
+            }
+
+            let application_properties = ApplicationProperties::from_publish(&pkt.properties);
 
             // Check write authorization
             let username = session.username.as_deref().unwrap_or("");
@@ -725,7 +884,13 @@ async fn process_client_packet(
 
             if pkt.qos == 2 {
                 let Some(packet_id) = pkt.packet_id else {
-                    return Err("QoS 2 PUBLISH missing packet identifier".into());
+                    return protocol_error(
+                        state,
+                        session,
+                        0x82,
+                        "QoS 2 PUBLISH missing packet identifier",
+                    )
+                    .await;
                 };
                 let already_owned = session.incoming_qos2.read().contains_key(&packet_id);
                 if !already_owned {
@@ -733,6 +898,7 @@ async fn process_client_packet(
                         topic: pkt.topic.to_string(),
                         payload: pkt.payload.to_vec(),
                         retain: pkt.retain,
+                        properties: application_properties.clone(),
                     };
                     session
                         .incoming_qos2
@@ -747,6 +913,8 @@ async fn process_client_packet(
                                 message.topic,
                                 message.payload,
                                 message.retain,
+                                serde_json::to_string(&message.properties)
+                                    .unwrap_or_else(|_| "{}".into()),
                             )
                             .await;
                     }
@@ -765,7 +933,7 @@ async fn process_client_packet(
             }
 
             if pkt.retain {
-                state.update_retained(pkt.topic, pkt.payload, pkt.qos);
+                state.update_retained(pkt.topic, pkt.payload, pkt.qos, &application_properties);
             }
 
             let publish_sequence = session.published_messages.fetch_add(1, Ordering::Relaxed);
@@ -776,6 +944,7 @@ async fn process_client_packet(
                     pkt.payload,
                     pkt.qos,
                     pkt.retain,
+                    &application_properties,
                     publish_sequence,
                 )
                 .await;
@@ -894,6 +1063,7 @@ async fn process_client_packet(
                         discard = true;
                     } else {
                         message.phase = OutgoingQos2Phase::AwaitPubComp;
+                        message.delivery_started = true;
                         resend_pubrel = true;
                         if session.session_expiry() > 0 {
                             persist_transition = Some(message.clone());
@@ -914,6 +1084,9 @@ async fn process_client_packet(
                         persisted.payload,
                         persisted.retain,
                         persisted.subscription_identifier,
+                        serde_json::to_string(&persisted.properties)
+                            .unwrap_or_else(|_| "{}".into()),
+                        persisted.delivery_started,
                         persisted.phase as u8,
                     )
                     .await;
@@ -938,7 +1111,7 @@ async fn process_client_packet(
             let pending = session.incoming_qos2.write().remove(&pkt.packet_id);
             let reason_code = if let Some(message) = pending {
                 if message.retain {
-                    state.update_retained(&message.topic, &message.payload, 2);
+                    state.update_retained(&message.topic, &message.payload, 2, &message.properties);
                 }
                 let sequence = session.published_messages.fetch_add(1, Ordering::Relaxed);
                 state
@@ -948,6 +1121,7 @@ async fn process_client_packet(
                         &message.payload,
                         2,
                         message.retain,
+                        &message.properties,
                         sequence,
                     )
                     .await;

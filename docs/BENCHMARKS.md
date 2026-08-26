@@ -231,3 +231,14 @@ Final Orange Pi release gates (ARM64, 128-byte payload, native Rust load generat
 - **Hybrid PQC TLS smoke:** 200k end-to-end messages at 1.667 M msg/s, 0 failures, with `X25519MLKEM768` negotiated on 10/10 connections.
 
 These are regression gates, not a claim that protocol-heavy QoS1/QoS2 paths share the QoS0 ceiling.
+
+## V2 2.1.1.0 — properties/crash-persistence regression gate
+
+`2.1.1.0` carries MQTT v5 Application Message properties through live routing, retained/offline QoS state and Last Will recovery. The extra metadata path is bypassed by the zero-route QoS0 fast path when no forwarding or persistence is needed.
+
+Final Orange Pi candidate gates, TCP, 128-byte payload:
+
+- **50M ingest QoS0:** 20.134 M msg/s, 0 failures.
+- **50M end-to-end QoS0:** 2.709 M msg/s sustained, 0 failures, ~122.4 MiB broker memory after the run.
+
+An earlier compliance-first candidate measured 17.2–19.5 M/s ingest because it scanned all PUBLISH property fields and used a Unicode wildcard search in the zero-route path. The final implementation keeps the same protocol validation while reducing that path to the fields which can require protocol handling and an allocation-free byte wildcard check.

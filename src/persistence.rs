@@ -69,6 +69,22 @@ impl Persistence {
             [],
         )
         .expect("Failed to create in_flight table");
+        let _ = conn.execute(
+            "ALTER TABLE in_flight ADD COLUMN retain INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE in_flight ADD COLUMN subscription_identifier INTEGER",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE in_flight ADD COLUMN properties_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE in_flight ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS retained_messages (
@@ -79,6 +95,10 @@ impl Persistence {
             [],
         )
         .expect("Failed to create retained_messages table");
+        let _ = conn.execute(
+            "ALTER TABLE retained_messages ADD COLUMN properties_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS qos2_incoming (
@@ -92,6 +112,10 @@ impl Persistence {
             [],
         )
         .expect("Failed to create qos2_incoming table");
+        let _ = conn.execute(
+            "ALTER TABLE qos2_incoming ADD COLUMN properties_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS qos2_outgoing (
@@ -107,6 +131,31 @@ impl Persistence {
             [],
         )
         .expect("Failed to create qos2_outgoing table");
+        let _ = conn.execute(
+            "ALTER TABLE qos2_outgoing ADD COLUMN properties_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE qos2_outgoing ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS wills (
+                client_id TEXT PRIMARY KEY,
+                username TEXT,
+                topic TEXT NOT NULL,
+                payload BLOB NOT NULL,
+                qos INTEGER NOT NULL,
+                retain INTEGER NOT NULL,
+                delay_interval INTEGER NOT NULL,
+                properties_json TEXT NOT NULL,
+                session_expiry_interval INTEGER NOT NULL,
+                due_at_ms INTEGER
+            )",
+            [],
+        )
+        .expect("Failed to create wills table");
 
         info!("SQLite persistence engine initialized ({})", db_path);
 
@@ -235,14 +284,28 @@ impl Persistence {
         topic: String,
         payload: Vec<u8>,
         qos: u8,
+        retain: bool,
+        subscription_identifier: Option<u32>,
+        properties_json: String,
+        delivery_started: bool,
     ) {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO in_flight (client_id, packet_id, topic, payload, qos)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                (&client_id, packet_id, &topic, &payload, qos),
+                "INSERT OR REPLACE INTO in_flight (client_id, packet_id, topic, payload, qos, retain, subscription_identifier, properties_json, delivery_started)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (
+                    &client_id,
+                    packet_id,
+                    &topic,
+                    &payload,
+                    qos,
+                    i32::from(retain),
+                    subscription_identifier,
+                    &properties_json,
+                    i32::from(delivery_started),
+                ),
             ) {
                 error!(
                     "Failed to save in-flight message for {} with ID {}: {:?}",
@@ -331,19 +394,40 @@ impl Persistence {
 
     pub async fn load_all_in_flight(
         &self,
-    ) -> Result<Vec<(String, u16, String, Vec<u8>, u8)>, rusqlite::Error> {
+    ) -> Result<
+        Vec<(
+            String,
+            u16,
+            String,
+            Vec<u8>,
+            u8,
+            bool,
+            Option<u32>,
+            String,
+            bool,
+        )>,
+        rusqlite::Error,
+    > {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare("SELECT client_id, packet_id, topic, payload, qos FROM in_flight")?;
+            let mut stmt = conn.prepare(
+                "SELECT client_id, packet_id, topic, payload, qos, retain, subscription_identifier, properties_json, delivery_started FROM in_flight",
+            )?;
             let rows = stmt.query_map([], |row| {
-                let client_id: String = row.get(0)?;
-                let packet_id: u16 = row.get(1)?;
-                let topic: String = row.get(2)?;
-                let payload: Vec<u8> = row.get(3)?;
-                let qos: u8 = row.get(4)?;
-                Ok((client_id, packet_id, topic, payload, qos))
+                let retain: i32 = row.get(5)?;
+                let delivery_started: i32 = row.get(8)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    retain != 0,
+                    row.get(6)?,
+                    row.get(7)?,
+                    delivery_started != 0,
+                ))
             })?;
             let mut result = Vec::new();
             for r in rows {
@@ -355,13 +439,19 @@ impl Persistence {
         .unwrap()
     }
 
-    pub async fn save_retained(&self, topic: String, payload: Vec<u8>, qos: u8) {
+    pub async fn save_retained(
+        &self,
+        topic: String,
+        payload: Vec<u8>,
+        qos: u8,
+        properties_json: String,
+    ) {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO retained_messages (topic, payload, qos) VALUES (?1, ?2, ?3)",
-                (&topic, &payload, qos),
+                "INSERT OR REPLACE INTO retained_messages (topic, payload, qos, properties_json) VALUES (?1, ?2, ?3, ?4)",
+                (&topic, &payload, qos, &properties_json),
             ) {
                 error!("Failed to save retained message for {}: {:?}", topic, e);
             }
@@ -378,12 +468,17 @@ impl Persistence {
         .unwrap();
     }
 
-    pub async fn load_retained(&self) -> Result<Vec<(String, Vec<u8>, u8)>, rusqlite::Error> {
+    pub async fn load_retained(
+        &self,
+    ) -> Result<Vec<(String, Vec<u8>, u8, String)>, rusqlite::Error> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt = conn.prepare("SELECT topic, payload, qos FROM retained_messages")?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            let mut stmt =
+                conn.prepare("SELECT topic, payload, qos, properties_json FROM retained_messages")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
             let mut result = Vec::new();
             for row in rows {
                 result.push(row?);
@@ -401,13 +496,14 @@ impl Persistence {
         topic: String,
         payload: Vec<u8>,
         retain: bool,
+        properties_json: String,
     ) {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO qos2_incoming (client_id, packet_id, topic, payload, retain) VALUES (?1, ?2, ?3, ?4, ?5)",
-                (&client_id, packet_id, &topic, &payload, i32::from(retain)),
+                "INSERT OR REPLACE INTO qos2_incoming (client_id, packet_id, topic, payload, retain, properties_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (&client_id, packet_id, &topic, &payload, i32::from(retain), &properties_json),
             ) { error!("Failed to save inbound QoS2 state for {}:{}: {:?}", client_id, packet_id, e); }
         }).await.unwrap();
     }
@@ -427,12 +523,12 @@ impl Persistence {
 
     pub async fn load_qos2_incoming(
         &self,
-    ) -> Result<Vec<(String, u16, String, Vec<u8>, bool)>, rusqlite::Error> {
+    ) -> Result<Vec<(String, u16, String, Vec<u8>, bool, String)>, rusqlite::Error> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT client_id, packet_id, topic, payload, retain FROM qos2_incoming",
+                "SELECT client_id, packet_id, topic, payload, retain, properties_json FROM qos2_incoming",
             )?;
             let rows = stmt.query_map([], |row| {
                 let retain: i32 = row.get(4)?;
@@ -442,6 +538,7 @@ impl Persistence {
                     row.get(2)?,
                     row.get(3)?,
                     retain != 0,
+                    row.get(5)?,
                 ))
             })?;
             let mut result = Vec::new();
@@ -462,14 +559,16 @@ impl Persistence {
         payload: Vec<u8>,
         retain: bool,
         subscription_identifier: Option<u32>,
+        properties_json: String,
+        delivery_started: bool,
         phase: u8,
     ) {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO qos2_outgoing (client_id, packet_id, topic, payload, retain, subscription_identifier, phase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                (&client_id, packet_id, &topic, &payload, i32::from(retain), subscription_identifier, phase),
+                "INSERT OR REPLACE INTO qos2_outgoing (client_id, packet_id, topic, payload, retain, subscription_identifier, phase, properties_json, delivery_started) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (&client_id, packet_id, &topic, &payload, i32::from(retain), subscription_identifier, phase, &properties_json, i32::from(delivery_started)),
             ) { error!("Failed to save outbound QoS2 state for {}:{}: {:?}", client_id, packet_id, e); }
         }).await.unwrap();
     }
@@ -489,14 +588,115 @@ impl Persistence {
 
     pub async fn load_qos2_outgoing(
         &self,
-    ) -> Result<Vec<(String, u16, String, Vec<u8>, bool, Option<u32>, u8)>, rusqlite::Error> {
+    ) -> Result<
+        Vec<(
+            String,
+            u16,
+            String,
+            Vec<u8>,
+            bool,
+            Option<u32>,
+            String,
+            bool,
+            u8,
+        )>,
+        rusqlite::Error,
+    > {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt = conn.prepare("SELECT client_id, packet_id, topic, payload, retain, subscription_identifier, phase FROM qos2_outgoing")?;
+            let mut stmt = conn.prepare(
+                "SELECT client_id, packet_id, topic, payload, retain, subscription_identifier, properties_json, delivery_started, phase FROM qos2_outgoing",
+            )?;
             let rows = stmt.query_map([], |row| {
                 let retain: i32 = row.get(4)?;
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, retain != 0, row.get(5)?, row.get(6)?))
+                let delivery_started: i32 = row.get(7)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    retain != 0,
+                    row.get(5)?,
+                    row.get(6)?,
+                    delivery_started != 0,
+                    row.get(8)?,
+                ))
+            })?;
+            let mut result = Vec::new();
+            for row in rows { result.push(row?); }
+            Ok(result)
+        }).await.unwrap()
+    }
+
+    pub async fn save_will(
+        &self,
+        client_id: String,
+        username: Option<String>,
+        topic: String,
+        payload: Vec<u8>,
+        qos: u8,
+        retain: bool,
+        delay_interval: u32,
+        properties_json: String,
+        session_expiry_interval: u32,
+        due_at_ms: Option<u64>,
+    ) {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            if let Err(e) = conn.execute(
+                "INSERT OR REPLACE INTO wills (client_id, username, topic, payload, qos, retain, delay_interval, properties_json, session_expiry_interval, due_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (
+                    &client_id, username, &topic, &payload, qos, i32::from(retain),
+                    delay_interval, &properties_json, session_expiry_interval, due_at_ms
+                ),
+            ) {
+                error!("Failed to save Will for {}: {:?}", client_id, e);
+            }
+        }).await.unwrap();
+    }
+
+    pub async fn delete_will(&self, client_id: String) {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let _ = conn.execute("DELETE FROM wills WHERE client_id = ?1", [&client_id]);
+        })
+        .await
+        .unwrap();
+    }
+
+    pub async fn load_wills(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            Option<String>,
+            String,
+            Vec<u8>,
+            u8,
+            bool,
+            u32,
+            String,
+            u32,
+            Option<u64>,
+        )>,
+        rusqlite::Error,
+    > {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT client_id, username, topic, payload, qos, retain, delay_interval, properties_json, session_expiry_interval, due_at_ms FROM wills",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let retain: i32 = row.get(5)?;
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    retain != 0, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?
+                ))
             })?;
             let mut result = Vec::new();
             for row in rows { result.push(row?); }

@@ -5,6 +5,7 @@ pub enum CodecError {
     Incomplete,
     InvalidVarint,
     MalformedPacket,
+    ProtocolError,
     UnsupportedProtocolVersion(u8),
 }
 
@@ -14,6 +15,7 @@ impl std::fmt::Display for CodecError {
             CodecError::Incomplete => write!(f, "Incomplete packet"),
             CodecError::InvalidVarint => write!(f, "Invalid variable byte integer"),
             CodecError::MalformedPacket => write!(f, "Malformed MQTT packet"),
+            CodecError::ProtocolError => write!(f, "MQTT protocol error"),
             CodecError::UnsupportedProtocolVersion(v) => {
                 write!(f, "Unsupported protocol version: {}", v)
             }
@@ -248,7 +250,7 @@ pub struct PublishProperties<'a> {
     pub content_type: Option<&'a str>,
     pub response_topic: Option<&'a str>,
     pub correlation_data: Option<&'a [u8]>,
-    pub subscription_identifier: Option<u32>, // Varint
+    pub subscription_identifiers: Vec<u32>, // Varint; may repeat Server -> Client
     pub topic_alias: Option<u16>,
     pub user_properties: Vec<(&'a str, &'a str)>,
 }
@@ -527,6 +529,17 @@ impl<'a> ConnAckProperties<'a> {
 }
 
 impl<'a> PublishProperties<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.payload_format_indicator.is_none()
+            && self.message_expiry_interval.is_none()
+            && self.content_type.is_none()
+            && self.response_topic.is_none()
+            && self.correlation_data.is_none()
+            && self.subscription_identifiers.is_empty()
+            && self.topic_alias.is_none()
+            && self.user_properties.is_empty()
+    }
+
     pub fn decode(buf: &mut &'a [u8]) -> Result<Self, CodecError> {
         let mut props = PublishProperties::default();
         if buf.is_empty() {
@@ -546,17 +559,54 @@ impl<'a> PublishProperties<'a> {
         while !prop_slice.is_empty() {
             let prop_id = read_u8(&mut prop_slice)?;
             match prop_id {
-                0x01 => props.payload_format_indicator = Some(read_u8(&mut prop_slice)?),
-                0x02 => props.message_expiry_interval = Some(read_u32(&mut prop_slice)?),
-                0x03 => props.content_type = Some(read_str(&mut prop_slice)?),
-                0x08 => props.response_topic = Some(read_str(&mut prop_slice)?),
-                0x09 => props.correlation_data = Some(read_bytes(&mut prop_slice)?),
+                0x01 => {
+                    if props.payload_format_indicator.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    let value = read_u8(&mut prop_slice)?;
+                    if value > 1 {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.payload_format_indicator = Some(value);
+                }
+                0x02 => {
+                    if props.message_expiry_interval.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.message_expiry_interval = Some(read_u32(&mut prop_slice)?);
+                }
+                0x03 => {
+                    if props.content_type.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.content_type = Some(read_str(&mut prop_slice)?);
+                }
+                0x08 => {
+                    if props.response_topic.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.response_topic = Some(read_str(&mut prop_slice)?);
+                }
+                0x09 => {
+                    if props.correlation_data.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.correlation_data = Some(read_bytes(&mut prop_slice)?);
+                }
                 0x0B => {
                     let (val, read) = decode_varint(prop_slice)?;
+                    if val == 0 {
+                        return Err(CodecError::ProtocolError);
+                    }
                     prop_slice = &prop_slice[read..];
-                    props.subscription_identifier = Some(val);
+                    props.subscription_identifiers.push(val);
                 }
-                0x23 => props.topic_alias = Some(read_u16(&mut prop_slice)?),
+                0x23 => {
+                    if props.topic_alias.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.topic_alias = Some(read_u16(&mut prop_slice)?);
+                }
                 0x26 => {
                     let key = read_str(&mut prop_slice)?;
                     let val = read_str(&mut prop_slice)?;
@@ -574,7 +624,7 @@ impl<'a> PublishProperties<'a> {
             && self.content_type.is_none()
             && self.response_topic.is_none()
             && self.correlation_data.is_none()
-            && self.subscription_identifier.is_none()
+            && self.subscription_identifiers.is_empty()
             && self.topic_alias.is_none()
             && self.user_properties.is_empty()
         {
@@ -603,9 +653,9 @@ impl<'a> PublishProperties<'a> {
             temp_buf.push(0x09);
             write_bytes(val, &mut temp_buf);
         }
-        if let Some(val) = self.subscription_identifier {
+        for val in &self.subscription_identifiers {
             temp_buf.push(0x0B);
-            encode_varint(val, &mut temp_buf);
+            encode_varint(*val, &mut temp_buf);
         }
         if let Some(val) = self.topic_alias {
             temp_buf.push(0x23);
@@ -635,12 +685,46 @@ impl<'a> WillProperties<'a> {
         while !prop_slice.is_empty() {
             let prop_id = read_u8(&mut prop_slice)?;
             match prop_id {
-                0x18 => props.will_delay_interval = Some(read_u32(&mut prop_slice)?),
-                0x01 => props.payload_format_indicator = Some(read_u8(&mut prop_slice)?),
-                0x02 => props.message_expiry_interval = Some(read_u32(&mut prop_slice)?),
-                0x03 => props.content_type = Some(read_str(&mut prop_slice)?),
-                0x08 => props.response_topic = Some(read_str(&mut prop_slice)?),
-                0x09 => props.correlation_data = Some(read_bytes(&mut prop_slice)?),
+                0x18 => {
+                    if props.will_delay_interval.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.will_delay_interval = Some(read_u32(&mut prop_slice)?);
+                }
+                0x01 => {
+                    if props.payload_format_indicator.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    let value = read_u8(&mut prop_slice)?;
+                    if value > 1 {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.payload_format_indicator = Some(value);
+                }
+                0x02 => {
+                    if props.message_expiry_interval.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.message_expiry_interval = Some(read_u32(&mut prop_slice)?);
+                }
+                0x03 => {
+                    if props.content_type.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.content_type = Some(read_str(&mut prop_slice)?);
+                }
+                0x08 => {
+                    if props.response_topic.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.response_topic = Some(read_str(&mut prop_slice)?);
+                }
+                0x09 => {
+                    if props.correlation_data.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.correlation_data = Some(read_bytes(&mut prop_slice)?);
+                }
                 0x26 => {
                     let key = read_str(&mut prop_slice)?;
                     let value = read_str(&mut prop_slice)?;
@@ -1473,7 +1557,7 @@ mod tests {
                 topic: "bench/native/1",
                 packet_id: None,
                 properties: PublishProperties {
-                    subscription_identifier,
+                    subscription_identifiers: subscription_identifier.into_iter().collect(),
                     ..Default::default()
                 },
                 payload: b"payload",

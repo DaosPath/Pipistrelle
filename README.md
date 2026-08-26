@@ -19,6 +19,8 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 *   **Retained Messages MQTT v5:** Persistencia de retained, borrado con payload vacío, Retain Handling `0/1/2`, Retain As Published y Subscription Identifier en replay.
 *   **Last Will and Testament:** Will QoS/retain, Will Delay, supresión en `DISCONNECT 0x00`, cancelación del Will retrasado al reanudar la misma Session y publicación correcta durante pérdida de conexión/takeover.
 *   **Sesiones Persistentes y ClientID Takeover:** `Session Present`, mensajes QoS pendientes offline, Session Expiry y takeover MQTT v5 con `DISCONNECT 0x8E` para el propietario anterior. Pipistrelle liga además la Session persistente al principal autenticado para impedir que otro usuario válido herede estado autorizado bajo ACLs distintas.
+*   **Propiedades MQTT v5 End-to-End:** Preserva Payload Format Indicator, Message Expiry Interval, Content Type, Response Topic, Correlation Data y User Properties (incluyendo orden y duplicados) durante routing live, retained, QoS1/QoS2 offline y reanudación tras restart. Topic Alias permanece deliberadamente deshabilitado (`Maximum=0`) y nunca se propaga entre conexiones.
+*   **Last Will Persistente ante Crash:** El Will completo se persiste antes de CONNACK. Un `SIGKILL`/fallo del proceso puede restaurar Wills activos o delayed, conservar su metadata, respetar el deadline ya armado y cancelar un Will retrasado si la misma Session se reanuda.
 *   **Generación Automática de Certificados:** Si los archivos `cert.pem` y `key.pem` no están en el volumen, Pipistrelle genera automáticamente certificados auto-firmados válidos para `localhost`, `127.0.0.1`, `10.0.1.2` y `host.wokwi.internal`.
 
 ---
@@ -177,6 +179,8 @@ Desde `2.0.0.4`, el routing **end-to-end** QoS 0 también supera el objetivo de 
 
 Desde `2.1.0.0`, V2 incorpora la primera gran expansión de protocolo: **QoS 2**, **retained messages**, **Last Will and Testament**, `Session Present`, Session Expiry persistente, mensajes QoS pendientes para clientes offline y takeover de ClientID con `DISCONNECT 0x8E`. La suite `test_protocol_v2.py` verifica los estados MQTT v5 directamente sobre sockets, sin depender de las abstracciones de Paho.
 
+Desde `2.1.1.0`, Pipistrelle preserva las propiedades de aplicación de PUBLISH/Will a través de routing y persistencia, aplica **Message Expiry** al tiempo real que el mensaje espera en el broker y guarda el Will en SQLite para recuperarlo tras un crash completo. La suite destructiva `test_protocol_restart_v2.py` usa `SIGKILL` del contenedor para validar recuperación real, no solo shutdown limpio. Consulta [`docs/MQTT5_COMPLIANCE.md`](docs/MQTT5_COMPLIANCE.md) para la matriz explícita de soporte; Pipistrelle todavía no se anuncia como MQTT v5 100% conforme.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración
@@ -193,9 +197,11 @@ Pipistrelle incluye un completo conjunto de pruebas de integración automatizada
     ```bash
     python test_broker.py
     python test_protocol_v2.py
+    # Solo en la instancia Docker local de desarrollo: hace SIGKILL del broker.
+    python test_protocol_restart_v2.py
     ```
 
-`test_broker.py` mantiene los 6 checks de transporte/autenticación. `test_protocol_v2.py` habla MQTT v5 directamente por sockets y valida QoS 2, retained, Will, opciones de suscripción y sesiones persistentes/takeover.
+`test_broker.py` mantiene los 6 checks de transporte/autenticación. `test_protocol_v2.py` habla MQTT v5 directamente por sockets y valida QoS 2, retained, propiedades PUBLISH/Will, Message Expiry, opciones de suscripción y sesiones persistentes/takeover. `test_protocol_restart_v2.py` es destructivo y valida la misma persistencia a través de `SIGKILL`/restart del contenedor local.
 
 El script base validará automáticamente los siguientes 6 escenarios:
 *   **Test 1 (TCP):** Conexión de administrador, publicación, suscripción y loopback.

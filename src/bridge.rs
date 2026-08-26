@@ -9,7 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::codec::{Connect, Packet, Subscribe, Subscription, decode_packet, encode_packet};
 use crate::crypto::{self, TlsProfile};
-use crate::session::{BridgeQueueHandle, BrokerState};
+use crate::session::{ApplicationProperties, BridgeMessage, BridgeQueueHandle, BrokerState};
 
 pub async fn start_bridge_engine(state: Arc<BrokerState>) {
     let host = match std::env::var("PIPISTRELLE_BRIDGE_HOST") {
@@ -38,7 +38,7 @@ pub async fn start_bridge_engine(state: Arc<BrokerState>) {
         host, port
     );
 
-    let (tx, mut rx) = mpsc::channel::<(String, Vec<u8>)>(state.bridge_queue_capacity);
+    let (tx, mut rx) = mpsc::channel::<BridgeMessage>(state.bridge_queue_capacity);
     *state.bridge_sender.write() = Some(BridgeQueueHandle {
         sender: tx,
         topic_prefix: Arc::<str>::from(local_pub_pattern),
@@ -96,7 +96,7 @@ async fn connect_and_run_bridge(
     remote_sub_filter: &str,
     local_pub_pattern: &str,
     state: Arc<BrokerState>,
-    local_rx: &mut mpsc::Receiver<(String, Vec<u8>)>,
+    local_rx: &mut mpsc::Receiver<BridgeMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Establish TCP connection
     let addr = format!("{}:{}", host, port);
@@ -224,6 +224,7 @@ async fn connect_and_run_bridge(
                                     pkt.payload,
                                     pkt.qos,
                                     pkt.retain,
+                                    &ApplicationProperties::from_publish(&pkt.properties),
                                     publish_sequence,
                                 )
                                 .await;
@@ -251,18 +252,21 @@ async fn connect_and_run_bridge(
             }
             // Read local publishes from channel and forward to remote broker
             local_msg = local_rx.recv() => {
-                if let Some((topic, payload)) = local_msg {
+                if let Some(message) = local_msg {
                     // Only bridge if it matches the configured prefix
-                    if topic.starts_with(local_pub_pattern) {
-                        debug!("Bridge forwarding local publish to remote: '{}'", topic);
+                    if message.topic.starts_with(local_pub_pattern) {
+                        if message.properties.is_expired() {
+                            continue;
+                        }
+                        debug!("Bridge forwarding local publish to remote: '{}'", message.topic);
                         let pub_pkt = Packet::Publish(crate::codec::Publish {
                             dup: false,
                             qos: 0,
-                            retain: false,
-                            topic: &topic,
+                            retain: message.retain,
+                            topic: &message.topic,
                             packet_id: None,
-                            properties: Default::default(),
-                            payload: &payload,
+                            properties: message.properties.as_publish_properties(None),
+                            payload: &message.payload,
                         });
 
                         let mut buf = Vec::new();

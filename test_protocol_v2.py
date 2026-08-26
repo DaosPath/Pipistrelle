@@ -44,6 +44,80 @@ def binary(value: bytes) -> bytes:
     return struct.pack("!H", len(value)) + value
 
 
+def application_properties_bytes(properties=None, *, allow_subscription_ids=True, allow_topic_alias=True):
+    properties = properties or {}
+    out = bytearray()
+    if properties.get("payload_format_indicator") is not None:
+        out += bytes([0x01, properties["payload_format_indicator"]])
+    if properties.get("message_expiry_interval") is not None:
+        out += bytes([0x02]) + struct.pack("!I", properties["message_expiry_interval"])
+    if properties.get("content_type") is not None:
+        out += bytes([0x03]) + utf8(properties["content_type"])
+    if properties.get("response_topic") is not None:
+        out += bytes([0x08]) + utf8(properties["response_topic"])
+    if properties.get("correlation_data") is not None:
+        out += bytes([0x09]) + binary(properties["correlation_data"])
+    if allow_subscription_ids:
+        for identifier in properties.get("subscription_identifiers", []):
+            out += bytes([0x0B]) + varint(identifier)
+    if allow_topic_alias and properties.get("topic_alias") is not None:
+        out += bytes([0x23]) + struct.pack("!H", properties["topic_alias"])
+    for key, value in properties.get("user_properties", []):
+        out += bytes([0x26]) + utf8(key) + utf8(value)
+    return bytes(out)
+
+
+def parse_application_properties(raw: bytes):
+    result = {
+        "payload_format_indicator": None,
+        "message_expiry_interval": None,
+        "content_type": None,
+        "response_topic": None,
+        "correlation_data": None,
+        "subscription_identifiers": [],
+        "topic_alias": None,
+        "user_properties": [],
+    }
+    off = 0
+    def read_utf8():
+        nonlocal off
+        size = struct.unpack("!H", raw[off:off+2])[0]
+        off += 2
+        value = raw[off:off+size].decode()
+        off += size
+        return value
+    def read_binary():
+        nonlocal off
+        size = struct.unpack("!H", raw[off:off+2])[0]
+        off += 2
+        value = raw[off:off+size]
+        off += size
+        return value
+    while off < len(raw):
+        prop = raw[off]
+        off += 1
+        if prop == 0x01:
+            result["payload_format_indicator"] = raw[off]; off += 1
+        elif prop == 0x02:
+            result["message_expiry_interval"] = struct.unpack("!I", raw[off:off+4])[0]; off += 4
+        elif prop == 0x03:
+            result["content_type"] = read_utf8()
+        elif prop == 0x08:
+            result["response_topic"] = read_utf8()
+        elif prop == 0x09:
+            result["correlation_data"] = read_binary()
+        elif prop == 0x0B:
+            value, used = read_varint_bytes(raw, off); off += used
+            result["subscription_identifiers"].append(value)
+        elif prop == 0x23:
+            result["topic_alias"] = struct.unpack("!H", raw[off:off+2])[0]; off += 2
+        elif prop == 0x26:
+            result["user_properties"].append((read_utf8(), read_utf8()))
+        else:
+            raise AssertionError(f"unexpected PUBLISH property {prop:#x} in {raw!r}")
+    return result
+
+
 def packet(header: int, body: bytes) -> bytes:
     return bytes([header]) + varint(len(body)) + body
 
@@ -66,6 +140,11 @@ def connect_packet(client_id, *, clean_start=True, session_expiry=0, will=None, 
         delay = will.get("delay", 0)
         if delay:
             wprops += bytes([0x18]) + struct.pack("!I", delay)
+        wprops += application_properties_bytes(
+            will.get("properties"),
+            allow_subscription_ids=False,
+            allow_topic_alias=False,
+        )
         payload += varint(len(wprops)) + wprops
         payload += utf8(will["topic"]) + binary(will["payload"])
     payload += utf8(user) + binary(password.encode())
@@ -81,7 +160,7 @@ def subscribe_packet(pid, topic_filter, qos=0, options_extra=0, subscription_id=
     return packet(0x82, body)
 
 
-def publish_packet(topic, payload, *, qos=0, retain=False, pid=1, dup=False):
+def publish_packet(topic, payload, *, qos=0, retain=False, pid=1, dup=False, properties=None, raw_properties=None):
     header = 0x30 | ((qos & 0x03) << 1)
     if retain:
         header |= 0x01
@@ -90,7 +169,8 @@ def publish_packet(topic, payload, *, qos=0, retain=False, pid=1, dup=False):
     body = utf8(topic)
     if qos:
         body += struct.pack("!H", pid)
-    body += b"\x00" + payload
+    prop_bytes = raw_properties if raw_properties is not None else application_properties_bytes(properties)
+    body += varint(len(prop_bytes)) + prop_bytes + payload
     return packet(header, body)
 
 
@@ -166,8 +246,10 @@ class RawClient:
         assert reason <= 2, f"SUBACK failure {reason:#x}"
         return reason
 
-    def publish(self, topic, payload, *, qos=0, retain=False, pid=1):
-        self.sock.sendall(publish_packet(topic, payload, qos=qos, retain=retain, pid=pid))
+    def publish(self, topic, payload, *, qos=0, retain=False, pid=1, properties=None):
+        self.sock.sendall(publish_packet(
+            topic, payload, qos=qos, retain=retain, pid=pid, properties=properties
+        ))
         if qos == 1:
             _, body = self.expect_type(4)
             assert struct.unpack("!H", body[:2])[0] == pid
@@ -199,7 +281,9 @@ def parse_publish(header, body):
     off += used + prop_len
     return {
         "qos": qos, "retain": retain, "dup": dup, "topic": topic,
-        "pid": pid, "properties": prop_raw, "payload": body[off:]
+        "pid": pid, "properties": prop_raw,
+        "parsed_properties": parse_application_properties(prop_raw),
+        "payload": body[off:]
     }
 
 
@@ -444,6 +528,282 @@ def test_client_id_takeover_stress():
     current.disconnect()
 
 
+def test_publish_application_properties_end_to_end():
+    topic = "protocol/v2/properties/live"
+    sub = RawClient("proto_props_live_sub")
+    sub.subscribe(topic, qos=0, subscription_id=41)
+    pub = RawClient("proto_props_live_pub")
+    properties = {
+        "payload_format_indicator": 1,
+        "message_expiry_interval": 5,
+        "content_type": "application/json",
+        "response_topic": "protocol/v2/properties/reply",
+        "correlation_data": b"corr-123",
+        "user_properties": [("first", "one"), ("second", "two")],
+    }
+    pub.publish(topic, b'{"ok":true}', properties=properties)
+    h, body = sub.expect_type(3)
+    msg = parse_publish(h, body)
+    got = msg["parsed_properties"]
+    assert msg["payload"] == b'{"ok":true}'
+    assert got["payload_format_indicator"] == 1, got
+    assert got["content_type"] == "application/json", got
+    assert got["response_topic"] == "protocol/v2/properties/reply", got
+    assert got["correlation_data"] == b"corr-123", got
+    assert got["user_properties"] == [("first", "one"), ("second", "two")], got
+    assert got["subscription_identifiers"] == [41], got
+    assert got["topic_alias"] is None, got
+    assert 1 <= got["message_expiry_interval"] <= 5, got
+    pub.disconnect(); sub.disconnect()
+
+
+def test_retained_properties_and_message_expiry():
+    topic = "protocol/v2/properties/retained-expiry"
+    cleaner = RawClient("proto_props_ret_clean")
+    cleaner.publish(topic, b"", retain=True)
+    properties = {
+        "payload_format_indicator": 1,
+        "message_expiry_interval": 3,
+        "content_type": "text/plain",
+        "response_topic": "protocol/v2/properties/reply-retained",
+        "correlation_data": b"ret-corr",
+        "user_properties": [("order", "1"), ("order", "2")],
+    }
+    cleaner.publish(topic, b"expires", qos=1, retain=True, pid=191, properties=properties)
+    time.sleep(1.15)
+    sub = RawClient("proto_props_ret_sub")
+    sub.subscribe(topic, qos=1, subscription_id=92)
+    h, body = sub.expect_type(3)
+    msg = parse_publish(h, body)
+    got = msg["parsed_properties"]
+    assert msg["retain"] and msg["payload"] == b"expires", msg
+    assert got["content_type"] == "text/plain", got
+    assert got["correlation_data"] == b"ret-corr", got
+    assert got["user_properties"] == [("order", "1"), ("order", "2")], got
+    assert got["subscription_identifiers"] == [92], got
+    assert 1 <= got["message_expiry_interval"] <= 2, got
+    if msg["qos"] == 1:
+        sub.sock.sendall(ack_packet(4, msg["pid"]))
+    sub.disconnect()
+
+    time.sleep(2.2)
+    expired = RawClient("proto_props_ret_expired")
+    expired.subscribe(topic, qos=0)
+    assert no_packet(expired, 0.6), "expired retained message was replayed"
+    expired.disconnect(); cleaner.disconnect()
+
+
+def test_offline_qos1_properties_and_expiry():
+    topic = "protocol/v2/properties/offline"
+    cid = "proto_props_offline_sub"
+    sub = RawClient(cid, clean_start=True, session_expiry=30)
+    sub.subscribe(topic, qos=1, subscription_id=73)
+    sub.disconnect()
+    time.sleep(0.1)
+
+    pub = RawClient("proto_props_offline_pub")
+    properties = {
+        "message_expiry_interval": 6,
+        "content_type": "application/octet-stream",
+        "correlation_data": b"offline-corr",
+        "user_properties": [("persist", "yes"), ("sequence", "two")],
+    }
+    pub.publish(topic, b"offline-properties", qos=1, pid=201, properties=properties)
+    time.sleep(1.15)
+
+    resumed = RawClient(cid, clean_start=False, session_expiry=30)
+    assert resumed.session_present
+    h, body = resumed.expect_type(3)
+    msg = parse_publish(h, body)
+    got = msg["parsed_properties"]
+    assert msg["dup"] and msg["payload"] == b"offline-properties", msg
+    assert got["content_type"] == "application/octet-stream", got
+    assert got["correlation_data"] == b"offline-corr", got
+    assert got["user_properties"] == [("persist", "yes"), ("sequence", "two")], got
+    assert got["subscription_identifiers"] == [73], got
+    assert 1 <= got["message_expiry_interval"] <= 5, got
+    resumed.sock.sendall(ack_packet(4, msg["pid"]))
+    resumed.disconnect(); pub.disconnect()
+
+
+def test_offline_unsent_message_expires_before_reconnect():
+    topic = "protocol/v2/expiry/offline-unsent"
+    cid = "proto_expiry_unsent_sub"
+    sub = RawClient(cid, clean_start=True, session_expiry=20)
+    sub.subscribe(topic, qos=1)
+    sub.disconnect()
+    time.sleep(0.1)
+    pub = RawClient("proto_expiry_unsent_pub")
+    pub.publish(
+        topic,
+        b"must-expire",
+        qos=1,
+        pid=211,
+        properties={"message_expiry_interval": 1},
+    )
+    time.sleep(1.25)
+    resumed = RawClient(cid, clean_start=False, session_expiry=20)
+    assert resumed.session_present
+    assert no_packet(resumed, 0.7), "offline message was delivered after Message Expiry"
+    resumed.disconnect(); pub.disconnect()
+
+
+def test_started_qos1_retries_after_expiry():
+    topic = "protocol/v2/expiry/qos1-started"
+    cid = "proto_expiry_qos1_sub"
+    sub = RawClient(cid, clean_start=True, session_expiry=20)
+    sub.subscribe(topic, qos=1)
+    pub = RawClient("proto_expiry_qos1_pub")
+    pub.publish(
+        topic,
+        b"qos1-started",
+        qos=1,
+        pid=212,
+        properties={"message_expiry_interval": 1, "user_properties": [("q", "one")]},
+    )
+    h, body = sub.expect_type(3)
+    first = parse_publish(h, body)
+    assert first["qos"] == 1 and first["payload"] == b"qos1-started"
+    # Do not PUBACK: onward delivery has started but remains unacknowledged.
+    sub.close_abrupt()
+    time.sleep(1.25)
+    resumed = RawClient(cid, clean_start=False, session_expiry=20)
+    assert resumed.session_present
+    h, body = resumed.expect_type(3)
+    retry = parse_publish(h, body)
+    assert retry["dup"] and retry["pid"] == first["pid"], retry
+    assert retry["payload"] == b"qos1-started"
+    assert retry["parsed_properties"]["user_properties"] == [("q", "one")]
+    # Expiry can have reached zero, but MQTT retry state must still complete.
+    assert retry["parsed_properties"]["message_expiry_interval"] == 0, retry
+    resumed.sock.sendall(ack_packet(4, retry["pid"]))
+    resumed.disconnect(); pub.disconnect()
+
+
+def test_started_qos2_continues_after_expiry():
+    topic = "protocol/v2/expiry/qos2-started"
+    cid = "proto_expiry_qos2_sub"
+    sub = RawClient(cid, clean_start=True, session_expiry=20)
+    sub.subscribe(topic, qos=2)
+    pub = RawClient("proto_expiry_qos2_pub")
+    pub.sock.sendall(publish_packet(
+        topic,
+        b"qos2-started",
+        qos=2,
+        pid=213,
+        properties={"message_expiry_interval": 1, "user_properties": [("q", "two")]},
+    ))
+    pub.expect_type(5)
+    pub.sock.sendall(ack_packet(6, 213))
+    pub.expect_type(7)
+    h, body = sub.expect_type(3)
+    first = parse_publish(h, body)
+    assert first["qos"] == 2 and first["payload"] == b"qos2-started", first
+    sub.sock.sendall(ack_packet(5, first["pid"]))
+    _, rel = sub.expect_type(6)
+    assert struct.unpack("!H", rel[:2])[0] == first["pid"]
+    # Lose PUBCOMP, then let Message Expiry pass. The PUBREL state still must resume.
+    sub.close_abrupt()
+    time.sleep(1.25)
+    resumed = RawClient(cid, clean_start=False, session_expiry=20)
+    assert resumed.session_present
+    _, rel2 = resumed.expect_type(6)
+    assert struct.unpack("!H", rel2[:2])[0] == first["pid"]
+    resumed.sock.sendall(ack_packet(7, first["pid"]))
+    assert no_packet(resumed, 0.4)
+    resumed.disconnect(); pub.disconnect()
+
+
+def test_will_application_properties():
+    topic = "protocol/v2/properties/will"
+    sub = RawClient("proto_props_will_sub")
+    sub.subscribe(topic, qos=1, subscription_id=66)
+    will_properties = {
+        "payload_format_indicator": 1,
+        "message_expiry_interval": 4,
+        "content_type": "text/plain",
+        "response_topic": "protocol/v2/properties/will-reply",
+        "correlation_data": b"will-corr",
+        "user_properties": [("will", "first"), ("will", "second")],
+    }
+    doomed = RawClient(
+        "proto_props_will_sender",
+        session_expiry=20,
+        will={
+            "topic": topic,
+            "payload": b"will-properties",
+            "qos": 1,
+            "delay": 0,
+            "properties": will_properties,
+        },
+    )
+    doomed.close_abrupt()
+    h, body = sub.expect_type(3, timeout=3)
+    msg = parse_publish(h, body)
+    got = msg["parsed_properties"]
+    assert msg["payload"] == b"will-properties"
+    assert got["payload_format_indicator"] == 1, got
+    assert got["content_type"] == "text/plain", got
+    assert got["response_topic"] == "protocol/v2/properties/will-reply", got
+    assert got["correlation_data"] == b"will-corr", got
+    assert got["user_properties"] == [("will", "first"), ("will", "second")], got
+    assert got["subscription_identifiers"] == [66], got
+    assert 1 <= got["message_expiry_interval"] <= 4, got
+    sub.sock.sendall(ack_packet(4, msg["pid"]))
+    sub.disconnect()
+
+
+def test_publish_property_protocol_errors():
+    # Client->Server Subscription Identifier is a Protocol Error (0x82).
+    bad_subid = RawClient("proto_bad_publish_subid")
+    bad_subid.sock.sendall(publish_packet(
+        "protocol/v2/bad/subid",
+        b"bad",
+        properties={"subscription_identifiers": [7]},
+    ))
+    _, body = bad_subid.expect_type(14)
+    assert body and body[0] == 0x82, body
+    bad_subid.sock.close()
+
+    # Server advertises Topic Alias Maximum=0, so any alias is invalid (0x94).
+    bad_alias = RawClient("proto_bad_publish_alias")
+    bad_alias.sock.sendall(publish_packet(
+        "protocol/v2/bad/alias",
+        b"bad",
+        properties={"topic_alias": 1},
+    ))
+    _, body = bad_alias.expect_type(14)
+    assert body and body[0] == 0x94, body
+    bad_alias.sock.close()
+
+    # A singleton PUBLISH property repeated twice is a Protocol Error.
+    duplicate_pfi = RawClient("proto_bad_publish_duplicate")
+    duplicate_pfi.sock.sendall(publish_packet(
+        "protocol/v2/bad/duplicate",
+        b"bad",
+        raw_properties=b"\x01\x01\x01\x01",
+    ))
+    _, body = duplicate_pfi.expect_type(14)
+    assert body and body[0] == 0x82, body
+    duplicate_pfi.sock.close()
+
+    # Invalid topics must not slip through the zero-route QoS0 fast path.
+    bad_wildcard = RawClient("proto_bad_publish_wildcard")
+    bad_wildcard.sock.sendall(publish_packet(
+        "protocol/v2/bad/+",
+        b"bad",
+    ))
+    _, body = bad_wildcard.expect_type(14)
+    assert body and body[0] == 0x82, body
+    bad_wildcard.sock.close()
+
+    bad_empty = RawClient("proto_bad_publish_empty")
+    bad_empty.sock.sendall(publish_packet("", b"bad"))
+    _, body = bad_empty.expect_type(14)
+    assert body and body[0] == 0x82, body
+    bad_empty.sock.close()
+
+
 def test_client_id_principal_binding():
     cid = "proto_principal_bound"
     owner = RawClient(cid, clean_start=True, session_expiry=60, user="admin", password="admin123")
@@ -524,6 +884,14 @@ if __name__ == "__main__":
         ("subscription Retain Handling/RAP/No Local", test_subscription_retain_options_and_no_local),
         ("Will normal suppression + retained Will", test_will_normal_disconnect_and_retained),
         ("QoS2 outbound resume from PUBREL", test_outgoing_qos2_resume_from_pubrel),
+        ("PUBLISH application properties end-to-end", test_publish_application_properties_end_to_end),
+        ("retained properties + Message Expiry", test_retained_properties_and_message_expiry),
+        ("offline QoS1 properties + Message Expiry", test_offline_qos1_properties_and_expiry),
+        ("offline unsent Message Expiry", test_offline_unsent_message_expires_before_reconnect),
+        ("started QoS1 retries after expiry", test_started_qos1_retries_after_expiry),
+        ("started QoS2 continues after expiry", test_started_qos2_continues_after_expiry),
+        ("Will application properties", test_will_application_properties),
+        ("PUBLISH property protocol errors", test_publish_property_protocol_errors),
         ("ClientID principal binding / ACL isolation", test_client_id_principal_binding),
         ("ClientID takeover DISCONNECT 0x8E", test_client_id_takeover),
         ("ClientID takeover stress x20", test_client_id_takeover_stress),

@@ -169,6 +169,7 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 let bridge_dropped =
                                     state.metrics_bridge_queue_dropped.load(Ordering::Relaxed);
                                 let retained_messages = state.retained.read().len();
+                                let pending_wills = state.pending_wills_count();
                                 let session_takeovers =
                                     state.metrics_session_takeovers.load(Ordering::Relaxed);
                                 let wills_published =
@@ -215,6 +216,11 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     "pipistrelle_retained_messages_current {}",
                                     retained_messages
                                 );
+                                metric!(
+                                    "# HELP pipistrelle_pending_wills_current Last Will messages currently persisted or awaiting publication"
+                                );
+                                metric!("# TYPE pipistrelle_pending_wills_current gauge");
+                                metric!("pipistrelle_pending_wills_current {}", pending_wills);
                                 metric!(
                                     "# HELP pipistrelle_qos2_incoming_pending QoS 2 inbound flows waiting for PUBREL"
                                 );
@@ -490,7 +496,7 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 "200 OK",
                                 "application/json; charset=utf-8",
                                 format!(
-                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"qos2\":true,\"retained_messages\":true,\"last_will\":true,\"persistent_sessions\":true,\"client_id_takeover\":true,\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
+                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"qos2\":true,\"retained_messages\":true,\"last_will\":true,\"persistent_sessions\":true,\"client_id_takeover\":true,\"publish_application_properties\":true,\"message_expiry\":true,\"will_crash_persistence\":true,\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
                                     version::VERSION,
                                     version::SERIES,
                                     tls_profile.as_str(),

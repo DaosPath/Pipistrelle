@@ -368,6 +368,7 @@ def run_test_metrics():
             "pipistrelle_writer_batch_packets",
             "pipistrelle_writer_batch_bytes",
             "pipistrelle_retained_messages_current",
+            "pipistrelle_pending_wills_current",
             "pipistrelle_qos2_incoming_pending",
             "pipistrelle_qos2_outgoing_pending",
             "pipistrelle_session_takeovers_total",

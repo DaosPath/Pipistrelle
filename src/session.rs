@@ -1,8 +1,9 @@
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -54,10 +55,124 @@ impl BridgeQueuePolicy {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BridgeMessage {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub retain: bool,
+    pub properties: ApplicationProperties,
+}
+
 #[derive(Clone)]
 pub struct BridgeQueueHandle {
-    pub sender: mpsc::Sender<(String, Vec<u8>)>,
+    pub sender: mpsc::Sender<BridgeMessage>,
     pub topic_prefix: Arc<str>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationProperties {
+    pub payload_format_indicator: Option<u8>,
+    pub message_expiry_interval: Option<u32>,
+    /// Unix milliseconds at which Message Expiry started counting. For a normal
+    /// PUBLISH this is reception time; for a Will it remains None until publication.
+    pub expiry_started_at_ms: Option<u64>,
+    pub content_type: Option<String>,
+    pub response_topic: Option<String>,
+    pub correlation_data: Option<Vec<u8>>,
+    pub user_properties: Vec<(String, String)>,
+}
+
+impl ApplicationProperties {
+    pub fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
+
+    pub fn from_publish(properties: &PublishProperties<'_>) -> Self {
+        Self {
+            payload_format_indicator: properties.payload_format_indicator,
+            message_expiry_interval: properties.message_expiry_interval,
+            expiry_started_at_ms: properties.message_expiry_interval.map(|_| Self::now_ms()),
+            content_type: properties.content_type.map(str::to_string),
+            response_topic: properties.response_topic.map(str::to_string),
+            correlation_data: properties.correlation_data.map(ToOwned::to_owned),
+            user_properties: properties
+                .user_properties
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    pub fn from_will(properties: &crate::codec::WillProperties<'_>) -> Self {
+        Self {
+            payload_format_indicator: properties.payload_format_indicator,
+            message_expiry_interval: properties.message_expiry_interval,
+            expiry_started_at_ms: None,
+            content_type: properties.content_type.map(str::to_string),
+            response_topic: properties.response_topic.map(str::to_string),
+            correlation_data: properties.correlation_data.map(ToOwned::to_owned),
+            user_properties: properties
+                .user_properties
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    pub fn start_expiry_now(&mut self) {
+        if self.message_expiry_interval.is_some() && self.expiry_started_at_ms.is_none() {
+            self.expiry_started_at_ms = Some(Self::now_ms());
+        }
+    }
+
+    pub fn remaining_expiry(&self) -> Option<u32> {
+        let interval = self.message_expiry_interval?;
+        let Some(started) = self.expiry_started_at_ms else {
+            return Some(interval);
+        };
+        let elapsed_ms = Self::now_ms().saturating_sub(started);
+        if elapsed_ms >= u64::from(interval) * 1000 {
+            return Some(0);
+        }
+        Some(interval.saturating_sub((elapsed_ms / 1000) as u32))
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.message_expiry_interval.is_some() && self.remaining_expiry() == Some(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.payload_format_indicator.is_none()
+            && self.message_expiry_interval.is_none()
+            && self.content_type.is_none()
+            && self.response_topic.is_none()
+            && self.correlation_data.is_none()
+            && self.user_properties.is_empty()
+    }
+
+    pub fn as_publish_properties(
+        &self,
+        subscription_identifier: Option<u32>,
+    ) -> PublishProperties<'_> {
+        PublishProperties {
+            payload_format_indicator: self.payload_format_indicator,
+            message_expiry_interval: self.remaining_expiry(),
+            content_type: self.content_type.as_deref(),
+            response_topic: self.response_topic.as_deref(),
+            correlation_data: self.correlation_data.as_deref(),
+            subscription_identifiers: subscription_identifier.into_iter().collect(),
+            topic_alias: None,
+            user_properties: self
+                .user_properties
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect(),
+        }
+    }
 }
 
 /// Information about a message currently in-flight (QoS > 0)
@@ -67,6 +182,10 @@ pub struct InFlightMessage {
     pub topic: String,
     pub payload: Vec<u8>,
     pub qos: u8,
+    pub retain: bool,
+    pub subscription_identifier: Option<u32>,
+    pub properties: ApplicationProperties,
+    pub delivery_started: bool,
     pub sent_at: Instant,
 }
 
@@ -75,6 +194,7 @@ pub struct RetainedMessage {
     pub topic: String,
     pub payload: Vec<u8>,
     pub qos: u8,
+    pub properties: ApplicationProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +202,7 @@ pub struct IncomingQos2Message {
     pub topic: String,
     pub payload: Vec<u8>,
     pub retain: bool,
+    pub properties: ApplicationProperties,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +227,8 @@ pub struct OutgoingQos2Message {
     pub payload: Vec<u8>,
     pub retain: bool,
     pub subscription_identifier: Option<u32>,
+    pub properties: ApplicationProperties,
+    pub delivery_started: bool,
     pub phase: OutgoingQos2Phase,
 }
 
@@ -116,12 +239,14 @@ pub struct WillMessage {
     pub qos: u8,
     pub retain: bool,
     pub delay_interval: u32,
+    pub properties: ApplicationProperties,
 }
 
 #[derive(Clone)]
 struct PendingWill {
     cancel: Arc<AtomicBool>,
     message: WillMessage,
+    username: Option<String>,
 }
 
 /// Represents an active or offline client session
@@ -208,12 +333,26 @@ impl ClientSession {
         id
     }
 
-    pub fn add_in_flight(&self, packet_id: u16, topic: &str, payload: &[u8], qos: u8) {
+    pub fn add_in_flight(
+        &self,
+        packet_id: u16,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+        subscription_identifier: Option<u32>,
+        properties: ApplicationProperties,
+        delivery_started: bool,
+    ) {
         let msg = InFlightMessage {
             packet_id,
             topic: topic.to_string(),
             payload: payload.to_vec(),
             qos,
+            retain,
+            subscription_identifier,
+            properties,
+            delivery_started,
             sent_at: Instant::now(),
         };
         self.in_flight.write().insert(packet_id, msg);
@@ -506,13 +645,45 @@ impl BrokerState {
         // 3. Restore in-flight messages
         match self.db.load_all_in_flight().await {
             Ok(inflight_loaded) => {
-                let sessions_guard = self.sessions.read();
+                let mut expired = Vec::new();
                 let mut count = 0;
-                for (client_id, packet_id, topic, payload, qos) in inflight_loaded {
-                    if let Some(session) = sessions_guard.get(&client_id) {
-                        session.add_in_flight(packet_id, &topic, &payload, qos);
-                        count += 1;
+                {
+                    let sessions_guard = self.sessions.read();
+                    for (
+                        client_id,
+                        packet_id,
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        subscription_identifier,
+                        properties_json,
+                        delivery_started,
+                    ) in inflight_loaded
+                    {
+                        if let Some(session) = sessions_guard.get(&client_id) {
+                            let properties: ApplicationProperties =
+                                serde_json::from_str(&properties_json).unwrap_or_default();
+                            if properties.is_expired() && !delivery_started {
+                                expired.push((client_id, packet_id));
+                                continue;
+                            }
+                            session.add_in_flight(
+                                packet_id,
+                                &topic,
+                                &payload,
+                                qos,
+                                retain,
+                                subscription_identifier,
+                                properties,
+                                delivery_started,
+                            );
+                            count += 1;
+                        }
                     }
+                }
+                for (client_id, packet_id) in expired {
+                    self.db.delete_in_flight(client_id, packet_id).await;
                 }
                 info!("Restored {} in-flight message(s) from database", count);
             }
@@ -524,16 +695,29 @@ impl BrokerState {
         match self.db.load_retained().await {
             Ok(messages) => {
                 let mut retained = self.retained.write();
-                for (topic, payload, qos) in messages {
+                let mut expired = Vec::new();
+                for (topic, payload, qos, properties_json) in messages {
+                    let properties: ApplicationProperties =
+                        serde_json::from_str(&properties_json).unwrap_or_default();
+                    if properties.is_expired() {
+                        expired.push(topic);
+                        continue;
+                    }
                     retained.insert(
                         topic.clone(),
                         RetainedMessage {
                             topic,
                             payload,
                             qos,
+                            properties,
                         },
                     );
                 }
+                drop(retained);
+                for topic in expired {
+                    self.db.delete_retained(topic).await;
+                }
+                let retained = self.retained.read();
                 info!(
                     "Restored {} retained message(s) from database",
                     retained.len()
@@ -545,14 +729,17 @@ impl BrokerState {
         match self.db.load_qos2_incoming().await {
             Ok(messages) => {
                 let sessions = self.sessions.read();
-                for (client_id, packet_id, topic, payload, retain) in messages {
+                for (client_id, packet_id, topic, payload, retain, properties_json) in messages {
                     if let Some(session) = sessions.get(&client_id) {
+                        let properties: ApplicationProperties =
+                            serde_json::from_str(&properties_json).unwrap_or_default();
                         session.incoming_qos2.write().insert(
                             packet_id,
                             IncomingQos2Message {
                                 topic,
                                 payload,
                                 retain,
+                                properties,
                             },
                         );
                     }
@@ -563,33 +750,55 @@ impl BrokerState {
 
         match self.db.load_qos2_outgoing().await {
             Ok(messages) => {
-                let sessions = self.sessions.read();
-                for (
-                    client_id,
-                    packet_id,
-                    topic,
-                    payload,
-                    retain,
-                    subscription_identifier,
-                    phase,
-                ) in messages
+                let mut expired = Vec::new();
                 {
-                    if let Some(session) = sessions.get(&client_id) {
-                        session.outgoing_qos2.write().insert(
-                            packet_id,
-                            OutgoingQos2Message {
-                                topic,
-                                payload,
-                                retain,
-                                subscription_identifier,
-                                phase: OutgoingQos2Phase::from_db(phase),
-                            },
-                        );
+                    let sessions = self.sessions.read();
+                    for (
+                        client_id,
+                        packet_id,
+                        topic,
+                        payload,
+                        retain,
+                        subscription_identifier,
+                        properties_json,
+                        delivery_started,
+                        phase,
+                    ) in messages
+                    {
+                        if let Some(session) = sessions.get(&client_id) {
+                            let properties: ApplicationProperties =
+                                serde_json::from_str(&properties_json).unwrap_or_default();
+                            let phase = OutgoingQos2Phase::from_db(phase);
+                            if properties.is_expired()
+                                && !delivery_started
+                                && phase == OutgoingQos2Phase::AwaitPubRec
+                            {
+                                expired.push((client_id, packet_id));
+                                continue;
+                            }
+                            session.outgoing_qos2.write().insert(
+                                packet_id,
+                                OutgoingQos2Message {
+                                    topic,
+                                    payload,
+                                    retain,
+                                    subscription_identifier,
+                                    properties,
+                                    delivery_started,
+                                    phase,
+                                },
+                            );
+                        }
                     }
+                }
+                for (client_id, packet_id) in expired {
+                    self.db.delete_qos2_outgoing(client_id, packet_id).await;
                 }
             }
             Err(e) => error!("Failed to restore outbound QoS2 state: {:?}", e),
         }
+
+        self.restore_wills_from_db().await;
 
         for (session, delay) in restored_expiry_timers {
             self.schedule_session_expiry_after(session, delay);
@@ -681,19 +890,73 @@ impl BrokerState {
         true
     }
 
-    pub fn cancel_pending_will(&self, client_id: &str) -> bool {
+    pub fn pending_wills_count(&self) -> usize {
+        self.pending_wills.read().len()
+    }
+
+    pub fn pending_will_principal(&self, client_id: &str) -> Option<Option<String>> {
+        self.pending_wills
+            .read()
+            .get(client_id)
+            .map(|pending| pending.username.clone())
+    }
+
+    pub async fn persist_connection_will(
+        &self,
+        client_id: &str,
+        username: Option<String>,
+        message: &WillMessage,
+        session_expiry_interval: u32,
+    ) {
+        let properties_json =
+            serde_json::to_string(&message.properties).unwrap_or_else(|_| "{}".into());
+        self.db
+            .save_will(
+                client_id.to_string(),
+                username,
+                message.topic.clone(),
+                message.payload.clone(),
+                message.qos,
+                message.retain,
+                message.delay_interval,
+                properties_json,
+                session_expiry_interval,
+                None,
+            )
+            .await;
+    }
+
+    pub async fn clear_persisted_will(&self, client_id: &str) {
         if let Some(pending) = self.pending_wills.write().remove(client_id) {
             pending.cancel.store(true, Ordering::Release);
+        }
+        self.db.delete_will(client_id.to_string()).await;
+    }
+
+    pub async fn cancel_pending_will(&self, client_id: &str) -> bool {
+        let removed = self.pending_wills.write().remove(client_id);
+        if let Some(pending) = removed {
+            pending.cancel.store(true, Ordering::Release);
+            self.db.delete_will(client_id.to_string()).await;
             true
         } else {
             false
         }
     }
 
-    pub async fn publish_will_now(&self, message: WillMessage) {
+    pub async fn publish_will_now(&self, mut message: WillMessage) {
+        message.properties.start_expiry_now();
+        if message.properties.is_expired() {
+            return;
+        }
         self.metrics_wills_published.fetch_add(1, Ordering::Relaxed);
         if message.retain {
-            self.update_retained(&message.topic, &message.payload, message.qos);
+            self.update_retained(
+                &message.topic,
+                &message.payload,
+                message.qos,
+                &message.properties,
+            );
         }
         let sequence = self
             .metrics_messages_published_retired
@@ -704,16 +967,25 @@ impl BrokerState {
             &message.payload,
             message.qos,
             message.retain,
+            &message.properties,
             sequence,
         )
         .await;
+    }
+
+    pub async fn publish_will_for_client(&self, client_id: &str, message: WillMessage) {
+        self.publish_will_now(message).await;
+        // Network publication and SQLite deletion cannot be one atomic transaction.
+        // Deleting after publication favors at-least-once recovery over silent loss.
+        self.db.delete_will(client_id.to_string()).await;
     }
 
     pub async fn publish_pending_will_now(self: &Arc<Self>, client_id: &str) -> bool {
         let pending = self.pending_wills.write().remove(client_id);
         if let Some(pending) = pending {
             pending.cancel.store(true, Ordering::Release);
-            self.publish_will_now(pending.message).await;
+            self.publish_will_for_client(client_id, pending.message)
+                .await;
             true
         } else {
             false
@@ -751,25 +1023,53 @@ impl BrokerState {
         });
     }
 
-    pub fn schedule_will(
+    fn effective_will_delay(message: &WillMessage, session_expiry_interval: u32) -> u32 {
+        if session_expiry_interval == 0 || message.delay_interval == 0 {
+            0
+        } else if session_expiry_interval == u32::MAX {
+            message.delay_interval
+        } else {
+            message.delay_interval.min(session_expiry_interval)
+        }
+    }
+
+    pub async fn schedule_will(
         self: &Arc<Self>,
         client_id: String,
+        username: Option<String>,
         message: WillMessage,
         session_expiry_interval: u32,
     ) {
-        let delay = if session_expiry_interval == 0 {
-            0
-        } else if message.delay_interval == 0 {
-            0
-        } else {
-            message.delay_interval.min(session_expiry_interval)
-        };
+        let delay = Self::effective_will_delay(&message, session_expiry_interval);
+        let due_at_ms =
+            ApplicationProperties::now_ms().saturating_add(u64::from(delay).saturating_mul(1000));
+        let properties_json =
+            serde_json::to_string(&message.properties).unwrap_or_else(|_| "{}".into());
+
+        // Persist before arming the timer. A process crash after this point can
+        // reconstruct the remaining delay and publish the Will after restart.
+        self.db
+            .save_will(
+                client_id.clone(),
+                username.clone(),
+                message.topic.clone(),
+                message.payload.clone(),
+                message.qos,
+                message.retain,
+                message.delay_interval,
+                properties_json,
+                session_expiry_interval,
+                Some(due_at_ms),
+            )
+            .await;
+
         let cancel = Arc::new(AtomicBool::new(false));
         if let Some(old) = self.pending_wills.write().insert(
             client_id.clone(),
             PendingWill {
                 cancel: cancel.clone(),
                 message: message.clone(),
+                username,
             },
         ) {
             old.cancel.store(true, Ordering::Release);
@@ -793,9 +1093,113 @@ impl BrokerState {
                 }
             };
             if should_publish && !cancel.load(Ordering::Acquire) {
-                state.publish_will_now(message).await;
+                state.publish_will_for_client(&client_id, message).await;
             }
         });
+    }
+
+    async fn restore_wills_from_db(self: &Arc<Self>) {
+        let rows = match self.db.load_wills().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("Failed to restore Wills: {:?}", e);
+                return;
+            }
+        };
+        let now_ms = ApplicationProperties::now_ms();
+        let mut restored = 0usize;
+        for (
+            client_id,
+            username,
+            topic,
+            payload,
+            qos,
+            retain,
+            delay_interval,
+            properties_json,
+            session_expiry_interval,
+            persisted_due_at_ms,
+        ) in rows
+        {
+            let properties: ApplicationProperties =
+                serde_json::from_str(&properties_json).unwrap_or_default();
+            let message = WillMessage {
+                topic,
+                payload,
+                qos,
+                retain,
+                delay_interval,
+                properties,
+            };
+            // due_at=NULL means this connection was active when the broker died.
+            // MQTT permits deferred Will publication until a subsequent restart,
+            // so restart becomes the observed network-loss time for the delay.
+            let due_at_ms = persisted_due_at_ms.unwrap_or_else(|| {
+                now_ms.saturating_add(
+                    u64::from(Self::effective_will_delay(
+                        &message,
+                        session_expiry_interval,
+                    ))
+                    .saturating_mul(1000),
+                )
+            });
+            if persisted_due_at_ms.is_none() {
+                let json =
+                    serde_json::to_string(&message.properties).unwrap_or_else(|_| "{}".into());
+                self.db
+                    .save_will(
+                        client_id.clone(),
+                        username.clone(),
+                        message.topic.clone(),
+                        message.payload.clone(),
+                        message.qos,
+                        message.retain,
+                        message.delay_interval,
+                        json,
+                        session_expiry_interval,
+                        Some(due_at_ms),
+                    )
+                    .await;
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            if let Some(old) = self.pending_wills.write().insert(
+                client_id.clone(),
+                PendingWill {
+                    cancel: cancel.clone(),
+                    message: message.clone(),
+                    username,
+                },
+            ) {
+                old.cancel.store(true, Ordering::Release);
+            }
+            let wait_ms = due_at_ms.saturating_sub(ApplicationProperties::now_ms());
+            let state = self.clone();
+            tokio::spawn(async move {
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let should_publish = {
+                    let mut pending = state.pending_wills.write();
+                    match pending.get(&client_id) {
+                        Some(current) if Arc::ptr_eq(&current.cancel, &cancel) => {
+                            pending.remove(&client_id);
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if should_publish && !cancel.load(Ordering::Acquire) {
+                    state.publish_will_for_client(&client_id, message).await;
+                }
+            });
+            restored += 1;
+        }
+        if restored > 0 {
+            info!("Restored {} Will(s) from database", restored);
+        }
     }
 
     /// Processes a subscription request and enforces the per-client quota.
@@ -860,13 +1264,26 @@ impl BrokerState {
         granted_qos: u8,
         subscription_identifier: Option<u32>,
     ) {
-        let messages: Vec<RetainedMessage> = self
-            .retained
-            .read()
-            .values()
-            .filter(|message| topic_matches_filter(&message.topic, topic_filter))
-            .cloned()
-            .collect();
+        let (messages, expired_topics): (Vec<RetainedMessage>, Vec<String>) = {
+            let retained = self.retained.read();
+            let mut messages = Vec::new();
+            let mut expired = Vec::new();
+            for message in retained.values() {
+                if !topic_matches_filter(&message.topic, topic_filter) {
+                    continue;
+                }
+                if message.properties.is_expired() {
+                    expired.push(message.topic.clone());
+                } else {
+                    messages.push(message.clone());
+                }
+            }
+            (messages, expired)
+        };
+        for topic in expired_topics {
+            self.retained.write().remove(&topic);
+            self.db.delete_retained(topic).await;
+        }
         for message in messages {
             let qos = message.qos.min(granted_qos);
             self.send_publish_to_client(
@@ -875,15 +1292,22 @@ impl BrokerState {
                 &message.payload,
                 qos,
                 true,
+                &message.properties,
                 subscription_identifier,
             )
             .await;
         }
     }
 
-    pub fn update_retained(&self, topic: &str, payload: &[u8], qos: u8) {
+    pub fn update_retained(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        properties: &ApplicationProperties,
+    ) {
         let db = self.db.clone();
-        if payload.is_empty() {
+        if payload.is_empty() || properties.is_expired() {
             self.retained.write().remove(topic);
             let topic = topic.to_string();
             tokio::spawn(async move { db.delete_retained(topic).await });
@@ -894,11 +1318,15 @@ impl BrokerState {
                     topic: topic.to_string(),
                     payload: payload.to_vec(),
                     qos,
+                    properties: properties.clone(),
                 },
             );
             let topic = topic.to_string();
             let payload = payload.to_vec();
-            tokio::spawn(async move { db.save_retained(topic, payload, qos).await });
+            let properties_json = serde_json::to_string(properties).unwrap_or_else(|_| "{}".into());
+            tokio::spawn(
+                async move { db.save_retained(topic, payload, qos, properties_json).await },
+            );
         }
     }
 
@@ -929,8 +1357,12 @@ impl BrokerState {
         payload: &[u8],
         qos: u8,
         retain: bool,
+        properties: &ApplicationProperties,
         publish_sequence: u64,
     ) {
+        if properties.is_expired() {
+            return;
+        }
         let sample_latency =
             publish_sequence & (self.publish_route_latency_sample_rate as u64 - 1) == 0;
         let route_started = sample_latency.then(Instant::now);
@@ -951,7 +1383,12 @@ impl BrokerState {
             let bridge = self.bridge_sender.read().clone();
             if let Some(bridge) = bridge {
                 if topic.starts_with(bridge.topic_prefix.as_ref()) {
-                    let message = (topic.to_string(), payload.to_vec());
+                    let message = BridgeMessage {
+                        topic: topic.to_string(),
+                        payload: payload.to_vec(),
+                        retain,
+                        properties: properties.clone(),
+                    };
                     match bridge.sender.try_send(message) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(message)) => {
@@ -992,6 +1429,7 @@ impl BrokerState {
                         payload,
                         qos.min(sub.qos),
                         retain && sub.retain_as_published,
+                        properties,
                         sub.subscription_identifier,
                     )
                     .await;
@@ -1015,6 +1453,7 @@ impl BrokerState {
                 payload,
                 qos.min(sub.qos),
                 retain && sub.retain_as_published,
+                properties,
                 sub.subscription_identifier,
             )
             .await;
@@ -1044,6 +1483,7 @@ impl BrokerState {
                 payload,
                 qos.min(selected_sub.qos),
                 retain && selected_sub.retain_as_published,
+                properties,
                 selected_sub.subscription_identifier,
             )
             .await;
@@ -1114,27 +1554,54 @@ impl BrokerState {
         payload: &[u8],
         qos: u8,
         retain: bool,
+        properties: &ApplicationProperties,
         subscription_identifier: Option<u32>,
     ) {
+        if properties.is_expired() {
+            return;
+        }
         let session = { self.sessions.read().get(client_id).cloned() };
         if let Some(session) = session {
+            let delivery_started = session.connected.load(Ordering::Acquire);
             let packet_id = if qos > 0 {
                 let pid = session.get_next_packet_id();
                 if qos == 1 {
-                    session.add_in_flight(pid, topic, payload, qos);
-                    let db = self.db.clone();
-                    let cid = client_id.to_string();
-                    let t = topic.to_string();
-                    let p = payload.to_vec();
-                    tokio::spawn(async move {
-                        db.save_in_flight(cid, pid, t, p, qos).await;
-                    });
+                    let stored_properties = properties.clone();
+                    session.add_in_flight(
+                        pid,
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        subscription_identifier,
+                        stored_properties.clone(),
+                        delivery_started,
+                    );
+                    if session.session_expiry() > 0 {
+                        let properties_json = serde_json::to_string(&stored_properties)
+                            .unwrap_or_else(|_| "{}".into());
+                        self.db
+                            .save_in_flight(
+                                client_id.to_string(),
+                                pid,
+                                topic.to_string(),
+                                payload.to_vec(),
+                                qos,
+                                retain,
+                                subscription_identifier,
+                                properties_json,
+                                delivery_started,
+                            )
+                            .await;
+                    }
                 } else {
                     let message = OutgoingQos2Message {
                         topic: topic.to_string(),
                         payload: payload.to_vec(),
                         retain,
                         subscription_identifier,
+                        properties: properties.clone(),
+                        delivery_started,
                         phase: OutgoingQos2Phase::AwaitPubRec,
                     };
                     session.outgoing_qos2.write().insert(pid, message.clone());
@@ -1147,6 +1614,9 @@ impl BrokerState {
                                 message.payload,
                                 message.retain,
                                 message.subscription_identifier,
+                                serde_json::to_string(&message.properties)
+                                    .unwrap_or_else(|_| "{}".into()),
+                                message.delivery_started,
                                 message.phase as u8,
                             )
                             .await;
@@ -1157,7 +1627,7 @@ impl BrokerState {
                 None
             };
 
-            let buf = if qos == 0 {
+            let buf = if qos == 0 && properties.is_empty() {
                 encode_publish_qos0(topic, payload, retain, subscription_identifier)
             } else {
                 let publish_pkt = Packet::Publish(Publish {
@@ -1166,10 +1636,7 @@ impl BrokerState {
                     retain,
                     topic,
                     packet_id,
-                    properties: PublishProperties {
-                        subscription_identifier,
-                        ..Default::default()
-                    },
+                    properties: properties.as_publish_properties(subscription_identifier),
                     payload,
                 });
                 let mut buf = Vec::new();
@@ -1183,18 +1650,47 @@ impl BrokerState {
     pub async fn resume_persistent_outgoing(&self, session: &ClientSession) {
         let qos1: Vec<InFlightMessage> = session.in_flight.read().values().cloned().collect();
         for message in qos1 {
+            if message.properties.is_expired() && !message.delivery_started {
+                session.remove_in_flight(message.packet_id);
+                self.db
+                    .delete_in_flight(session.client_id.clone(), message.packet_id)
+                    .await;
+                continue;
+            }
             let publish = Packet::Publish(Publish {
                 dup: true,
                 qos: 1,
-                retain: false,
+                retain: message.retain,
                 topic: &message.topic,
                 packet_id: Some(message.packet_id),
-                properties: PublishProperties::default(),
+                properties: message
+                    .properties
+                    .as_publish_properties(message.subscription_identifier),
                 payload: &message.payload,
             });
             let mut buf = Vec::new();
             encode_packet(&publish, &mut buf);
-            let _ = self.send_to_session(session, buf).await;
+            if self.send_to_session(session, buf).await && !message.delivery_started {
+                if let Some(current) = session.in_flight.write().get_mut(&message.packet_id) {
+                    current.delivery_started = true;
+                }
+                if session.session_expiry() > 0 {
+                    self.db
+                        .save_in_flight(
+                            session.client_id.clone(),
+                            message.packet_id,
+                            message.topic.clone(),
+                            message.payload.clone(),
+                            message.qos,
+                            message.retain,
+                            message.subscription_identifier,
+                            serde_json::to_string(&message.properties)
+                                .unwrap_or_else(|_| "{}".into()),
+                            true,
+                        )
+                        .await;
+                }
+            }
         }
 
         let qos2: Vec<(u16, OutgoingQos2Message)> = session
@@ -1204,6 +1700,16 @@ impl BrokerState {
             .map(|(packet_id, message)| (*packet_id, message.clone()))
             .collect();
         for (packet_id, message) in qos2 {
+            if message.properties.is_expired()
+                && !message.delivery_started
+                && message.phase == OutgoingQos2Phase::AwaitPubRec
+            {
+                session.outgoing_qos2.write().remove(&packet_id);
+                self.db
+                    .delete_qos2_outgoing(session.client_id.clone(), packet_id)
+                    .await;
+                continue;
+            }
             let packet = match message.phase {
                 OutgoingQos2Phase::AwaitPubRec => Packet::Publish(Publish {
                     dup: true,
@@ -1211,10 +1717,9 @@ impl BrokerState {
                     retain: message.retain,
                     topic: &message.topic,
                     packet_id: Some(packet_id),
-                    properties: PublishProperties {
-                        subscription_identifier: message.subscription_identifier,
-                        ..Default::default()
-                    },
+                    properties: message
+                        .properties
+                        .as_publish_properties(message.subscription_identifier),
                     payload: &message.payload,
                 }),
                 OutgoingQos2Phase::AwaitPubComp => Packet::PubRel(crate::codec::PubAck {
@@ -1225,7 +1730,30 @@ impl BrokerState {
             };
             let mut buf = Vec::new();
             encode_packet(&packet, &mut buf);
-            let _ = self.send_to_session(session, buf).await;
+            if self.send_to_session(session, buf).await
+                && message.phase == OutgoingQos2Phase::AwaitPubRec
+                && !message.delivery_started
+            {
+                if let Some(current) = session.outgoing_qos2.write().get_mut(&packet_id) {
+                    current.delivery_started = true;
+                }
+                if session.session_expiry() > 0 {
+                    self.db
+                        .save_qos2_outgoing(
+                            session.client_id.clone(),
+                            packet_id,
+                            message.topic.clone(),
+                            message.payload.clone(),
+                            message.retain,
+                            message.subscription_identifier,
+                            serde_json::to_string(&message.properties)
+                                .unwrap_or_else(|_| "{}".into()),
+                            true,
+                            message.phase as u8,
+                        )
+                        .await;
+                }
+            }
         }
     }
 
