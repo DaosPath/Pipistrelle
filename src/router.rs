@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +33,9 @@ impl TrieNode {
 
 pub struct TopicRouter {
     root: RwLock<TrieNode>,
+    exact_routes: RwLock<HashMap<String, Arc<[SubscriptionInfo]>>>,
     active_routes: AtomicUsize,
+    non_exact_routes: AtomicUsize,
 }
 
 /// Represents matching subscribers.
@@ -48,8 +51,47 @@ impl TopicRouter {
     pub fn new() -> Self {
         Self {
             root: RwLock::new(TrieNode::default()),
+            exact_routes: RwLock::new(HashMap::new()),
             active_routes: AtomicUsize::new(0),
+            non_exact_routes: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    fn is_exact_normal_filter(topic_filter: &str) -> bool {
+        !topic_filter.starts_with("$share/")
+            && !topic_filter.as_bytes().contains(&b'+')
+            && !topic_filter.as_bytes().contains(&b'#')
+    }
+
+    fn update_exact_route(&self, topic: &str, sub_info: SubscriptionInfo) {
+        let mut routes = self.exact_routes.write();
+        let mut entries = routes
+            .get(topic)
+            .map(|entries| entries.as_ref().to_vec())
+            .unwrap_or_default();
+        entries.retain(|entry| entry.client_id != sub_info.client_id);
+        entries.push(sub_info);
+        routes.insert(topic.to_string(), Arc::from(entries));
+    }
+
+    fn remove_exact_route(&self, topic: &str, client_id: &str) -> bool {
+        let mut routes = self.exact_routes.write();
+        let Some(current) = routes.get(topic) else {
+            return false;
+        };
+        let mut entries = current.as_ref().to_vec();
+        let before = entries.len();
+        entries.retain(|entry| entry.client_id != client_id);
+        if entries.len() == before {
+            return false;
+        }
+        if entries.is_empty() {
+            routes.remove(topic);
+        } else {
+            routes.insert(topic.to_string(), Arc::from(entries));
+        }
+        true
     }
 
     /// Subscribes a client to a topic filter.
@@ -102,16 +144,22 @@ impl TopicRouter {
             let existed = list.iter().any(|s| s.client_id == client_id);
             // Avoid duplicate registrations for the same client in the same group.
             list.retain(|s| s.client_id != client_id);
-            list.push(sub_info);
+            list.push(sub_info.clone());
             !existed
         } else {
             current
                 .subscriptions
-                .insert(client_id.to_string(), sub_info)
+                .insert(client_id.to_string(), sub_info.clone())
                 .is_none()
         };
+        if Self::is_exact_normal_filter(topic_filter) {
+            self.update_exact_route(topic_filter, sub_info.clone());
+        }
         if inserted_new {
             self.active_routes.fetch_add(1, Ordering::Release);
+            if !Self::is_exact_normal_filter(topic_filter) {
+                self.non_exact_routes.fetch_add(1, Ordering::Release);
+            }
         }
     }
 
@@ -194,6 +242,11 @@ impl TopicRouter {
         let (removed, _) = unsubscribe_recursive(&mut *root, client_id, &segments, group);
         if removed {
             self.active_routes.fetch_sub(1, Ordering::Release);
+            if Self::is_exact_normal_filter(topic_filter) {
+                self.remove_exact_route(topic_filter, client_id);
+            } else {
+                self.non_exact_routes.fetch_sub(1, Ordering::Release);
+            }
         }
         removed
     }
@@ -235,7 +288,31 @@ impl TopicRouter {
         let mut root = self.root.write();
         let removed = remove_recursive(&mut root, client_id);
         if removed > 0 {
+            let exact_removed = {
+                let mut routes = self.exact_routes.write();
+                let topics: Vec<String> = routes.keys().cloned().collect();
+                let mut count = 0usize;
+                for topic in topics {
+                    if let Some(current) = routes.get(&topic) {
+                        let mut entries = current.as_ref().to_vec();
+                        let before = entries.len();
+                        entries.retain(|entry| entry.client_id != client_id);
+                        count += before - entries.len();
+                        if entries.is_empty() {
+                            routes.remove(&topic);
+                        } else if entries.len() != before {
+                            routes.insert(topic, Arc::from(entries));
+                        }
+                    }
+                }
+                count
+            };
+            let non_exact_removed = removed.saturating_sub(exact_removed);
             self.active_routes.fetch_sub(removed, Ordering::Release);
+            if non_exact_removed > 0 {
+                self.non_exact_routes
+                    .fetch_sub(non_exact_removed, Ordering::Release);
+            }
         }
         removed
     }
@@ -245,6 +322,16 @@ impl TopicRouter {
     #[inline]
     pub fn has_routes(&self) -> bool {
         self.active_routes.load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    pub fn has_only_exact_routes(&self) -> bool {
+        self.has_routes() && self.non_exact_routes.load(Ordering::Acquire) == 0
+    }
+
+    #[inline]
+    pub fn match_exact(&self, topic: &str) -> Option<Arc<[SubscriptionInfo]>> {
+        self.exact_routes.read().get(topic).cloned()
     }
 
     pub fn match_topic(&self, topic: &str) -> RouteResult {
@@ -324,6 +411,41 @@ mod tests {
         let res2 = router.match_topic("sensor/humi");
         assert_eq!(res2.normal.len(), 1);
         assert_eq!(res2.normal[0].client_id, "client2");
+    }
+
+    #[test]
+    fn test_exact_route_cache_lifecycle() {
+        let router = TopicRouter::new();
+        router.subscribe("client1", "sensor/temp", 0, None);
+        assert!(router.has_only_exact_routes());
+        let exact = router.match_exact("sensor/temp").unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].client_id, "client1");
+
+        router.subscribe("client2", "sensor/temp", 1, Some(7));
+        let exact = router.match_exact("sensor/temp").unwrap();
+        assert_eq!(exact.len(), 2);
+        assert!(exact.iter().any(|sub| sub.client_id == "client2"));
+
+        assert!(router.unsubscribe("client1", "sensor/temp"));
+        let exact = router.match_exact("sensor/temp").unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].client_id, "client2");
+
+        assert_eq!(router.remove_client("client2"), 1);
+        assert!(router.match_exact("sensor/temp").is_none());
+        assert!(!router.has_routes());
+    }
+
+    #[test]
+    fn wildcard_route_disables_exact_only_fast_path() {
+        let router = TopicRouter::new();
+        router.subscribe("client1", "sensor/temp", 0, None);
+        assert!(router.has_only_exact_routes());
+        router.subscribe("client2", "sensor/+", 0, None);
+        assert!(!router.has_only_exact_routes());
+        assert!(router.unsubscribe("client2", "sensor/+"));
+        assert!(router.has_only_exact_routes());
     }
 
     #[test]

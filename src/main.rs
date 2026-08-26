@@ -400,9 +400,30 @@ where
     let (mut read_half, mut write_half) = tokio::io::split(socket);
     let client_id_clone = client_id.clone();
 
+    let writer_batch_packets = state.writer_batch_packets;
+    let writer_batch_bytes = state.writer_batch_bytes;
     let writer_task = tokio::spawn(async move {
-        while let Some(bytes) = rx.recv().await {
-            if let Err(e) = write_half.write_all(&bytes).await {
+        let mut batch = Vec::with_capacity(writer_batch_bytes.min(256 * 1024));
+        while let Some(first) = rx.recv().await {
+            batch.clear();
+            batch.extend_from_slice(&first);
+            let mut packet_count = 1usize;
+
+            // Under load, collapse queued MQTT packets into one socket/TLS write.
+            // Ordering is preserved and the bounded channel remains the source of
+            // backpressure; light traffic is still written immediately.
+            while packet_count < writer_batch_packets && batch.len() < writer_batch_bytes {
+                match rx.try_recv() {
+                    Ok(bytes) => {
+                        batch.extend_from_slice(&bytes);
+                        packet_count += 1;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+
+            if let Err(e) = write_half.write_all(&batch).await {
                 warn!("Failed to write to client {}: {:?}", client_id_clone, e);
                 break;
             }

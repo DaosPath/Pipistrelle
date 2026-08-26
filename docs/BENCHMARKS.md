@@ -177,3 +177,44 @@ A 10-client TLS 1.3 loopback test delivered **200,000 messages at 634.2 k msg/s*
 ### Interpretation
 
 The **20+ M msg/s** figure must not be interpreted as 20M end-to-end delivered messages/s. It is the current single-node **QoS 0 intake ceiling** for the optimized zero-routing case. Fan-out/routing, QoS 1 persistence, WebSockets, and TLS have different ceilings and must be benchmarked independently.
+
+## V2 2.0.0.4 — 2M/s sustained end-to-end milestone
+
+The target for `2.0.0.4` was at least **2.0 M msg/s end-to-end** for native TCP MQTT v5 QoS 0 routing while preserving bounded queues and normal broker semantics. The workload uses 10 clients, each subscribed to its own exact topic and publishing 128-byte payloads to that topic.
+
+### Separating broker gains from benchmark gains
+
+The native benchmark reader itself had become a bottleneck: it previously performed multiple `read_exact` operations and allocated a body `Vec` for every received MQTT packet. After converting it to a buffered multi-packet parser, the published `v2.0.0.3` tag was re-tested unchanged with the new generator and reached **1.321 M msg/s** over 10 million messages.
+
+The optimized `2.0.0.4` broker, driven by that same new generator on the same Orange Pi, reached **2.393 M msg/s** in a 10-million-message run. That is roughly **+81% broker throughput** versus `v2.0.0.3` under the corrected measurement path.
+
+### Sustained 50-million-message release gate
+
+The final `2.0.0.4` build delivered **50,000,000 QoS 0 messages** in **20.893 s**:
+
+- **2.393 M msg/s sustained end-to-end**
+- **292.1 MiB/s delivered payload throughput**
+- Prometheus publish delta: exactly **50,000,000**
+- **0 benchmark failures**
+- Broker CPU samples: roughly **8.0–8.8 CPU cores** during most of the run
+- Broker memory: roughly **103–105 MiB** during the sustained run
+- Broker memory about two seconds after the run: roughly **102 MiB**
+- Bounded-queue pressure was still active and observable (`52,663` pressure events; cumulative concurrent wait about `16.7 s`)
+
+This is a true loopback routing test: every counted message entered the broker and was delivered back to a subscriber. It is not the `ingest` fast path used for the 20M/s milestone.
+
+### A/B progression
+
+| Change | 10-client QoS 0 loopback |
+|---|---:|
+| `v2.0.0.3`, corrected buffered benchmark reader | **1.321 M msg/s** |
+| Direct QoS 0 encoder | ~**1.0 M/s** with the older reader |
+| Exact-topic routing cache + writer batching, older reader | **1.69–1.74 M/s** |
+| Final broker + buffered native reader | **2.31–2.39 M/s** |
+| Final sustained 50M gate | **2.393 M msg/s** |
+
+The older-reader intermediate numbers are diagnostic only; the A/B comparison against `v2.0.0.3` uses the same corrected generator on both broker versions.
+
+### QoS 1 and hybrid PQC regression gates
+
+The final build also completed a 10-client, 200,000-message QoS 1 loopback run at **427.2 k msg/s** with zero failures. A clean TLS 1.3 hybrid run delivered 200,000 QoS 0 messages at **2.108 M msg/s** in a short run, with all **10/10** connections negotiating `X25519MLKEM768` and setup p50 around **200 ms**. The TLS number is a short regression check, not the sustained release headline.

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::codec::{Packet, Publish, PublishProperties, encode_packet};
+use crate::codec::{Packet, Publish, PublishProperties, encode_packet, encode_publish_qos0};
 use crate::latency::LatencyHistogram;
 use crate::router::TopicRouter;
 
@@ -216,6 +216,8 @@ pub struct BrokerState {
     pub slow_consumer_timeout: Duration,
     pub bridge_queue_capacity: usize,
     pub bridge_queue_policy: BridgeQueuePolicy,
+    pub writer_batch_packets: usize,
+    pub writer_batch_bytes: usize,
 
     // Bridge channel
     pub bridge_active: AtomicBool,
@@ -260,6 +262,16 @@ impl BrokerState {
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(1, 65_536).next_power_of_two().min(65_536))
             .unwrap_or(64);
+        let writer_batch_packets = std::env::var("PIPISTRELLE_WRITER_BATCH_PACKETS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1, 4096))
+            .unwrap_or(256);
+        let writer_batch_bytes = std::env::var("PIPISTRELLE_WRITER_BATCH_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(4_096, 4 * 1024 * 1024))
+            .unwrap_or(256 * 1024);
         info!(
             "Client limits: outbound_queue={}, subscriptions={}, slow_consumer={} ({} ms)",
             client_queue_capacity,
@@ -268,10 +280,12 @@ impl BrokerState {
             slow_consumer_timeout.as_millis(),
         );
         info!(
-            "Bridge queue: capacity={}, policy={}; latency sample rate=1/{}",
+            "Bridge queue: capacity={}, policy={}; latency sample rate=1/{}; writer batch={} packets/{} bytes",
             bridge_queue_capacity,
             bridge_queue_policy.as_str(),
             publish_route_latency_sample_rate,
+            writer_batch_packets,
+            writer_batch_bytes,
         );
 
         Self {
@@ -299,6 +313,8 @@ impl BrokerState {
             slow_consumer_timeout,
             bridge_queue_capacity,
             bridge_queue_policy,
+            writer_batch_packets,
+            writer_batch_bytes,
             bridge_active: AtomicBool::new(false),
             bridge_sender: RwLock::new(None),
         }
@@ -544,6 +560,28 @@ impl BrokerState {
             }
         }
 
+        // Exact-only routing is the common telemetry/service case. Subscription
+        // mutations rebuild an Arc slice; publishes only clone the Arc and iterate.
+        if self.router.has_only_exact_routes() {
+            if let Some(subscriptions) = self.router.match_exact(topic) {
+                for sub in subscriptions.iter() {
+                    self.send_publish_to_client(
+                        &sub.client_id,
+                        topic,
+                        payload,
+                        qos,
+                        retain,
+                        sub.subscription_identifier,
+                    )
+                    .await;
+                }
+            }
+            if let Some(route_started) = route_started {
+                self.publish_route_latency.record(route_started.elapsed());
+            }
+            return;
+        }
+
         let route = self.router.match_topic(topic);
 
         for sub in route.normal {
@@ -674,21 +712,25 @@ impl BrokerState {
                 None
             };
 
-            let publish_pkt = Packet::Publish(Publish {
-                dup: false,
-                qos,
-                retain,
-                topic,
-                packet_id,
-                properties: PublishProperties {
-                    subscription_identifier,
-                    ..Default::default()
-                },
-                payload,
-            });
-
-            let mut buf = Vec::new();
-            encode_packet(&publish_pkt, &mut buf);
+            let buf = if qos == 0 {
+                encode_publish_qos0(topic, payload, retain, subscription_identifier)
+            } else {
+                let publish_pkt = Packet::Publish(Publish {
+                    dup: false,
+                    qos,
+                    retain,
+                    topic,
+                    packet_id,
+                    properties: PublishProperties {
+                        subscription_identifier,
+                        ..Default::default()
+                    },
+                    payload,
+                });
+                let mut buf = Vec::new();
+                encode_packet(&publish_pkt, &mut buf);
+                buf
+            };
             let _ = self.send_to_session(&session, buf).await;
         }
     }

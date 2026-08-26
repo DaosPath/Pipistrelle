@@ -14,13 +14,14 @@ impl std::fmt::Display for CodecError {
             CodecError::Incomplete => write!(f, "Incomplete packet"),
             CodecError::InvalidVarint => write!(f, "Invalid variable byte integer"),
             CodecError::MalformedPacket => write!(f, "Malformed MQTT packet"),
-            CodecError::UnsupportedProtocolVersion(v) => write!(f, "Unsupported protocol version: {}", v),
+            CodecError::UnsupportedProtocolVersion(v) => {
+                write!(f, "Unsupported protocol version: {}", v)
+            }
         }
     }
 }
 
 impl std::error::Error for CodecError {}
-
 
 // Helper functions for reading primitive data types from byte slices
 
@@ -60,8 +61,7 @@ pub fn read_str<'a>(buf: &mut &'a [u8]) -> Result<&'a str, CodecError> {
     if buf.len() < len {
         return Err(CodecError::Incomplete);
     }
-    let s = std::str::from_utf8(&buf[..len])
-        .map_err(|_| CodecError::MalformedPacket)?;
+    let s = std::str::from_utf8(&buf[..len]).map_err(|_| CodecError::MalformedPacket)?;
     *buf = &buf[len..];
     Ok(s)
 }
@@ -87,11 +87,11 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u32, usize), CodecError> {
     for &byte in buf {
         bytes_read += 1;
         value += ((byte & 127) as u32) * multiplier;
-        
+
         if (byte & 128) == 0 {
             return Ok((value, bytes_read));
         }
-        
+
         // Max value is 268,435,455 (4 bytes max)
         if multiplier >= 128 * 128 * 128 {
             return Err(CodecError::InvalidVarint);
@@ -541,6 +541,19 @@ impl<'a> PublishProperties<'a> {
     }
 
     pub fn encode(&self, buf: &mut Vec<u8>) {
+        if self.payload_format_indicator.is_none()
+            && self.message_expiry_interval.is_none()
+            && self.content_type.is_none()
+            && self.response_topic.is_none()
+            && self.correlation_data.is_none()
+            && self.subscription_identifier.is_none()
+            && self.topic_alias.is_none()
+            && self.user_properties.is_empty()
+        {
+            buf.push(0); // Property Length = 0
+            return;
+        }
+
         let mut temp_buf = Vec::new();
         if let Some(val) = self.payload_format_indicator {
             temp_buf.push(0x01);
@@ -795,7 +808,7 @@ impl<'a> DisconnectProperties<'a> {
 
 pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), CodecError> {
     let original_len = raw_buf.len();
-    
+
     // 1. Read Fixed Header Byte
     let fixed_header_byte = read_u8(&mut raw_buf)?;
     let packet_type = fixed_header_byte >> 4;
@@ -928,7 +941,7 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
             let packet_id = read_u16(&mut payload)?;
             let mut reason_code = 0; // Default: Success
             let mut properties = PubAckProperties::default();
-            
+
             if !payload.is_empty() {
                 reason_code = read_u8(&mut payload)?;
                 if !payload.is_empty() {
@@ -947,7 +960,8 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
         }
         8 => {
             // SUBSCRIBE
-            if flags != 0x02 { // Must be 0010
+            if flags != 0x02 {
+                // Must be 0010
                 return Err(CodecError::MalformedPacket);
             }
             let packet_id = read_u16(&mut payload)?;
@@ -1031,6 +1045,45 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
 
 // Packet encoders
 
+/// Allocation-efficient MQTT v5 QoS 0 PUBLISH encoder.
+/// Computes Remaining Length up front and writes directly into the final buffer,
+/// avoiding the generic encoder's intermediate payload allocation.
+pub fn encode_publish_qos0(
+    topic: &str,
+    payload: &[u8],
+    retain: bool,
+    subscription_identifier: Option<u32>,
+) -> Vec<u8> {
+    let subscription_varint_len = subscription_identifier.map(varint_encoded_len).unwrap_or(0);
+    let properties_len = subscription_identifier
+        .map(|_| 1 + subscription_varint_len) // property id + value
+        .unwrap_or(0);
+    let properties_len_varint = varint_encoded_len(properties_len as u32);
+    let remaining_len = 2 + topic.len() + properties_len_varint + properties_len + payload.len();
+
+    let mut buf = Vec::with_capacity(1 + varint_encoded_len(remaining_len as u32) + remaining_len);
+    buf.push((3 << 4) | u8::from(retain));
+    encode_varint(remaining_len as u32, &mut buf);
+    write_str(topic, &mut buf);
+    encode_varint(properties_len as u32, &mut buf);
+    if let Some(identifier) = subscription_identifier {
+        buf.push(0x0B);
+        encode_varint(identifier, &mut buf);
+    }
+    buf.extend_from_slice(payload);
+    buf
+}
+
+#[inline]
+fn varint_encoded_len(mut value: u32) -> usize {
+    let mut len = 1;
+    while value >= 128 {
+        value /= 128;
+        len += 1;
+    }
+    len
+}
+
 pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
     let mut payload = Vec::new();
     let mut fixed_header_byte: u8;
@@ -1091,10 +1144,11 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
         Packet::PubAck(pkt) => {
             fixed_header_byte = 4 << 4;
             write_u16(pkt.packet_id, &mut payload);
-            
+
             // Only encode reason code and properties if properties are not empty,
             // or if reason code is not Success (0x00)
-            let has_props = pkt.properties.reason_string.is_some() || !pkt.properties.user_properties.is_empty();
+            let has_props = pkt.properties.reason_string.is_some()
+                || !pkt.properties.user_properties.is_empty();
             if has_props || pkt.reason_code != 0 {
                 payload.push(pkt.reason_code);
                 pkt.properties.encode(&mut payload);
@@ -1123,12 +1177,12 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
         }
         Packet::Disconnect(pkt) => {
             fixed_header_byte = 14 << 4;
-            
+
             let has_props = pkt.properties.session_expiry_interval.is_some()
                 || pkt.properties.reason_string.is_some()
                 || pkt.properties.server_reference.is_some()
                 || !pkt.properties.user_properties.is_empty();
-                
+
             if has_props || pkt.reason_code != 0 {
                 payload.push(pkt.reason_code);
                 pkt.properties.encode(&mut payload);
@@ -1212,6 +1266,29 @@ mod tests {
         let (decoded, bytes_read) = decode_packet(&buf).unwrap();
         assert_eq!(bytes_read, buf.len());
         assert_eq!(decoded, publish_pkt);
+    }
+
+    #[test]
+    fn test_direct_qos0_encoder_matches_generic_encoder() {
+        for subscription_identifier in [None, Some(7)] {
+            let publish_pkt = Packet::Publish(Publish {
+                dup: false,
+                qos: 0,
+                retain: false,
+                topic: "bench/native/1",
+                packet_id: None,
+                properties: PublishProperties {
+                    subscription_identifier,
+                    ..Default::default()
+                },
+                payload: b"payload",
+            });
+            let mut generic = Vec::new();
+            encode_packet(&publish_pkt, &mut generic);
+            let direct =
+                encode_publish_qos0("bench/native/1", b"payload", false, subscription_identifier);
+            assert_eq!(direct, generic);
+        }
     }
 
     #[test]

@@ -299,6 +299,22 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     state.publish_route_latency_sample_rate
                                 );
                                 metric!(
+                                    "# HELP pipistrelle_writer_batch_packets Maximum MQTT packets coalesced per writer batch"
+                                );
+                                metric!("# TYPE pipistrelle_writer_batch_packets gauge");
+                                metric!(
+                                    "pipistrelle_writer_batch_packets {}",
+                                    state.writer_batch_packets
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_writer_batch_bytes Target byte ceiling for a writer batch"
+                                );
+                                metric!("# TYPE pipistrelle_writer_batch_bytes gauge");
+                                metric!(
+                                    "pipistrelle_writer_batch_bytes {}",
+                                    state.writer_batch_bytes
+                                );
+                                metric!(
                                     "# HELP pipistrelle_publish_route_latency_seconds Sampled time spent routing one inbound PUBLISH, including bounded queue waits"
                                 );
                                 metric!(
@@ -383,7 +399,7 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 "200 OK",
                                 "application/json; charset=utf-8",
                                 format!(
-                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{}}}\n",
+                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
                                     version::VERSION,
                                     version::SERIES,
                                     tls_profile.as_str(),
@@ -394,6 +410,8 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     state.bridge_queue_capacity,
                                     state.bridge_queue_policy.as_str(),
                                     state.publish_route_latency_sample_rate,
+                                    state.writer_batch_packets,
+                                    state.writer_batch_bytes,
                                 ),
                             ),
                             _ => (

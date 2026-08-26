@@ -169,6 +169,8 @@ Desde `2.0.0.2`, también hay cuotas y aislamiento configurables: `PIPISTRELLE_M
 
 Desde `2.0.0.3`, el hot path QoS 0 sin subscribers/bridge supera **20 M PUBLISH/s** en la Orange Pi con el benchmark Rust nativo. La validación sostenida de 200 millones de mensajes alcanzó **21.463 M msg/s** con contador Prometheus exacto y 0 fallos. Esta cifra es ingest puro; el routing end-to-end se mide y documenta por separado.
 
+Desde `2.0.0.4`, el routing **end-to-end** QoS 0 también supera el objetivo de 2 M/s: la prueba sostenida de 50 millones de mensajes con 10 clientes alcanzó **2.393 M msg/s**, contador Prometheus exacto, 0 fallos y ~103–105 MiB de RAM del broker. La mejora usa cache copy-on-write para topics exactos, encoder QoS0 directo y batching de escrituras sin eliminar las colas bounded ni el backpressure.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración

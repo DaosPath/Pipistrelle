@@ -1,3 +1,4 @@
+use bytes::{Buf, BytesMut};
 use pipistrelle::crypto::{self, TlsProfile};
 use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
@@ -439,30 +440,89 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let mut read_buf = BytesMut::with_capacity(256 * 1024);
+    let mut ack_batch = Vec::with_capacity(16 * 1024);
+
     loop {
-        let (header, body) = read_packet(&mut reader).await?;
-        match header >> 4 {
-            3 => {
-                let qos = (header >> 1) & 0x03;
-                let packet_id = parse_publish_packet_id(&body, qos)?;
-                received.fetch_add(1, Ordering::Relaxed);
-                received_notify.notify_waiters();
-                if qos == 1 {
-                    if let Some(packet_id) = packet_id {
-                        let ack = encode_puback(packet_id);
-                        let mut guard = writer.lock().await;
-                        guard.write_all(&ack).await?;
+        let n = reader.read_buf(&mut read_buf).await?;
+        if n == 0 {
+            return Err(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "benchmark stream closed").into(),
+            );
+        }
+
+        let mut received_batch = 0u64;
+        let mut puback_batch = 0u64;
+        ack_batch.clear();
+
+        while let Some((header, body_start, packet_len)) = try_packet_bounds(&read_buf)? {
+            let body = &read_buf[body_start..packet_len];
+            match header >> 4 {
+                3 => {
+                    let qos = (header >> 1) & 0x03;
+                    received_batch += 1;
+                    if qos == 1 {
+                        if let Some(packet_id) = parse_publish_packet_id(body, qos)? {
+                            ack_batch.extend_from_slice(&encode_puback(packet_id));
+                        }
                     }
                 }
+                4 => puback_batch += 1,
+                13 => {}
+                _ => {}
             }
-            4 => {
-                pubacks.fetch_add(1, Ordering::Relaxed);
-                puback_notify.notify_waiters();
-            }
-            13 => {}
-            _ => {}
+            read_buf.advance(packet_len);
+        }
+
+        if received_batch != 0 {
+            received.fetch_add(received_batch, Ordering::Relaxed);
+            received_notify.notify_waiters();
+        }
+        if puback_batch != 0 {
+            pubacks.fetch_add(puback_batch, Ordering::Relaxed);
+            puback_notify.notify_waiters();
+        }
+        if !ack_batch.is_empty() {
+            let mut guard = writer.lock().await;
+            guard.write_all(&ack_batch).await?;
         }
     }
+}
+
+/// Returns fixed header, body offset and total packet length when a complete MQTT
+/// packet is already buffered. Parsing never allocates and handles partial varints.
+fn try_packet_bounds(buf: &[u8]) -> io::Result<Option<(u8, usize, usize)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let header = buf[0];
+    let mut multiplier = 1usize;
+    let mut remaining = 0usize;
+    let mut index = 1usize;
+    for _ in 0..4 {
+        if index >= buf.len() {
+            return Ok(None);
+        }
+        let byte = buf[index];
+        index += 1;
+        remaining = remaining
+            .checked_add(((byte & 0x7f) as usize).saturating_mul(multiplier))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "MQTT length overflow"))?;
+        if byte & 0x80 == 0 {
+            let total = index.checked_add(remaining).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "MQTT packet overflow")
+            })?;
+            if buf.len() < total {
+                return Ok(None);
+            }
+            return Ok(Some((header, index, total)));
+        }
+        multiplier = multiplier.saturating_mul(128);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "malformed MQTT remaining length",
+    ))
 }
 
 async fn wait_counter(
@@ -773,4 +833,34 @@ fn print_help() {
          --timeout SECONDS        per-stage timeout (default 60)\n\
          --json-out PATH          save machine-readable result"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_packet_bounds_handle_complete_and_partial_packets() {
+        let packet = encode_publish("bench/native/7", b"payload", 0, None);
+        assert_eq!(
+            try_packet_bounds(&packet).unwrap(),
+            Some((0x30, 2, packet.len()))
+        );
+        for cut in 0..packet.len() {
+            assert_eq!(try_packet_bounds(&packet[..cut]).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn buffered_packet_bounds_support_multiple_packets() {
+        let first = encode_publish("a", b"1", 0, None);
+        let second = encode_puback(42);
+        let mut combined = first.clone();
+        combined.extend_from_slice(&second);
+        let (_, _, first_len) = try_packet_bounds(&combined).unwrap().unwrap();
+        assert_eq!(first_len, first.len());
+        let (header, _, second_len) = try_packet_bounds(&combined[first_len..]).unwrap().unwrap();
+        assert_eq!(header >> 4, 4);
+        assert_eq!(second_len, second.len());
+    }
 }

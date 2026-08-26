@@ -365,6 +365,8 @@ def run_test_metrics():
             "pipistrelle_publish_route_latency_p50_seconds",
             "pipistrelle_publish_route_latency_p95_seconds",
             "pipistrelle_publish_route_latency_p99_seconds",
+            "pipistrelle_writer_batch_packets",
+            "pipistrelle_writer_batch_bytes",
             "pipistrelle_build_info",
         ]
         missing = [name for name in required_metrics if name not in html]
