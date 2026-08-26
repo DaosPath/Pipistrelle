@@ -242,3 +242,17 @@ Final Orange Pi candidate gates, TCP, 128-byte payload:
 - **50M end-to-end QoS0:** 2.709 M msg/s sustained, 0 failures, ~122.4 MiB broker memory after the run.
 
 An earlier compliance-first candidate measured 17.2–19.5 M/s ingest because it scanned all PUBLISH property fields and used a Unicode wildcard search in the zero-route path. The final implementation keeps the same protocol validation while reducing that path to the fields which can require protocol handling and an allocation-free byte wildcard check.
+
+## V2 2.1.2.0 — flow-control compliance regression gate
+
+`2.1.2.0` adds bilateral Receive Maximum handling, Maximum Packet Size enforcement, durable UNSUBSCRIBE, server-assigned ClientIDs, incremental CONNECT framing and stricter wire validation. QoS0 paths do not allocate flow-control state.
+
+Final exact-image Orange Pi gates, native Rust load generator, 128-byte payload:
+
+- **50M QoS0 ingest, 3 fresh-container repeats:** 20.792 / 20.328 / 18.582 M msg/s; **median 20.328 M msg/s**, 0 failures. The run-to-run spread is retained in the report instead of cherry-picking the maximum.
+- An exact 50M ingest counter gate increased `pipistrelle_messages_published_total` by **50,000,050**, matching 50M QoS0 publishes plus 50 QoS1 completion markers.
+- **50M QoS0 end-to-end:** **2.656 M msg/s**, 0 failures, ~**103.5 MiB** broker memory after the run.
+- **200k QoS1 end-to-end:** **210.97k msg/s**, 0 failures. The stricter bilateral flow-control path adds synchronization and the existing SQLite-per-message persistence remains the main bottleneck; this is tracked as a performance target rather than relaxed for speed.
+- **200k hybrid PQC TLS QoS0:** **2.112 M msg/s**, 0 failures, `X25519MLKEM768` on **10/10** connections.
+
+During the ingest repetitions the board was ~41–45 °C with a shared-system load average around 4, which explains part of the observed scheduling variance.

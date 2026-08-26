@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -67,6 +67,14 @@ pub struct BridgeMessage {
 pub struct BridgeQueueHandle {
     pub sender: mpsc::Sender<BridgeMessage>,
     pub topic_prefix: Arc<str>,
+}
+
+#[derive(Debug)]
+pub struct OutboundPacket {
+    pub bytes: Vec<u8>,
+    /// Inbound QoS Packet Identifier whose Receive Maximum slot is released only
+    /// after these bytes have actually been written to the network.
+    pub release_inbound_packet_id: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +193,7 @@ pub struct InFlightMessage {
     pub retain: bool,
     pub subscription_identifier: Option<u32>,
     pub properties: ApplicationProperties,
+    pub enqueue_order: u64,
     pub delivery_started: bool,
     pub sent_at: Instant,
 }
@@ -228,6 +237,7 @@ pub struct OutgoingQos2Message {
     pub retain: bool,
     pub subscription_identifier: Option<u32>,
     pub properties: ApplicationProperties,
+    pub enqueue_order: u64,
     pub delivery_started: bool,
     pub phase: OutgoingQos2Phase,
 }
@@ -257,13 +267,17 @@ pub struct ClientSession {
     pub allow_all_read: bool,
     pub allow_all_write: bool,
     pub keep_alive: u16,
+    /// Maximum concurrent QoS1/2 PUBLISH packets this client accepts on the current connection.
+    pub receive_maximum: u16,
+    /// Maximum MQTT Control Packet size this client accepts from the server.
+    pub maximum_packet_size: u32,
     pub session_expiry_interval: AtomicU32,
     pub last_activity: RwLock<Instant>,
     pub connected: AtomicBool,
     pub will: RwLock<Option<WillMessage>>,
 
     // Channel to send raw serialized bytes to the client's TCP writer task
-    pub sender: mpsc::Sender<Vec<u8>>,
+    pub sender: mpsc::Sender<OutboundPacket>,
 
     // Topic aliases sent by the client: Alias ID -> Topic String
     pub topic_aliases: RwLock<HashMap<u16, String>>,
@@ -276,9 +290,14 @@ pub struct ClientSession {
 
     // QoS 1/2 state
     next_packet_id: AtomicU16,
+    next_outbound_order: AtomicU64,
     pub in_flight: RwLock<HashMap<u16, InFlightMessage>>,
     pub incoming_qos2: RwLock<HashMap<u16, IncomingQos2Message>>,
+    /// Incoming QoS1/2 Packet Identifiers which still occupy the Server Receive Maximum.
+    pub inbound_receive_pending: Arc<Mutex<HashSet<u16>>>,
     pub outgoing_qos2: RwLock<HashMap<u16, OutgoingQos2Message>>,
+    /// Packet identifiers occupying the peer Receive Maximum on this Network Connection.
+    outbound_active: Mutex<HashSet<u16>>,
 
     // Slow-consumer cancellation path
     disconnect_requested: AtomicBool,
@@ -293,8 +312,10 @@ impl ClientSession {
         allow_all_read: bool,
         allow_all_write: bool,
         keep_alive: u16,
+        receive_maximum: u16,
+        maximum_packet_size: u32,
         session_expiry_interval: u32,
-        sender: mpsc::Sender<Vec<u8>>,
+        sender: mpsc::Sender<OutboundPacket>,
     ) -> Self {
         Self {
             client_id,
@@ -303,6 +324,8 @@ impl ClientSession {
             allow_all_read,
             allow_all_write,
             keep_alive,
+            receive_maximum,
+            maximum_packet_size,
             session_expiry_interval: AtomicU32::new(session_expiry_interval),
             last_activity: RwLock::new(Instant::now()),
             connected: AtomicBool::new(true),
@@ -312,9 +335,12 @@ impl ClientSession {
             subscriptions: RwLock::new(HashSet::new()),
             published_messages: AtomicU64::new(0),
             next_packet_id: AtomicU16::new(1),
+            next_outbound_order: AtomicU64::new(1),
             in_flight: RwLock::new(HashMap::new()),
             incoming_qos2: RwLock::new(HashMap::new()),
+            inbound_receive_pending: Arc::new(Mutex::new(HashSet::new())),
             outgoing_qos2: RwLock::new(HashMap::new()),
+            outbound_active: Mutex::new(HashSet::new()),
             disconnect_requested: AtomicBool::new(false),
             disconnect_notify: Notify::new(),
         }
@@ -324,13 +350,53 @@ impl ClientSession {
         *self.last_activity.write() = Instant::now();
     }
 
-    pub fn get_next_packet_id(&self) -> u16 {
-        // Increment and handle wrap-around (1 to 65535, 0 is reserved)
-        let mut id = self.next_packet_id.fetch_add(1, Ordering::SeqCst);
-        if id == 0 {
-            id = self.next_packet_id.fetch_add(1, Ordering::SeqCst);
+    fn get_next_packet_id(&self) -> u16 {
+        // Called while outbound_active is locked. Packet Identifiers for outbound
+        // QoS PUBLISH must not be reused until the handshake completes.
+        for _ in 0..u16::MAX {
+            let mut id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+            if id == 0 {
+                id = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+            }
+            if !self.in_flight.read().contains_key(&id)
+                && !self.outgoing_qos2.read().contains_key(&id)
+            {
+                return id;
+            }
         }
-        id
+        // All identifiers are occupied. 0 is reserved and signals no allocation.
+        0
+    }
+
+    pub fn release_outbound_slot(&self, packet_id: u16) {
+        self.outbound_active.lock().remove(&packet_id);
+    }
+
+    fn reset_outbound_slots(&self) {
+        self.outbound_active.lock().clear();
+    }
+
+    /// Returns Ok(true) for a newly occupied inbound flow, Ok(false) for a duplicate
+    /// Packet Identifier already counted, and Err when Receive Maximum would be exceeded.
+    pub fn reserve_inbound_receive(&self, packet_id: u16, maximum: u16) -> Result<bool, ()> {
+        let mut pending = self.inbound_receive_pending.lock();
+        if pending.contains(&packet_id) {
+            return Ok(false);
+        }
+        if pending.len() >= maximum as usize {
+            return Err(());
+        }
+        pending.insert(packet_id);
+        Ok(true)
+    }
+
+    fn next_outbound_order(&self) -> u64 {
+        self.next_outbound_order.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn observe_outbound_order(&self, order: u64) {
+        self.next_outbound_order
+            .fetch_max(order.saturating_add(1), Ordering::Relaxed);
     }
 
     pub fn add_in_flight(
@@ -342,6 +408,7 @@ impl ClientSession {
         retain: bool,
         subscription_identifier: Option<u32>,
         properties: ApplicationProperties,
+        enqueue_order: u64,
         delivery_started: bool,
     ) {
         let msg = InFlightMessage {
@@ -352,6 +419,7 @@ impl ClientSession {
             retain,
             subscription_identifier,
             properties,
+            enqueue_order,
             delivery_started,
             sent_at: Instant::now(),
         };
@@ -437,6 +505,11 @@ pub struct BrokerState {
     pub bridge_queue_policy: BridgeQueuePolicy,
     pub writer_batch_packets: usize,
     pub writer_batch_bytes: usize,
+    /// Server-advertised Receive Maximum for inbound QoS1/2 publishes.
+    pub receive_maximum: u16,
+    /// Server-advertised inbound Maximum Packet Size.
+    pub maximum_packet_size: usize,
+    next_assigned_client_id: AtomicU64,
 
     // Bridge channel
     pub bridge_active: AtomicBool,
@@ -491,6 +564,16 @@ impl BrokerState {
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(4_096, 4 * 1024 * 1024))
             .unwrap_or(256 * 1024);
+        let receive_maximum = std::env::var("PIPISTRELLE_RECEIVE_MAXIMUM")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_024);
+        let maximum_packet_size = std::env::var("PIPISTRELLE_MAX_PACKET_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(1_024, 268_435_455))
+            .unwrap_or(16 * 1024 * 1024);
         info!(
             "Client limits: outbound_queue={}, subscriptions={}, slow_consumer={} ({} ms)",
             client_queue_capacity,
@@ -505,6 +588,10 @@ impl BrokerState {
             publish_route_latency_sample_rate,
             writer_batch_packets,
             writer_batch_bytes,
+        );
+        info!(
+            "MQTT flow limits: receive_maximum={}, maximum_packet_size={} bytes",
+            receive_maximum, maximum_packet_size
         );
 
         Self {
@@ -538,8 +625,23 @@ impl BrokerState {
             bridge_queue_policy,
             writer_batch_packets,
             writer_batch_bytes,
+            receive_maximum,
+            maximum_packet_size,
+            next_assigned_client_id: AtomicU64::new(1),
             bridge_active: AtomicBool::new(false),
             bridge_sender: RwLock::new(None),
+        }
+    }
+
+    pub fn allocate_client_id(&self) -> String {
+        loop {
+            let seq = self.next_assigned_client_id.fetch_add(1, Ordering::Relaxed);
+            let id = format!("pip-{:x}-{:x}", ApplicationProperties::now_ms(), seq);
+            if !self.sessions.read().contains_key(&id)
+                && !self.pending_wills.read().contains_key(&id)
+            {
+                return id;
+            }
         }
     }
 
@@ -581,7 +683,7 @@ impl BrokerState {
                             Some(expiry as u64 - elapsed)
                         };
 
-                        let (tx, _) = mpsc::channel::<Vec<u8>>(self.client_queue_capacity);
+                        let (tx, _) = mpsc::channel::<OutboundPacket>(self.client_queue_capacity);
                         let auth_username = username.as_deref().unwrap_or("");
                         let allow_all_read = self.auth.authorizes_all(auth_username, "read");
                         let allow_all_write = self.auth.authorizes_all(auth_username, "write");
@@ -592,6 +694,8 @@ impl BrokerState {
                             allow_all_read,
                             allow_all_write,
                             0,
+                            u16::MAX,
+                            268_435_455,
                             expiry,
                             tx,
                         ));
@@ -658,6 +762,7 @@ impl BrokerState {
                         retain,
                         subscription_identifier,
                         properties_json,
+                        enqueue_order,
                         delivery_started,
                     ) in inflight_loaded
                     {
@@ -676,8 +781,10 @@ impl BrokerState {
                                 retain,
                                 subscription_identifier,
                                 properties,
+                                enqueue_order,
                                 delivery_started,
                             );
+                            session.observe_outbound_order(enqueue_order);
                             count += 1;
                         }
                     }
@@ -761,6 +868,7 @@ impl BrokerState {
                         retain,
                         subscription_identifier,
                         properties_json,
+                        enqueue_order,
                         delivery_started,
                         phase,
                     ) in messages
@@ -784,10 +892,12 @@ impl BrokerState {
                                     retain,
                                     subscription_identifier,
                                     properties,
+                                    enqueue_order,
                                     delivery_started,
                                     phase,
                                 },
                             );
+                            session.observe_outbound_order(enqueue_order);
                         }
                     }
                 }
@@ -813,6 +923,11 @@ impl BrokerState {
         *target.subscriptions.write() = source.subscriptions.read().clone();
         *target.in_flight.write() = source.in_flight.read().clone();
         *target.incoming_qos2.write() = source.incoming_qos2.read().clone();
+        {
+            let incoming = target.incoming_qos2.read();
+            let mut pending = target.inbound_receive_pending.lock();
+            pending.extend(incoming.keys().copied());
+        }
         *target.outgoing_qos2.write() = source.outgoing_qos2.read().clone();
     }
 
@@ -1331,21 +1446,18 @@ impl BrokerState {
     }
 
     /// Processes unsubscription request
-    pub fn unsubscribe(&self, client_id: &str, topic_filter: &str) -> bool {
+    pub async fn unsubscribe(&self, client_id: &str, topic_filter: &str) -> bool {
         let removed = self.router.unsubscribe(client_id, topic_filter);
         if removed {
             if let Some(session) = self.sessions.read().get(client_id).cloned() {
                 session.subscriptions.write().remove(topic_filter);
             }
             debug!("Client {} unsubscribed from {}", client_id, topic_filter);
-
-            // Delete persistent subscription
-            let db = self.db.clone();
-            let cid = client_id.to_string();
-            let filter = topic_filter.to_string();
-            tokio::spawn(async move {
-                db.delete_subscription(cid, filter).await;
-            });
+            // Commit the Session-state mutation before UNSUBACK so a crash immediately
+            // after the acknowledgement cannot resurrect the subscription.
+            self.db
+                .delete_subscription(client_id.to_string(), topic_filter.to_string())
+                .await;
         }
         removed
     }
@@ -1498,21 +1610,45 @@ impl BrokerState {
     /// when the queue is full, pressure propagates back to the publisher until the
     /// socket writer drains enough capacity.
     pub async fn send_to_session(&self, session: &ClientSession, bytes: Vec<u8>) -> bool {
-        match session.sender.try_send(bytes) {
+        self.send_to_session_after_write(session, bytes, None).await
+    }
+
+    /// Enqueues an MQTT packet and optionally releases one inbound Receive Maximum
+    /// credit only after the writer has successfully written the batch containing it.
+    pub async fn send_to_session_after_write(
+        &self,
+        session: &ClientSession,
+        bytes: Vec<u8>,
+        release_inbound_packet_id: Option<u16>,
+    ) -> bool {
+        if bytes.len() > session.maximum_packet_size as usize {
+            warn!(
+                "Suppressing {}-byte MQTT packet for client {} (Maximum Packet Size={})",
+                bytes.len(),
+                session.client_id,
+                session.maximum_packet_size
+            );
+            return false;
+        }
+        let packet = OutboundPacket {
+            bytes,
+            release_inbound_packet_id,
+        };
+        match session.sender.try_send(packet) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(bytes)) => {
+            Err(mpsc::error::TrySendError::Full(packet)) => {
                 self.metrics_client_queue_backpressure_events
                     .fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
 
                 let result = match self.slow_consumer_policy {
                     SlowConsumerPolicy::Backpressure => {
-                        session.sender.send(bytes).await.map_err(|_| ())
+                        session.sender.send(packet).await.map_err(|_| ())
                     }
                     SlowConsumerPolicy::Disconnect => {
                         match tokio::time::timeout(
                             self.slow_consumer_timeout,
-                            session.sender.send(bytes),
+                            session.sender.send(packet),
                         )
                         .await
                         {
@@ -1561,200 +1697,347 @@ impl BrokerState {
             return;
         }
         let session = { self.sessions.read().get(client_id).cloned() };
-        if let Some(session) = session {
-            let delivery_started = session.connected.load(Ordering::Acquire);
-            let packet_id = if qos > 0 {
-                let pid = session.get_next_packet_id();
-                if qos == 1 {
-                    let stored_properties = properties.clone();
-                    session.add_in_flight(
-                        pid,
-                        topic,
-                        payload,
-                        qos,
-                        retain,
-                        subscription_identifier,
-                        stored_properties.clone(),
-                        delivery_started,
-                    );
-                    if session.session_expiry() > 0 {
-                        let properties_json = serde_json::to_string(&stored_properties)
-                            .unwrap_or_else(|_| "{}".into());
-                        self.db
-                            .save_in_flight(
-                                client_id.to_string(),
-                                pid,
-                                topic.to_string(),
-                                payload.to_vec(),
-                                qos,
-                                retain,
-                                subscription_identifier,
-                                properties_json,
-                                delivery_started,
-                            )
-                            .await;
-                    }
-                } else {
-                    let message = OutgoingQos2Message {
+        let Some(session) = session else {
+            return;
+        };
+
+        // Maximum Packet Size is connection-scoped. Offline queued messages are retained
+        // until a future connection declares its own limit.
+        if session.connected.load(Ordering::Acquire) {
+            let preview = if qos == 0 && properties.is_empty() {
+                encode_publish_qos0(topic, payload, retain, subscription_identifier)
+            } else {
+                let preview = Packet::Publish(Publish {
+                    dup: false,
+                    qos,
+                    retain,
+                    topic,
+                    packet_id: (qos > 0).then_some(1),
+                    properties: properties.as_publish_properties(subscription_identifier),
+                    payload,
+                });
+                let mut buf = Vec::new();
+                encode_packet(&preview, &mut buf);
+                buf
+            };
+            if preview.len() > session.maximum_packet_size as usize {
+                // MQTT-3.1.2-25: discard and behave as if delivery completed.
+                return;
+            }
+            if qos == 0 {
+                let _ = self.send_to_session(&session, preview).await;
+                return;
+            }
+        } else if qos == 0 {
+            // QoS0 has no offline Session queue.
+            return;
+        }
+
+        let (packet_id, enqueue_order, start_now) = {
+            let mut active = session.outbound_active.lock();
+            let pid = session.get_next_packet_id();
+            if pid == 0 {
+                warn!(
+                    "No outbound MQTT Packet Identifier available for {}",
+                    client_id
+                );
+                return;
+            }
+            let enqueue_order = session.next_outbound_order();
+            let start_now = session.connected.load(Ordering::Acquire)
+                && active.len() < session.receive_maximum as usize;
+            if start_now {
+                active.insert(pid);
+            }
+            if qos == 1 {
+                session.add_in_flight(
+                    pid,
+                    topic,
+                    payload,
+                    qos,
+                    retain,
+                    subscription_identifier,
+                    properties.clone(),
+                    enqueue_order,
+                    start_now,
+                );
+            } else {
+                session.outgoing_qos2.write().insert(
+                    pid,
+                    OutgoingQos2Message {
                         topic: topic.to_string(),
                         payload: payload.to_vec(),
                         retain,
                         subscription_identifier,
                         properties: properties.clone(),
-                        delivery_started,
+                        enqueue_order,
+                        delivery_started: start_now,
                         phase: OutgoingQos2Phase::AwaitPubRec,
-                    };
-                    session.outgoing_qos2.write().insert(pid, message.clone());
-                    if session.session_expiry() > 0 {
+                    },
+                );
+            }
+            (pid, enqueue_order, start_now)
+        };
+
+        if session.session_expiry() > 0 {
+            let json = serde_json::to_string(properties).unwrap_or_else(|_| "{}".into());
+            if qos == 1 {
+                self.db
+                    .save_in_flight(
+                        client_id.to_string(),
+                        packet_id,
+                        topic.to_string(),
+                        payload.to_vec(),
+                        qos,
+                        retain,
+                        subscription_identifier,
+                        json,
+                        enqueue_order,
+                        start_now,
+                    )
+                    .await;
+            } else {
+                self.db
+                    .save_qos2_outgoing(
+                        client_id.to_string(),
+                        packet_id,
+                        topic.to_string(),
+                        payload.to_vec(),
+                        retain,
+                        subscription_identifier,
+                        json,
+                        enqueue_order,
+                        start_now,
+                        OutgoingQos2Phase::AwaitPubRec as u8,
+                    )
+                    .await;
+            }
+        }
+
+        if !start_now {
+            return;
+        }
+        let publish = Packet::Publish(Publish {
+            dup: false,
+            qos,
+            retain,
+            topic,
+            packet_id: Some(packet_id),
+            properties: properties.as_publish_properties(subscription_identifier),
+            payload,
+        });
+        let mut buf = Vec::new();
+        encode_packet(&publish, &mut buf);
+        let _ = self.send_to_session(&session, buf).await;
+    }
+
+    /// Promotes queued QoS1/2 PUBLISH packets until the peer Receive Maximum is full.
+    pub async fn drain_receive_maximum(&self, session: &ClientSession) {
+        loop {
+            if !session.connected.load(Ordering::Acquire) {
+                return;
+            }
+
+            enum Candidate {
+                Qos1(InFlightMessage, bool),
+                Qos2(u16, OutgoingQos2Message, bool),
+            }
+
+            let candidate = {
+                let mut active = session.outbound_active.lock();
+                if active.len() >= session.receive_maximum as usize {
+                    return;
+                }
+
+                let qos1 = session
+                    .in_flight
+                    .read()
+                    .values()
+                    .filter(|m| !active.contains(&m.packet_id))
+                    .min_by_key(|m| (m.enqueue_order, m.packet_id))
+                    .cloned();
+                let qos2 = session
+                    .outgoing_qos2
+                    .read()
+                    .iter()
+                    .filter(|(pid, m)| {
+                        m.phase == OutgoingQos2Phase::AwaitPubRec && !active.contains(pid)
+                    })
+                    .min_by_key(|(pid, m)| (m.enqueue_order, **pid))
+                    .map(|(pid, m)| (*pid, m.clone()));
+
+                let choose_qos1 = match (&qos1, &qos2) {
+                    (Some(one), Some((_, two))) => one.enqueue_order <= two.enqueue_order,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => return,
+                };
+
+                if choose_qos1 {
+                    let mut message = qos1.expect("qos1 candidate");
+                    if message.properties.is_expired() && !message.delivery_started {
+                        Candidate::Qos1(message, false)
+                    } else {
+                        let was_started = message.delivery_started;
+                        active.insert(message.packet_id);
+                        if !message.delivery_started {
+                            if let Some(current) =
+                                session.in_flight.write().get_mut(&message.packet_id)
+                            {
+                                current.delivery_started = true;
+                            }
+                            message.delivery_started = true;
+                        }
+                        Candidate::Qos1(message, was_started)
+                    }
+                } else {
+                    let (pid, mut message) = qos2.expect("qos2 candidate");
+                    if message.properties.is_expired() && !message.delivery_started {
+                        Candidate::Qos2(pid, message, false)
+                    } else {
+                        let was_started = message.delivery_started;
+                        active.insert(pid);
+                        if !message.delivery_started {
+                            if let Some(current) = session.outgoing_qos2.write().get_mut(&pid) {
+                                current.delivery_started = true;
+                            }
+                            message.delivery_started = true;
+                        }
+                        Candidate::Qos2(pid, message, was_started)
+                    }
+                }
+            };
+
+            match candidate {
+                Candidate::Qos1(message, was_started) => {
+                    if message.properties.is_expired() && !message.delivery_started {
+                        session.remove_in_flight(message.packet_id);
                         self.db
-                            .save_qos2_outgoing(
-                                client_id.to_string(),
-                                pid,
-                                message.topic,
-                                message.payload,
+                            .delete_in_flight(session.client_id.clone(), message.packet_id)
+                            .await;
+                        continue;
+                    }
+                    let publish = Packet::Publish(Publish {
+                        dup: was_started,
+                        qos: 1,
+                        retain: message.retain,
+                        topic: &message.topic,
+                        packet_id: Some(message.packet_id),
+                        properties: message
+                            .properties
+                            .as_publish_properties(message.subscription_identifier),
+                        payload: &message.payload,
+                    });
+                    let mut buf = Vec::new();
+                    encode_packet(&publish, &mut buf);
+                    if buf.len() > session.maximum_packet_size as usize {
+                        session.release_outbound_slot(message.packet_id);
+                        session.remove_in_flight(message.packet_id);
+                        self.db
+                            .delete_in_flight(session.client_id.clone(), message.packet_id)
+                            .await;
+                        continue;
+                    }
+                    if !was_started && session.session_expiry() > 0 {
+                        self.db
+                            .save_in_flight(
+                                session.client_id.clone(),
+                                message.packet_id,
+                                message.topic.clone(),
+                                message.payload.clone(),
+                                message.qos,
                                 message.retain,
                                 message.subscription_identifier,
                                 serde_json::to_string(&message.properties)
                                     .unwrap_or_else(|_| "{}".into()),
-                                message.delivery_started,
+                                message.enqueue_order,
+                                true,
+                            )
+                            .await;
+                    }
+                    let _ = self.send_to_session(session, buf).await;
+                }
+                Candidate::Qos2(packet_id, message, was_started) => {
+                    if message.properties.is_expired() && !message.delivery_started {
+                        session.outgoing_qos2.write().remove(&packet_id);
+                        self.db
+                            .delete_qos2_outgoing(session.client_id.clone(), packet_id)
+                            .await;
+                        continue;
+                    }
+                    let publish = Packet::Publish(Publish {
+                        dup: was_started,
+                        qos: 2,
+                        retain: message.retain,
+                        topic: &message.topic,
+                        packet_id: Some(packet_id),
+                        properties: message
+                            .properties
+                            .as_publish_properties(message.subscription_identifier),
+                        payload: &message.payload,
+                    });
+                    let mut buf = Vec::new();
+                    encode_packet(&publish, &mut buf);
+                    if buf.len() > session.maximum_packet_size as usize {
+                        session.release_outbound_slot(packet_id);
+                        session.outgoing_qos2.write().remove(&packet_id);
+                        self.db
+                            .delete_qos2_outgoing(session.client_id.clone(), packet_id)
+                            .await;
+                        continue;
+                    }
+                    if !was_started && session.session_expiry() > 0 {
+                        self.db
+                            .save_qos2_outgoing(
+                                session.client_id.clone(),
+                                packet_id,
+                                message.topic.clone(),
+                                message.payload.clone(),
+                                message.retain,
+                                message.subscription_identifier,
+                                serde_json::to_string(&message.properties)
+                                    .unwrap_or_else(|_| "{}".into()),
+                                message.enqueue_order,
+                                true,
                                 message.phase as u8,
                             )
                             .await;
                     }
+                    let _ = self.send_to_session(session, buf).await;
                 }
-                Some(pid)
-            } else {
-                None
-            };
-
-            let buf = if qos == 0 && properties.is_empty() {
-                encode_publish_qos0(topic, payload, retain, subscription_identifier)
-            } else {
-                let publish_pkt = Packet::Publish(Publish {
-                    dup: false,
-                    qos,
-                    retain,
-                    topic,
-                    packet_id,
-                    properties: properties.as_publish_properties(subscription_identifier),
-                    payload,
-                });
-                let mut buf = Vec::new();
-                encode_packet(&publish_pkt, &mut buf);
-                buf
-            };
-            let _ = self.send_to_session(&session, buf).await;
+            }
         }
     }
 
     pub async fn resume_persistent_outgoing(&self, session: &ClientSession) {
-        let qos1: Vec<InFlightMessage> = session.in_flight.read().values().cloned().collect();
-        for message in qos1 {
-            if message.properties.is_expired() && !message.delivery_started {
-                session.remove_in_flight(message.packet_id);
-                self.db
-                    .delete_in_flight(session.client_id.clone(), message.packet_id)
-                    .await;
-                continue;
-            }
-            let publish = Packet::Publish(Publish {
-                dup: true,
-                qos: 1,
-                retain: message.retain,
-                topic: &message.topic,
-                packet_id: Some(message.packet_id),
-                properties: message
-                    .properties
-                    .as_publish_properties(message.subscription_identifier),
-                payload: &message.payload,
-            });
-            let mut buf = Vec::new();
-            encode_packet(&publish, &mut buf);
-            if self.send_to_session(session, buf).await && !message.delivery_started {
-                if let Some(current) = session.in_flight.write().get_mut(&message.packet_id) {
-                    current.delivery_started = true;
-                }
-                if session.session_expiry() > 0 {
-                    self.db
-                        .save_in_flight(
-                            session.client_id.clone(),
-                            message.packet_id,
-                            message.topic.clone(),
-                            message.payload.clone(),
-                            message.qos,
-                            message.retain,
-                            message.subscription_identifier,
-                            serde_json::to_string(&message.properties)
-                                .unwrap_or_else(|_| "{}".into()),
-                            true,
-                        )
-                        .await;
-                }
-            }
-        }
+        session.reset_outbound_slots();
 
-        let qos2: Vec<(u16, OutgoingQos2Message)> = session
+        // QoS2 flows which already reached PUBREL continue independently of the
+        // PUBLISH send window, but still occupy Receive Maximum until PUBCOMP.
+        let awaiting_pubcomp: Vec<(u16, OutgoingQos2Message)> = session
             .outgoing_qos2
             .read()
             .iter()
+            .filter(|(_, message)| message.phase == OutgoingQos2Phase::AwaitPubComp)
             .map(|(packet_id, message)| (*packet_id, message.clone()))
             .collect();
-        for (packet_id, message) in qos2 {
-            if message.properties.is_expired()
-                && !message.delivery_started
-                && message.phase == OutgoingQos2Phase::AwaitPubRec
-            {
-                session.outgoing_qos2.write().remove(&packet_id);
-                self.db
-                    .delete_qos2_outgoing(session.client_id.clone(), packet_id)
-                    .await;
-                continue;
-            }
-            let packet = match message.phase {
-                OutgoingQos2Phase::AwaitPubRec => Packet::Publish(Publish {
-                    dup: true,
-                    qos: 2,
-                    retain: message.retain,
-                    topic: &message.topic,
-                    packet_id: Some(packet_id),
-                    properties: message
-                        .properties
-                        .as_publish_properties(message.subscription_identifier),
-                    payload: &message.payload,
-                }),
-                OutgoingQos2Phase::AwaitPubComp => Packet::PubRel(crate::codec::PubAck {
-                    packet_id,
-                    reason_code: 0x00,
-                    properties: Default::default(),
-                }),
-            };
-            let mut buf = Vec::new();
-            encode_packet(&packet, &mut buf);
-            if self.send_to_session(session, buf).await
-                && message.phase == OutgoingQos2Phase::AwaitPubRec
-                && !message.delivery_started
-            {
-                if let Some(current) = session.outgoing_qos2.write().get_mut(&packet_id) {
-                    current.delivery_started = true;
-                }
-                if session.session_expiry() > 0 {
-                    self.db
-                        .save_qos2_outgoing(
-                            session.client_id.clone(),
-                            packet_id,
-                            message.topic.clone(),
-                            message.payload.clone(),
-                            message.retain,
-                            message.subscription_identifier,
-                            serde_json::to_string(&message.properties)
-                                .unwrap_or_else(|_| "{}".into()),
-                            true,
-                            message.phase as u8,
-                        )
-                        .await;
-                }
-            }
+        for (packet_id, _) in &awaiting_pubcomp {
+            session.outbound_active.lock().insert(*packet_id);
         }
+        for (packet_id, _) in awaiting_pubcomp {
+            let pubrel = Packet::PubRel(crate::codec::PubAck {
+                packet_id,
+                reason_code: 0x00,
+                properties: Default::default(),
+            });
+            let mut buf = Vec::new();
+            encode_packet(&pubrel, &mut buf);
+            let _ = self.send_to_session(session, buf).await;
+        }
+
+        // QoS1 and QoS2 AwaitPubRec retransmissions/new offline messages are admitted
+        // through the new connection's Receive Maximum window.
+        self.drain_receive_maximum(session).await;
     }
 
     /// Gracefully disconnects all active client sessions.
@@ -1801,7 +2084,18 @@ mod policy_tests {
     #[test]
     fn disconnect_request_is_idempotent() {
         let (tx, _rx) = mpsc::channel(1);
-        let session = ClientSession::new("slow".to_string(), None, true, false, false, 60, 0, tx);
+        let session = ClientSession::new(
+            "slow".to_string(),
+            None,
+            true,
+            false,
+            false,
+            60,
+            u16::MAX,
+            268_435_455,
+            0,
+            tx,
+        );
         assert!(session.request_disconnect());
         assert!(!session.request_disconnect());
         assert!(session.disconnect_requested());

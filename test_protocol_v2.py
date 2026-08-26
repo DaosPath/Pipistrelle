@@ -122,7 +122,51 @@ def packet(header: int, body: bytes) -> bytes:
     return bytes([header]) + varint(len(body)) + body
 
 
-def connect_packet(client_id, *, clean_start=True, session_expiry=0, will=None, user=USER, password=PASSWORD):
+def parse_connack_properties(body: bytes):
+    assert len(body) >= 3, body
+    prop_len, used = read_varint_bytes(body, 2)
+    raw = body[2+used:2+used+prop_len]
+    result = {
+        "receive_maximum": None,
+        "maximum_packet_size": None,
+        "assigned_client_identifier": None,
+        "topic_alias_maximum": None,
+    }
+    off = 0
+    def read_utf8_prop():
+        nonlocal off
+        size = struct.unpack("!H", raw[off:off+2])[0]
+        off += 2
+        value = raw[off:off+size].decode()
+        off += size
+        return value
+    while off < len(raw):
+        prop = raw[off]; off += 1
+        if prop == 0x21:
+            result["receive_maximum"] = struct.unpack("!H", raw[off:off+2])[0]; off += 2
+        elif prop == 0x27:
+            result["maximum_packet_size"] = struct.unpack("!I", raw[off:off+4])[0]; off += 4
+        elif prop == 0x12:
+            result["assigned_client_identifier"] = read_utf8_prop()
+        elif prop == 0x22:
+            result["topic_alias_maximum"] = struct.unpack("!H", raw[off:off+2])[0]; off += 2
+        else:
+            raise AssertionError(f"unexpected CONNACK property {prop:#x} in {raw!r}")
+    return result
+
+
+def connect_packet(
+    client_id,
+    *,
+    clean_start=True,
+    session_expiry=0,
+    receive_maximum=None,
+    maximum_packet_size=None,
+    raw_connect_properties=None,
+    will=None,
+    user=USER,
+    password=PASSWORD,
+):
     flags = 0x80 | 0x40
     if clean_start:
         flags |= 0x02
@@ -133,6 +177,12 @@ def connect_packet(client_id, *, clean_start=True, session_expiry=0, will=None, 
     props = b""
     if session_expiry is not None:
         props += bytes([0x11]) + struct.pack("!I", session_expiry)
+    if receive_maximum is not None:
+        props += bytes([0x21]) + struct.pack("!H", receive_maximum)
+    if maximum_packet_size is not None:
+        props += bytes([0x27]) + struct.pack("!I", maximum_packet_size)
+    if raw_connect_properties is not None:
+        props += raw_connect_properties
     vh = utf8("MQTT") + b"\x05" + bytes([flags]) + struct.pack("!H", 60) + varint(len(props)) + props
     payload = utf8(client_id)
     if will is not None:
@@ -158,6 +208,16 @@ def subscribe_packet(pid, topic_filter, qos=0, options_extra=0, subscription_id=
     options = (qos & 0x03) | options_extra
     body = struct.pack("!H", pid) + varint(len(props)) + props + utf8(topic_filter) + bytes([options])
     return packet(0x82, body)
+
+
+def unsubscribe_packet(pid, *topic_filters, user_properties=None):
+    props = b""
+    for key, value in user_properties or []:
+        props += b"\x26" + utf8(key) + utf8(value)
+    body = struct.pack("!H", pid) + varint(len(props)) + props
+    for topic_filter in topic_filters:
+        body += utf8(topic_filter)
+    return packet(0xA2, body)
 
 
 def publish_packet(topic, payload, *, qos=0, retain=False, pid=1, dup=False, properties=None, raw_properties=None):
@@ -189,7 +249,20 @@ def disconnect_packet(reason=0x00):
 
 
 class RawClient:
-    def __init__(self, client_id, *, clean_start=True, session_expiry=0, will=None, timeout=3.0, user=USER, password=PASSWORD, expect_reason=0):
+    def __init__(
+        self,
+        client_id,
+        *,
+        clean_start=True,
+        session_expiry=0,
+        receive_maximum=None,
+        maximum_packet_size=None,
+        will=None,
+        timeout=3.0,
+        user=USER,
+        password=PASSWORD,
+        expect_reason=0,
+    ):
         self.sock = socket.create_connection((HOST, PORT), timeout=timeout)
         self.sock.settimeout(timeout)
         self.client_id = client_id
@@ -197,6 +270,8 @@ class RawClient:
             client_id,
             clean_start=clean_start,
             session_expiry=session_expiry,
+            receive_maximum=receive_maximum,
+            maximum_packet_size=maximum_packet_size,
             will=will,
             user=user,
             password=password,
@@ -207,6 +282,9 @@ class RawClient:
             f"CONNACK reason {body[1] if len(body) >= 2 else None!r}, expected {expect_reason:#x}: {body!r}"
         )
         self.session_present = bool(body[0] & 1)
+        self.connack_properties = parse_connack_properties(body) if expect_reason == 0 else {}
+        if self.connack_properties.get("assigned_client_identifier"):
+            self.client_id = self.connack_properties["assigned_client_identifier"]
 
     def read_exact(self, n):
         out = bytearray()
@@ -245,6 +323,14 @@ class RawClient:
         reason = body[reason_offset]
         assert reason <= 2, f"SUBACK failure {reason:#x}"
         return reason
+
+    def unsubscribe(self, *topic_filters, pid=2):
+        self.sock.sendall(unsubscribe_packet(pid, *topic_filters))
+        _, body = self.expect_type(11)
+        assert body[:2] == struct.pack("!H", pid), body
+        prop_len, used = read_varint_bytes(body, 2)
+        off = 2 + used + prop_len
+        return list(body[off:])
 
     def publish(self, topic, payload, *, qos=0, retain=False, pid=1, properties=None):
         self.sock.sendall(publish_packet(
@@ -616,7 +702,7 @@ def test_offline_qos1_properties_and_expiry():
     h, body = resumed.expect_type(3)
     msg = parse_publish(h, body)
     got = msg["parsed_properties"]
-    assert msg["dup"] and msg["payload"] == b"offline-properties", msg
+    assert not msg["dup"] and msg["payload"] == b"offline-properties", msg
     assert got["content_type"] == "application/octet-stream", got
     assert got["correlation_data"] == b"offline-corr", got
     assert got["user_properties"] == [("persist", "yes"), ("sequence", "two")], got
@@ -869,6 +955,143 @@ def test_client_id_takeover():
         pass
 
 
+def test_unsubscribe_unsuback_and_filter_validation():
+    topic = "protocol/v2/unsubscribe/live"
+    client = RawClient("proto_unsub_client", clean_start=True, session_expiry=30)
+    client.subscribe(topic, qos=1, pid=61)
+    reasons = client.unsubscribe(topic, "protocol/v2/unsubscribe/missing", pid=62)
+    assert reasons == [0x00, 0x11], reasons
+
+    pub = RawClient("proto_unsub_pub")
+    pub.publish(topic, b"must-not-arrive", qos=1, pid=63)
+    assert no_packet(client, 0.5), "message arrived after successful UNSUBSCRIBE"
+
+    # Malformed wildcard placement is a Protocol Error rather than silently creating
+    # an unusable subscription.
+    bad = RawClient("proto_bad_filter")
+    bad.sock.sendall(subscribe_packet(64, "bad/#/tail", qos=0))
+    _, body = bad.expect_type(14)
+    assert body and body[0] == 0x82, body
+    bad.sock.close()
+    pub.disconnect(); client.disconnect()
+
+
+def test_server_assigned_client_id_and_connack_limits():
+    generated = RawClient("", clean_start=True, session_expiry=30)
+    assigned = generated.connack_properties["assigned_client_identifier"]
+    assert assigned and assigned.startswith("pip-"), generated.connack_properties
+    assert generated.client_id == assigned
+    assert generated.connack_properties["receive_maximum"] == 1024, generated.connack_properties
+    assert generated.connack_properties["maximum_packet_size"] == 16 * 1024 * 1024, generated.connack_properties
+    assert generated.connack_properties["topic_alias_maximum"] == 0, generated.connack_properties
+    generated.disconnect()
+
+    resumed = RawClient(assigned, clean_start=False, session_expiry=30)
+    assert resumed.session_present, "server-assigned ClientID did not identify the persistent Session"
+    resumed.disconnect()
+
+
+def test_client_receive_maximum_window():
+    topic = "protocol/v2/flow/receive-max"
+    sub = RawClient("proto_receive_max_sub", receive_maximum=1)
+    sub.subscribe(topic, qos=1, pid=71)
+    pub = RawClient("proto_receive_max_pub")
+    for pid, payload in [(72, b"one"), (73, b"two"), (74, b"three")]:
+        pub.publish(topic, payload, qos=1, pid=pid)
+
+    h, body = sub.expect_type(3)
+    first = parse_publish(h, body)
+    assert first["qos"] == 1 and first["payload"] == b"one", first
+    assert no_packet(sub, 0.35), "server exceeded client Receive Maximum=1"
+    sub.sock.sendall(ack_packet(4, first["pid"]))
+
+    h, body = sub.expect_type(3)
+    second = parse_publish(h, body)
+    assert second["payload"] == b"two", second
+    assert no_packet(sub, 0.35), "server sent third PUBLISH before second PUBACK"
+    sub.sock.sendall(ack_packet(4, second["pid"]))
+
+    h, body = sub.expect_type(3)
+    third = parse_publish(h, body)
+    assert third["payload"] == b"three", third
+    sub.sock.sendall(ack_packet(4, third["pid"]))
+    sub.disconnect(); pub.disconnect()
+
+
+def test_client_maximum_packet_size_and_server_limit():
+    topic = "protocol/v2/flow/max-packet"
+    sub = RawClient("proto_small_packet_sub", maximum_packet_size=96)
+    sub.subscribe(topic, qos=1, pid=81)
+    pub = RawClient("proto_small_packet_pub")
+
+    pub.publish(topic, b"small", qos=1, pid=82)
+    h, body = sub.expect_type(3)
+    small = parse_publish(h, body)
+    assert small["payload"] == b"small", small
+    sub.sock.sendall(ack_packet(4, small["pid"]))
+
+    pub.publish(topic, b"X" * 256, qos=1, pid=83)
+    assert no_packet(sub, 0.5), "server sent PUBLISH larger than client Maximum Packet Size"
+    # Oversize delivery is treated as completed and must not poison the Receive Maximum.
+    pub.publish(topic, b"after-drop", qos=1, pid=84)
+    h, body = sub.expect_type(3)
+    after = parse_publish(h, body)
+    assert after["payload"] == b"after-drop", after
+    sub.sock.sendall(ack_packet(4, after["pid"]))
+
+    server_limit = sub.connack_properties["maximum_packet_size"]
+    # Fixed header alone proves the declared packet would exceed the server limit;
+    # no giant body needs to be allocated/sent.
+    sub.sock.sendall(b"\x30" + varint(server_limit))
+    _, body = sub.expect_type(14)
+    assert body and body[0] == 0x95, body
+    sub.sock.close(); pub.disconnect()
+
+
+def test_connect_limits_fragmentation_and_utf8_errors():
+    # CONNECT properties with forbidden zero values are Protocol Errors.
+    for suffix, kwargs in [
+        ("recv0", {"receive_maximum": 0}),
+        ("max0", {"maximum_packet_size": 0}),
+    ]:
+        sock = socket.create_connection((HOST, PORT), timeout=3)
+        sock.settimeout(3)
+        proxy = object.__new__(RawClient); proxy.sock = sock
+        sock.sendall(connect_packet(f"proto_{suffix}", **kwargs))
+        _, body = proxy.expect_type(2)
+        assert body[1] == 0x82, body
+        sock.close()
+
+    # TCP fragmentation must not be confused with an incomplete/malformed CONNECT.
+    sock = socket.create_connection((HOST, PORT), timeout=3)
+    sock.settimeout(3)
+    raw = connect_packet("proto_fragmented_connect")
+    proxy = object.__new__(RawClient); proxy.sock = sock
+    cursor = 0
+    for end in [1, 2, 5, 11, len(raw)]:
+        if end > cursor:
+            sock.sendall(raw[cursor:end])
+            cursor = end
+            time.sleep(0.02)
+    _, body = proxy.expect_type(2)
+    assert body[1] == 0x00, body
+    sock.sendall(disconnect_packet()); sock.close()
+
+    # U+0000 is forbidden in every MQTT UTF-8 Encoded String.
+    bad_utf = RawClient("proto_bad_utf8")
+    bad_utf.sock.sendall(publish_packet("bad\x00topic", b"bad"))
+    _, body = bad_utf.expect_type(14)
+    assert body and body[0] == 0x81, body
+    bad_utf.sock.close()
+
+    # Non-minimal Remaining Length encoding is malformed.
+    bad_varint = RawClient("proto_bad_varint")
+    bad_varint.sock.sendall(b"\xc0\x80\x00")
+    _, body = bad_varint.expect_type(14)
+    assert body and body[0] == 0x81, body
+    bad_varint.sock.close()
+
+
 def run(name, fn):
     started = time.time()
     fn()
@@ -892,6 +1115,11 @@ if __name__ == "__main__":
         ("started QoS2 continues after expiry", test_started_qos2_continues_after_expiry),
         ("Will application properties", test_will_application_properties),
         ("PUBLISH property protocol errors", test_publish_property_protocol_errors),
+        ("UNSUBSCRIBE/UNSUBACK + filter validation", test_unsubscribe_unsuback_and_filter_validation),
+        ("server-assigned ClientID + CONNACK limits", test_server_assigned_client_id_and_connack_limits),
+        ("client Receive Maximum flow window", test_client_receive_maximum_window),
+        ("Maximum Packet Size both directions", test_client_maximum_packet_size_and_server_limit),
+        ("CONNECT fragmentation + UTF-8/varint errors", test_connect_limits_fragmentation_and_utf8_errors),
         ("ClientID principal binding / ACL isolation", test_client_id_principal_binding),
         ("ClientID takeover DISCONNECT 0x8E", test_client_id_takeover),
         ("ClientID takeover stress x20", test_client_id_takeover_stress),

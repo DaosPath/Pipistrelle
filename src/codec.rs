@@ -6,6 +6,7 @@ pub enum CodecError {
     InvalidVarint,
     MalformedPacket,
     ProtocolError,
+    PacketTooLarge,
     UnsupportedProtocolVersion(u8),
 }
 
@@ -16,6 +17,9 @@ impl std::fmt::Display for CodecError {
             CodecError::InvalidVarint => write!(f, "Invalid variable byte integer"),
             CodecError::MalformedPacket => write!(f, "Malformed MQTT packet"),
             CodecError::ProtocolError => write!(f, "MQTT protocol error"),
+            CodecError::PacketTooLarge => {
+                write!(f, "MQTT packet exceeds negotiated Maximum Packet Size")
+            }
             CodecError::UnsupportedProtocolVersion(v) => {
                 write!(f, "Unsupported protocol version: {}", v)
             }
@@ -64,6 +68,26 @@ pub fn read_str<'a>(buf: &mut &'a [u8]) -> Result<&'a str, CodecError> {
         return Err(CodecError::Incomplete);
     }
     let s = std::str::from_utf8(&buf[..len]).map_err(|_| CodecError::MalformedPacket)?;
+    for ch in s.chars() {
+        let cp = ch as u32;
+        let disallowed_control = cp == 0 || (1..=0x1f).contains(&cp) || (0x7f..=0x9f).contains(&cp);
+        let noncharacter =
+            (0xfdd0..=0xfdef).contains(&cp) || (cp & 0xffff == 0xfffe) || (cp & 0xffff == 0xffff);
+        if disallowed_control || noncharacter {
+            return Err(CodecError::MalformedPacket);
+        }
+    }
+    *buf = &buf[len..];
+    Ok(s)
+}
+
+#[inline]
+fn read_utf8_str_structural<'a>(buf: &mut &'a [u8]) -> Result<&'a str, CodecError> {
+    let len = read_u16(buf)? as usize;
+    if buf.len() < len {
+        return Err(CodecError::Incomplete);
+    }
+    let s = std::str::from_utf8(&buf[..len]).map_err(|_| CodecError::MalformedPacket)?;
     *buf = &buf[len..];
     Ok(s)
 }
@@ -91,6 +115,16 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u32, usize), CodecError> {
         value += ((byte & 127) as u32) * multiplier;
 
         if (byte & 128) == 0 {
+            let minimum = match bytes_read {
+                1 => 0,
+                2 => 128,
+                3 => 16_384,
+                4 => 2_097_152,
+                _ => return Err(CodecError::InvalidVarint),
+            };
+            if value < minimum {
+                return Err(CodecError::InvalidVarint);
+            }
             return Ok((value, bytes_read));
         }
 
@@ -102,6 +136,19 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u32, usize), CodecError> {
     }
 
     Err(CodecError::Incomplete)
+}
+
+/// Returns the full MQTT Control Packet size as soon as the fixed header is complete.
+/// `Ok(None)` means more bytes are needed to finish the Remaining Length field.
+pub fn packet_total_len(buf: &[u8]) -> Result<Option<usize>, CodecError> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    match decode_varint(&buf[1..]) {
+        Ok((remaining, used)) => Ok(Some(1 + used + remaining as usize)),
+        Err(CodecError::Incomplete) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Encodes a u32 value as a Variable Byte Integer (Varint) into a vector.
@@ -155,6 +202,8 @@ pub enum Packet<'a> {
     PubComp(PubComp<'a>),
     Subscribe(Subscribe<'a>),
     SubAck(SubAck<'a>),
+    Unsubscribe(Unsubscribe<'a>),
+    UnsubAck(UnsubAck<'a>),
     PingReq,
     PingResp,
     Disconnect(Disconnect<'a>),
@@ -305,6 +354,25 @@ pub struct SubAckProperties<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct Unsubscribe<'a> {
+    pub packet_id: u16,
+    pub properties: UnsubscribeProperties<'a>,
+    pub topic_filters: Vec<&'a str>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UnsubscribeProperties<'a> {
+    pub user_properties: Vec<(&'a str, &'a str)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnsubAck<'a> {
+    pub packet_id: u16,
+    pub properties: SubAckProperties<'a>,
+    pub reason_codes: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct Disconnect<'a> {
     pub reason_code: u8,
     pub properties: DisconnectProperties<'a>,
@@ -340,19 +408,75 @@ impl<'a> ConnectProperties<'a> {
         while !prop_slice.is_empty() {
             let prop_id = read_u8(&mut prop_slice)?;
             match prop_id {
-                0x11 => props.session_expiry_interval = Some(read_u32(&mut prop_slice)?),
-                0x21 => props.receive_maximum = Some(read_u16(&mut prop_slice)?),
-                0x27 => props.max_packet_size = Some(read_u32(&mut prop_slice)?),
-                0x22 => props.topic_alias_maximum = Some(read_u16(&mut prop_slice)?),
-                0x19 => props.request_response_info = Some(read_u8(&mut prop_slice)?),
-                0x17 => props.request_problem_info = Some(read_u8(&mut prop_slice)?),
+                0x11 => {
+                    if props.session_expiry_interval.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.session_expiry_interval = Some(read_u32(&mut prop_slice)?);
+                }
+                0x21 => {
+                    if props.receive_maximum.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    let value = read_u16(&mut prop_slice)?;
+                    if value == 0 {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.receive_maximum = Some(value);
+                }
+                0x27 => {
+                    if props.max_packet_size.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    let value = read_u32(&mut prop_slice)?;
+                    if value == 0 {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.max_packet_size = Some(value);
+                }
+                0x22 => {
+                    if props.topic_alias_maximum.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.topic_alias_maximum = Some(read_u16(&mut prop_slice)?);
+                }
+                0x19 => {
+                    if props.request_response_info.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    let value = read_u8(&mut prop_slice)?;
+                    if value > 1 {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.request_response_info = Some(value);
+                }
+                0x17 => {
+                    if props.request_problem_info.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    let value = read_u8(&mut prop_slice)?;
+                    if value > 1 {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.request_problem_info = Some(value);
+                }
                 0x26 => {
                     let key = read_str(&mut prop_slice)?;
                     let val = read_str(&mut prop_slice)?;
                     props.user_properties.push((key, val));
                 }
-                0x15 => props.auth_method = Some(read_str(&mut prop_slice)?),
-                0x16 => props.auth_data = Some(read_bytes(&mut prop_slice)?),
+                0x15 => {
+                    if props.auth_method.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.auth_method = Some(read_str(&mut prop_slice)?);
+                }
+                0x16 => {
+                    if props.auth_data.is_some() {
+                        return Err(CodecError::ProtocolError);
+                    }
+                    props.auth_data = Some(read_bytes(&mut prop_slice)?);
+                }
                 _ => return Err(CodecError::MalformedPacket),
             }
         }
@@ -923,6 +1047,41 @@ impl<'a> SubAckProperties<'a> {
     }
 }
 
+impl<'a> UnsubscribeProperties<'a> {
+    pub fn decode(buf: &mut &'a [u8]) -> Result<Self, CodecError> {
+        let (prop_len, read) = decode_varint(buf)?;
+        *buf = &buf[read..];
+        if buf.len() < prop_len as usize {
+            return Err(CodecError::Incomplete);
+        }
+        let mut prop_slice = &buf[..prop_len as usize];
+        *buf = &buf[prop_len as usize..];
+        let mut props = Self::default();
+        while !prop_slice.is_empty() {
+            match read_u8(&mut prop_slice)? {
+                0x26 => {
+                    let key = read_str(&mut prop_slice)?;
+                    let value = read_str(&mut prop_slice)?;
+                    props.user_properties.push((key, value));
+                }
+                _ => return Err(CodecError::ProtocolError),
+            }
+        }
+        Ok(props)
+    }
+
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        let mut temp = Vec::new();
+        for (key, value) in &self.user_properties {
+            temp.push(0x26);
+            write_str(key, &mut temp);
+            write_str(value, &mut temp);
+        }
+        encode_varint(temp.len() as u32, buf);
+        buf.extend_from_slice(&temp);
+    }
+}
+
 impl<'a> DisconnectProperties<'a> {
     pub fn decode(buf: &mut &'a [u8]) -> Result<Self, CodecError> {
         let mut props = DisconnectProperties::default();
@@ -984,7 +1143,17 @@ impl<'a> DisconnectProperties<'a> {
 
 // Packet decoders
 
-pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), CodecError> {
+pub fn decode_packet<'a>(raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), CodecError> {
+    decode_packet_limited(raw_buf, usize::MAX)
+}
+
+/// Decodes one MQTT Control Packet while enforcing the peer-facing Maximum Packet Size.
+/// The size check happens immediately after Remaining Length is decoded, before the
+/// full packet body needs to be present in memory.
+pub fn decode_packet_limited<'a>(
+    mut raw_buf: &'a [u8],
+    maximum_packet_size: usize,
+) -> Result<(Packet<'a>, usize), CodecError> {
     let original_len = raw_buf.len();
 
     // 1. Read Fixed Header Byte
@@ -994,6 +1163,10 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
 
     // 2. Read Remaining Length
     let (remaining_len, read) = decode_varint(raw_buf)?;
+    let total_packet_size = 1 + read + remaining_len as usize;
+    if total_packet_size > maximum_packet_size {
+        return Err(CodecError::PacketTooLarge);
+    }
     raw_buf = &raw_buf[read..];
 
     if raw_buf.len() < remaining_len as usize {
@@ -1101,10 +1274,17 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
                 return Err(CodecError::MalformedPacket);
             }
 
-            let topic = read_str(&mut payload)?;
+            // PUBLISH topics are validated for MQTT-specific forbidden code points
+            // in the session hot path together with wildcard validation, avoiding a
+            // second Unicode walk for the overwhelmingly common ASCII case.
+            let topic = read_utf8_str_structural(&mut payload)?;
             let mut packet_id = None;
             if qos > 0 {
-                packet_id = Some(read_u16(&mut payload)?);
+                let pid = read_u16(&mut payload)?;
+                if pid == 0 {
+                    return Err(CodecError::ProtocolError);
+                }
+                packet_id = Some(pid);
             }
 
             let properties = PublishProperties::decode(&mut payload)?;
@@ -1158,6 +1338,9 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
                 return Err(CodecError::MalformedPacket);
             }
             let packet_id = read_u16(&mut payload)?;
+            if packet_id == 0 {
+                return Err(CodecError::ProtocolError);
+            }
             let properties = SubscribeProperties::decode(&mut payload)?;
 
             let mut subscriptions = Vec::new();
@@ -1193,6 +1376,55 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
             }
             Ok((
                 Packet::SubAck(SubAck {
+                    packet_id,
+                    properties,
+                    reason_codes,
+                }),
+                total_read,
+            ))
+        }
+        10 => {
+            // UNSUBSCRIBE
+            if flags != 0x02 {
+                return Err(CodecError::MalformedPacket);
+            }
+            let packet_id = read_u16(&mut payload)?;
+            if packet_id == 0 {
+                return Err(CodecError::ProtocolError);
+            }
+            let properties = UnsubscribeProperties::decode(&mut payload)?;
+            let mut topic_filters = Vec::new();
+            while !payload.is_empty() {
+                topic_filters.push(read_str(&mut payload)?);
+            }
+            if topic_filters.is_empty() {
+                return Err(CodecError::MalformedPacket);
+            }
+            Ok((
+                Packet::Unsubscribe(Unsubscribe {
+                    packet_id,
+                    properties,
+                    topic_filters,
+                }),
+                total_read,
+            ))
+        }
+        11 => {
+            // UNSUBACK
+            if flags != 0 {
+                return Err(CodecError::MalformedPacket);
+            }
+            let packet_id = read_u16(&mut payload)?;
+            if packet_id == 0 {
+                return Err(CodecError::ProtocolError);
+            }
+            let properties = SubAckProperties::decode(&mut payload)?;
+            let mut reason_codes = Vec::new();
+            while !payload.is_empty() {
+                reason_codes.push(read_u8(&mut payload)?);
+            }
+            Ok((
+                Packet::UnsubAck(UnsubAck {
                     packet_id,
                     properties,
                     reason_codes,
@@ -1382,6 +1614,20 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
         }
         Packet::SubAck(pkt) => {
             fixed_header_byte = 9 << 4;
+            write_u16(pkt.packet_id, &mut payload);
+            pkt.properties.encode(&mut payload);
+            payload.extend_from_slice(&pkt.reason_codes);
+        }
+        Packet::Unsubscribe(pkt) => {
+            fixed_header_byte = (10 << 4) | 0x02;
+            write_u16(pkt.packet_id, &mut payload);
+            pkt.properties.encode(&mut payload);
+            for filter in &pkt.topic_filters {
+                write_str(filter, &mut payload);
+            }
+        }
+        Packet::UnsubAck(pkt) => {
+            fixed_header_byte = 11 << 4;
             write_u16(pkt.packet_id, &mut payload);
             pkt.properties.encode(&mut payload);
             payload.extend_from_slice(&pkt.reason_codes);
@@ -1611,6 +1857,107 @@ mod tests {
         let (decoded_resp, read_resp) = decode_packet(&buf).unwrap();
         assert_eq!(read_resp, buf.len());
         assert_eq!(decoded_resp, Packet::PingResp);
+    }
+
+    #[test]
+    fn unsubscribe_and_unsuback_roundtrip() {
+        let unsubscribe = Packet::Unsubscribe(Unsubscribe {
+            packet_id: 91,
+            properties: UnsubscribeProperties {
+                user_properties: vec![("source", "test")],
+            },
+            topic_filters: vec!["sensor/+", "alerts/#"],
+        });
+        let mut buf = Vec::new();
+        encode_packet(&unsubscribe, &mut buf);
+        assert_eq!(buf[0], 0xA2);
+        let (decoded, used) = decode_packet(&buf).unwrap();
+        assert_eq!(used, buf.len());
+        assert_eq!(decoded, unsubscribe);
+
+        let unsuback = Packet::UnsubAck(UnsubAck {
+            packet_id: 91,
+            properties: SubAckProperties::default(),
+            reason_codes: vec![0x00, 0x11],
+        });
+        buf.clear();
+        encode_packet(&unsuback, &mut buf);
+        assert_eq!(buf[0], 0xB0);
+        let (decoded, used) = decode_packet(&buf).unwrap();
+        assert_eq!(used, buf.len());
+        assert_eq!(decoded, unsuback);
+    }
+
+    #[test]
+    fn connect_flow_limits_reject_zero_and_duplicates() {
+        let zero_receive = Packet::Connect(Connect {
+            client_id: "flow-zero",
+            keep_alive: 60,
+            clean_start: true,
+            username: None,
+            password: None,
+            will: None,
+            properties: ConnectProperties {
+                receive_maximum: Some(0),
+                ..Default::default()
+            },
+        });
+        let mut buf = Vec::new();
+        encode_packet(&zero_receive, &mut buf);
+        assert_eq!(decode_packet(&buf), Err(CodecError::ProtocolError));
+
+        let zero_packet = Packet::Connect(Connect {
+            client_id: "packet-zero",
+            keep_alive: 60,
+            clean_start: true,
+            username: None,
+            password: None,
+            will: None,
+            properties: ConnectProperties {
+                max_packet_size: Some(0),
+                ..Default::default()
+            },
+        });
+        buf.clear();
+        encode_packet(&zero_packet, &mut buf);
+        assert_eq!(decode_packet(&buf), Err(CodecError::ProtocolError));
+
+        // CONNECT property length=6: two Receive Maximum entries.
+        let mut body = Vec::new();
+        write_str("MQTT", &mut body);
+        body.extend_from_slice(&[5, 0x02, 0, 60, 6, 0x21, 0, 1, 0x21, 0, 2]);
+        write_str("dup-flow", &mut body);
+        let mut raw = vec![0x10];
+        encode_varint(body.len() as u32, &mut raw);
+        raw.extend_from_slice(&body);
+        assert_eq!(decode_packet(&raw), Err(CodecError::ProtocolError));
+    }
+
+    #[test]
+    fn mqtt_utf8_and_varint_are_strict() {
+        let raw = [0, 3, b'a', 0, b'b'];
+        let mut slice = raw.as_slice();
+        assert_eq!(read_str(&mut slice), Err(CodecError::MalformedPacket));
+
+        let raw = [0, 3, 0xEF, 0xB7, 0x90]; // U+FDD0 noncharacter
+        let mut slice = raw.as_slice();
+        assert_eq!(read_str(&mut slice), Err(CodecError::MalformedPacket));
+
+        assert_eq!(decode_varint(&[0x80, 0x00]), Err(CodecError::InvalidVarint));
+        assert_eq!(decode_varint(&[0x81, 0x00]), Err(CodecError::InvalidVarint));
+        assert_eq!(decode_varint(&[0x80, 0x01]), Ok((128, 2)));
+    }
+
+    #[test]
+    fn packet_total_len_works_from_fixed_header_prefix() {
+        assert_eq!(packet_total_len(&[]), Ok(None));
+        assert_eq!(packet_total_len(&[0x30]), Ok(None));
+        assert_eq!(packet_total_len(&[0x30, 0x7f]), Ok(Some(129)));
+        assert_eq!(packet_total_len(&[0x30, 0x80, 0x01]), Ok(Some(131)));
+        assert_eq!(
+            packet_total_len(&[0x30, 0x80, 0x00]),
+            Err(CodecError::InvalidVarint)
+        );
     }
 
     #[test]

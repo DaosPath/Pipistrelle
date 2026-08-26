@@ -277,7 +277,7 @@ def test_offline_qos1_properties_survive_restart():
     h, body = resumed.expect_type(3)
     msg = parse_publish(h, body)
     got = msg["parsed_properties"]
-    assert msg["dup"] and msg["payload"] == b"offline-qos1-restart", msg
+    assert not msg["dup"] and msg["payload"] == b"offline-qos1-restart", msg
     assert got["content_type"] == "application/octet-stream", got
     assert got["correlation_data"] == b"q1-restart-corr", got
     assert got["user_properties"] == [("persist", "qos1")], got
@@ -389,6 +389,55 @@ def test_outbound_qos2_started_properties_survive_restart():
     resumed.disconnect()
 
 
+def test_unsubscribe_survives_restart():
+    topic = "protocol/v2/restart/unsubscribe"
+    cid = "restart_unsubscribe_client"
+    sub = RawClient(cid, clean_start=True, session_expiry=60)
+    sub.subscribe(topic, qos=1, pid=241)
+    reasons = sub.unsubscribe(topic, pid=242)
+    assert reasons == [0x00], reasons
+
+    # Crash immediately after UNSUBACK: the acknowledged Session mutation must already
+    # be durable and must not be resurrected from SQLite.
+    hard_restart()
+    try:
+        sub.sock.close()
+    except Exception:
+        pass
+
+    resumed = RawClient(cid, clean_start=False, session_expiry=60)
+    assert resumed.session_present
+    pub = RawClient("restart_unsubscribe_pub")
+    pub.publish(topic, b"must-not-arrive", qos=1, pid=243)
+    assert no_packet(resumed, 0.7), "UNSUBSCRIBE was resurrected after SIGKILL/restart"
+    resumed.disconnect(); pub.disconnect()
+
+
+def test_offline_order_and_receive_maximum_survive_restart():
+    topic = "protocol/v2/restart/ordered-offline"
+    cid = "restart_ordered_offline_sub"
+    sub = RawClient(cid, clean_start=True, session_expiry=60)
+    sub.subscribe(topic, qos=1, pid=251)
+    sub.disconnect()
+
+    pub = RawClient("restart_ordered_offline_pub")
+    for pid, payload in [(252, b"one"), (253, b"two"), (254, b"three")]:
+        pub.publish(topic, payload, qos=1, pid=pid)
+    pub.disconnect()
+
+    hard_restart()
+    resumed = RawClient(cid, clean_start=False, session_expiry=60, receive_maximum=1)
+    assert resumed.session_present
+    for expected in (b"one", b"two", b"three"):
+        h, body = resumed.expect_type(3)
+        msg = parse_publish(h, body)
+        assert msg["payload"] == expected, msg
+        assert not msg["dup"], "never-sent offline message incorrectly marked DUP"
+        assert no_packet(resumed, 0.3), "Receive Maximum=1 exceeded after restart"
+        resumed.sock.sendall(ack_packet(4, msg["pid"]))
+    resumed.disconnect()
+
+
 def run(name, fn):
     started = time.time()
     fn()
@@ -406,6 +455,8 @@ if __name__ == "__main__":
         ("offline QoS1 properties survive restart", test_offline_qos1_properties_survive_restart),
         ("inbound QoS2 properties survive PUBREC restart", test_inbound_qos2_properties_survive_pubrec_restart),
         ("outbound QoS2 properties survive restart", test_outbound_qos2_started_properties_survive_restart),
+        ("UNSUBSCRIBE durability survives restart", test_unsubscribe_survives_restart),
+        ("offline order + Receive Maximum survive restart", test_offline_order_and_receive_maximum_survive_restart),
     ]
     for name, fn in tests:
         run(name, fn)

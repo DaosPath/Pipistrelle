@@ -85,6 +85,10 @@ impl Persistence {
             "ALTER TABLE in_flight ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 1",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE in_flight ADD COLUMN enqueue_order INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS retained_messages (
@@ -137,6 +141,10 @@ impl Persistence {
         );
         let _ = conn.execute(
             "ALTER TABLE qos2_outgoing ADD COLUMN delivery_started INTEGER NOT NULL DEFAULT 1",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE qos2_outgoing ADD COLUMN enqueue_order INTEGER NOT NULL DEFAULT 0",
             [],
         );
 
@@ -287,14 +295,15 @@ impl Persistence {
         retain: bool,
         subscription_identifier: Option<u32>,
         properties_json: String,
+        enqueue_order: u64,
         delivery_started: bool,
     ) {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO in_flight (client_id, packet_id, topic, payload, qos, retain, subscription_identifier, properties_json, delivery_started)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT OR REPLACE INTO in_flight (client_id, packet_id, topic, payload, qos, retain, subscription_identifier, properties_json, enqueue_order, delivery_started)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 (
                     &client_id,
                     packet_id,
@@ -304,6 +313,7 @@ impl Persistence {
                     i32::from(retain),
                     subscription_identifier,
                     &properties_json,
+                    enqueue_order,
                     i32::from(delivery_started),
                 ),
             ) {
@@ -404,6 +414,7 @@ impl Persistence {
             bool,
             Option<u32>,
             String,
+            u64,
             bool,
         )>,
         rusqlite::Error,
@@ -412,11 +423,11 @@ impl Persistence {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT client_id, packet_id, topic, payload, qos, retain, subscription_identifier, properties_json, delivery_started FROM in_flight",
+                "SELECT client_id, packet_id, topic, payload, qos, retain, subscription_identifier, properties_json, enqueue_order, delivery_started FROM in_flight",
             )?;
             let rows = stmt.query_map([], |row| {
                 let retain: i32 = row.get(5)?;
-                let delivery_started: i32 = row.get(8)?;
+                let delivery_started: i32 = row.get(9)?;
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -426,6 +437,7 @@ impl Persistence {
                     retain != 0,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                     delivery_started != 0,
                 ))
             })?;
@@ -560,6 +572,7 @@ impl Persistence {
         retain: bool,
         subscription_identifier: Option<u32>,
         properties_json: String,
+        enqueue_order: u64,
         delivery_started: bool,
         phase: u8,
     ) {
@@ -567,8 +580,8 @@ impl Persistence {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             if let Err(e) = conn.execute(
-                "INSERT OR REPLACE INTO qos2_outgoing (client_id, packet_id, topic, payload, retain, subscription_identifier, phase, properties_json, delivery_started) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                (&client_id, packet_id, &topic, &payload, i32::from(retain), subscription_identifier, phase, &properties_json, i32::from(delivery_started)),
+                "INSERT OR REPLACE INTO qos2_outgoing (client_id, packet_id, topic, payload, retain, subscription_identifier, phase, properties_json, enqueue_order, delivery_started) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (&client_id, packet_id, &topic, &payload, i32::from(retain), subscription_identifier, phase, &properties_json, enqueue_order, i32::from(delivery_started)),
             ) { error!("Failed to save outbound QoS2 state for {}:{}: {:?}", client_id, packet_id, e); }
         }).await.unwrap();
     }
@@ -597,6 +610,7 @@ impl Persistence {
             bool,
             Option<u32>,
             String,
+            u64,
             bool,
             u8,
         )>,
@@ -606,11 +620,11 @@ impl Persistence {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT client_id, packet_id, topic, payload, retain, subscription_identifier, properties_json, delivery_started, phase FROM qos2_outgoing",
+                "SELECT client_id, packet_id, topic, payload, retain, subscription_identifier, properties_json, enqueue_order, delivery_started, phase FROM qos2_outgoing",
             )?;
             let rows = stmt.query_map([], |row| {
                 let retain: i32 = row.get(4)?;
-                let delivery_started: i32 = row.get(7)?;
+                let delivery_started: i32 = row.get(8)?;
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -619,8 +633,9 @@ impl Persistence {
                     retain != 0,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                     delivery_started != 0,
-                    row.get(8)?,
+                    row.get(9)?,
                 ))
             })?;
             let mut result = Vec::new();

@@ -412,6 +412,19 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     state.writer_batch_bytes
                                 );
                                 metric!(
+                                    "# HELP pipistrelle_receive_maximum Server-advertised MQTT Receive Maximum for inbound QoS1/2"
+                                );
+                                metric!("# TYPE pipistrelle_receive_maximum gauge");
+                                metric!("pipistrelle_receive_maximum {}", state.receive_maximum);
+                                metric!(
+                                    "# HELP pipistrelle_maximum_packet_size_bytes Server-advertised MQTT Maximum Packet Size in bytes"
+                                );
+                                metric!("# TYPE pipistrelle_maximum_packet_size_bytes gauge");
+                                metric!(
+                                    "pipistrelle_maximum_packet_size_bytes {}",
+                                    state.maximum_packet_size
+                                );
+                                metric!(
                                     "# HELP pipistrelle_publish_route_latency_seconds Sampled time spent routing one inbound PUBLISH, including bounded queue waits"
                                 );
                                 metric!(
@@ -496,9 +509,11 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 "200 OK",
                                 "application/json; charset=utf-8",
                                 format!(
-                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"qos2\":true,\"retained_messages\":true,\"last_will\":true,\"persistent_sessions\":true,\"client_id_takeover\":true,\"publish_application_properties\":true,\"message_expiry\":true,\"will_crash_persistence\":true,\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
+                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"qos2\":true,\"retained_messages\":true,\"last_will\":true,\"persistent_sessions\":true,\"client_id_takeover\":true,\"publish_application_properties\":true,\"message_expiry\":true,\"will_crash_persistence\":true,\"unsubscribe\":true,\"server_assigned_client_id\":true,\"strict_mqtt_utf8\":true,\"receive_maximum\":{},\"maximum_packet_size\":{},\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
                                     version::VERSION,
                                     version::SERIES,
+                                    state.receive_maximum,
+                                    state.maximum_packet_size,
                                     tls_profile.as_str(),
                                     state.client_queue_capacity,
                                     state.max_subscriptions_per_client,

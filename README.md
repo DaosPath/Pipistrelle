@@ -181,6 +181,9 @@ Desde `2.1.0.0`, V2 incorpora la primera gran expansión de protocolo: **QoS 2**
 
 Desde `2.1.1.0`, Pipistrelle preserva las propiedades de aplicación de PUBLISH/Will a través de routing y persistencia, aplica **Message Expiry** al tiempo real que el mensaje espera en el broker y guarda el Will en SQLite para recuperarlo tras un crash completo. La suite destructiva `test_protocol_restart_v2.py` usa `SIGKILL` del contenedor para validar recuperación real, no solo shutdown limpio. Consulta [`docs/MQTT5_COMPLIANCE.md`](docs/MQTT5_COMPLIANCE.md) para la matriz explícita de soporte; Pipistrelle todavía no se anuncia como MQTT v5 100% conforme.
 
+Desde `2.1.2.0`, el broker implementa además **UNSUBSCRIBE/UNSUBACK**, Receive Maximum bilateral, Maximum Packet Size bilateral, ClientID asignado por servidor, CONNECT fragmentado sobre TCP y validación MQTT UTF-8/varint más estricta. Los límites por defecto son `PIPISTRELLE_RECEIVE_MAXIMUM=1024` y `PIPISTRELLE_MAX_PACKET_SIZE=16777216`.
+La release mantiene una mediana de **20.33 M msg/s ingest QoS0** (tres repeticiones de 50M) y **2.656 M msg/s end-to-end QoS0** en la Orange Pi; QoS1 queda como objetivo de optimización de persistence/flow-control, no como motivo para relajar compliance.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración

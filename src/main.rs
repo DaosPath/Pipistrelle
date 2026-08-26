@@ -27,10 +27,13 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
-use crate::codec::{ConnAck, Packet, PubAck, SubAck, decode_packet, encode_packet};
+use crate::codec::{
+    ConnAck, Packet, PubAck, SubAck, UnsubAck, decode_packet_limited, encode_packet,
+};
+use crate::router::topic_filter_valid;
 use crate::session::{
-    ApplicationProperties, BrokerState, ClientSession, IncomingQos2Message, OutgoingQos2Phase,
-    WillMessage,
+    ApplicationProperties, BrokerState, ClientSession, IncomingQos2Message, OutboundPacket,
+    OutgoingQos2Phase, WillMessage,
 };
 use pipistrelle::{crypto, version};
 
@@ -311,54 +314,115 @@ where
 
     let mut read_buf = BytesMut::with_capacity(4096);
 
-    // 1. Wait for the CONNECT packet first.
-    // It must be the first packet received within a reasonable time (e.g., 5 seconds).
-    let (client_id, keep_alive, clean_start, session_expiry_interval, username, password, will) =
-        match tokio::time::timeout(Duration::from_secs(5), socket.read_buf(&mut read_buf)).await {
-            Ok(Ok(n)) if n > 0 => match decode_packet(&read_buf) {
-                Ok((Packet::Connect(pkt), bytes_read)) => {
-                    let client_id = pkt.client_id.to_string();
-                    let keep_alive = pkt.keep_alive;
-                    let clean_start = pkt.clean_start;
-                    let session_expiry_interval =
-                        pkt.properties.session_expiry_interval.unwrap_or(0);
-                    let username = pkt.username.map(|s| s.to_string());
-                    let password = pkt
-                        .password
-                        .map(|b| String::from_utf8_lossy(b).into_owned());
-                    let will = pkt.will.map(|will| WillMessage {
-                        topic: will.topic.to_string(),
-                        payload: will.payload.to_vec(),
-                        qos: will.qos,
-                        retain: will.retain,
-                        delay_interval: will.properties.will_delay_interval.unwrap_or(0),
-                        properties: ApplicationProperties::from_will(&will.properties),
-                    });
-                    read_buf.advance(bytes_read);
-                    (
-                        client_id,
-                        keep_alive,
-                        clean_start,
-                        session_expiry_interval,
-                        username,
-                        password,
-                        will,
-                    )
-                }
-                Ok((other, _)) => {
-                    warn!("First packet was not CONNECT: {:?}", other);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("Failed to decode CONNECT packet: {:?}", e);
-                    return Ok(());
-                }
-            },
-            _ => {
-                warn!("Timeout or connection closed before CONNECT received");
+    // 1. Wait for the CONNECT packet first. TCP can fragment a Control Packet across
+    // arbitrary reads, so accumulate until the entire CONNECT is available or the
+    // five-second handshake deadline expires.
+    let connect_deadline = Instant::now() + Duration::from_secs(5);
+    let (
+        mut client_id,
+        keep_alive,
+        clean_start,
+        session_expiry_interval,
+        client_receive_maximum,
+        client_maximum_packet_size,
+        username,
+        password,
+        will,
+    ) = loop {
+        match decode_packet_limited(&read_buf, state.maximum_packet_size) {
+            Ok((Packet::Connect(pkt), bytes_read)) => {
+                let client_id = pkt.client_id.to_string();
+                let keep_alive = pkt.keep_alive;
+                let clean_start = pkt.clean_start;
+                let session_expiry_interval = pkt.properties.session_expiry_interval.unwrap_or(0);
+                let client_receive_maximum = pkt.properties.receive_maximum.unwrap_or(u16::MAX);
+                let client_maximum_packet_size =
+                    pkt.properties.max_packet_size.unwrap_or(268_435_455);
+                let username = pkt.username.map(|s| s.to_string());
+                let password = pkt
+                    .password
+                    .map(|b| String::from_utf8_lossy(b).into_owned());
+                let will = pkt.will.map(|will| WillMessage {
+                    topic: will.topic.to_string(),
+                    payload: will.payload.to_vec(),
+                    qos: will.qos,
+                    retain: will.retain,
+                    delay_interval: will.properties.will_delay_interval.unwrap_or(0),
+                    properties: ApplicationProperties::from_will(&will.properties),
+                });
+                read_buf.advance(bytes_read);
+                break (
+                    client_id,
+                    keep_alive,
+                    clean_start,
+                    session_expiry_interval,
+                    client_receive_maximum,
+                    client_maximum_packet_size,
+                    username,
+                    password,
+                    will,
+                );
+            }
+            Ok((other, _)) => {
+                warn!("First packet was not CONNECT: {:?}", other);
                 return Ok(());
             }
-        };
+            Err(codec::CodecError::Incomplete) => {
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    warn!("CONNECT handshake timeout from {}", addr);
+                    return Ok(());
+                }
+                match tokio::time::timeout(remaining, socket.read_buf(&mut read_buf)).await {
+                    Ok(Ok(n)) if n > 0 => continue,
+                    _ => {
+                        warn!("Timeout or connection closed before CONNECT completed");
+                        return Ok(());
+                    }
+                }
+            }
+            Err(codec::CodecError::UnsupportedProtocolVersion(_)) => {
+                let connack = Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    reason_code: 0x84,
+                    properties: Default::default(),
+                });
+                let mut buf = Vec::new();
+                encode_packet(&connack, &mut buf);
+                let _ = socket.write_all(&buf).await;
+                let _ = socket.shutdown().await;
+                return Ok(());
+            }
+            Err(codec::CodecError::PacketTooLarge) => {
+                let connack = Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    reason_code: 0x95,
+                    properties: Default::default(),
+                });
+                let mut buf = Vec::new();
+                encode_packet(&connack, &mut buf);
+                let _ = socket.write_all(&buf).await;
+                let _ = socket.shutdown().await;
+                return Ok(());
+            }
+            Err(codec::CodecError::ProtocolError) => {
+                let connack = Packet::ConnAck(ConnAck {
+                    session_present: false,
+                    reason_code: 0x82,
+                    properties: Default::default(),
+                });
+                let mut buf = Vec::new();
+                encode_packet(&connack, &mut buf);
+                let _ = socket.write_all(&buf).await;
+                let _ = socket.shutdown().await;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to decode CONNECT packet: {:?}", e);
+                return Ok(());
+            }
+        }
+    };
 
     // Authenticate client
     let authenticated = match (&username, &password) {
@@ -383,6 +447,13 @@ where
         let _ = socket.shutdown().await;
         return Ok(());
     }
+
+    let assigned_client_identifier = if client_id.is_empty() {
+        client_id = state.allocate_client_id();
+        Some(client_id.clone())
+    } else {
+        None
+    };
 
     info!(
         "Client '{}' (authenticated user: {:?}) connecting from {}",
@@ -440,6 +511,45 @@ where
             .as_ref()
             .is_some_and(|session| session.session_expiry() > 0);
 
+    // Negotiate a CONNACK that respects the client's Maximum Packet Size before
+    // mutating Session/Will ownership. Optional capability properties are removed
+    // if needed; Assigned Client Identifier is mandatory when the CONNECT ClientID was empty.
+    let mut connack_buf = Vec::new();
+    let full_connack = Packet::ConnAck(ConnAck {
+        session_present,
+        reason_code: 0,
+        properties: crate::codec::ConnAckProperties {
+            receive_maximum: Some(state.receive_maximum),
+            maximum_packet_size: Some(state.maximum_packet_size as u32),
+            assigned_client_identifier: assigned_client_identifier.as_deref(),
+            topic_alias_maximum: Some(0),
+            ..Default::default()
+        },
+    });
+    encode_packet(&full_connack, &mut connack_buf);
+    if connack_buf.len() > client_maximum_packet_size as usize {
+        connack_buf.clear();
+        let minimal_connack = Packet::ConnAck(ConnAck {
+            session_present,
+            reason_code: 0,
+            properties: crate::codec::ConnAckProperties {
+                assigned_client_identifier: assigned_client_identifier.as_deref(),
+                ..Default::default()
+            },
+        });
+        encode_packet(&minimal_connack, &mut connack_buf);
+    }
+    if connack_buf.len() > client_maximum_packet_size as usize {
+        warn!(
+            "Client '{}' Maximum Packet Size {} cannot accommodate mandatory CONNACK ({} bytes)",
+            client_id,
+            client_maximum_packet_size,
+            connack_buf.len()
+        );
+        let _ = socket.shutdown().await;
+        return Ok(());
+    }
+
     // A reconnect continuing the same persistent Session cancels a delayed Will.
     // Clean Start ends the previous Session, so a pending Will must be published now.
     if clean_start {
@@ -455,7 +565,7 @@ where
     }
 
     // 2. Set up channels for sending outgoing packets to this client
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(state.client_queue_capacity);
+    let (tx, mut rx) = mpsc::channel::<OutboundPacket>(state.client_queue_capacity);
 
     let auth_username = username.as_deref().unwrap_or("");
     let allow_all_read = state.auth.authorizes_all(auth_username, "read");
@@ -468,6 +578,8 @@ where
         allow_all_read,
         allow_all_write,
         keep_alive,
+        client_receive_maximum,
+        client_maximum_packet_size,
         session_expiry_interval,
         tx,
     ));
@@ -534,11 +646,17 @@ where
 
     let writer_batch_packets = state.writer_batch_packets;
     let writer_batch_bytes = state.writer_batch_bytes;
+    let inbound_receive_pending = session.inbound_receive_pending.clone();
     let writer_task = tokio::spawn(async move {
         let mut batch = Vec::with_capacity(writer_batch_bytes.min(256 * 1024));
+        let mut release_ids = Vec::with_capacity(writer_batch_packets.min(256));
         while let Some(first) = rx.recv().await {
             batch.clear();
-            batch.extend_from_slice(&first);
+            release_ids.clear();
+            batch.extend_from_slice(&first.bytes);
+            if let Some(packet_id) = first.release_inbound_packet_id {
+                release_ids.push(packet_id);
+            }
             let mut packet_count = 1usize;
 
             // Under load, collapse queued MQTT packets into one socket/TLS write.
@@ -546,8 +664,11 @@ where
             // backpressure; light traffic is still written immediately.
             while packet_count < writer_batch_packets && batch.len() < writer_batch_bytes {
                 match rx.try_recv() {
-                    Ok(bytes) => {
-                        batch.extend_from_slice(&bytes);
+                    Ok(packet) => {
+                        batch.extend_from_slice(&packet.bytes);
+                        if let Some(packet_id) = packet.release_inbound_packet_id {
+                            release_ids.push(packet_id);
+                        }
                         packet_count += 1;
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -563,21 +684,23 @@ where
                 warn!("Failed to flush client {}: {:?}", client_id_clone, e);
                 break;
             }
+
+            if !release_ids.is_empty() {
+                let mut pending = inbound_receive_pending.lock();
+                for packet_id in &release_ids {
+                    pending.remove(packet_id);
+                }
+            }
         }
         // Ensure socket write half is closed
         let _ = write_half.shutdown().await;
         debug!("Writer task terminated for client {}", client_id_clone);
     });
 
-    // 4. Send CONNACK response
-    let connack = Packet::ConnAck(ConnAck {
-        session_present,
-        reason_code: 0, // Success
-        properties: Default::default(),
-    });
-    let mut connack_buf = Vec::new();
-    encode_packet(&connack, &mut connack_buf);
-    let _ = state.send_to_session(&session, connack_buf).await;
+    // 4. Send the pre-negotiated CONNACK response.
+    if !state.send_to_session(&session, connack_buf).await {
+        session.request_disconnect();
+    }
     if session_present {
         state.resume_persistent_outgoing(&session).await;
     }
@@ -616,9 +739,11 @@ where
                     // Update session keep-alive timer
                     session.update_activity();
 
-                    // Parse and process all complete packets currently in the read buffer
+                    // Parse and process all complete packets currently in the read buffer.
+                    // The fixed header reveals total packet size before the payload arrives,
+                    // allowing us to enforce Maximum Packet Size without buffering it all.
                     loop {
-                        match decode_packet(&read_buf) {
+                        match decode_packet_limited(&read_buf, state.maximum_packet_size) {
                             Ok((packet, bytes_read)) => {
                                 if let Packet::Disconnect(pkt) = &packet {
                                     if let Some(expiry) = pkt.properties.session_expiry_interval {
@@ -691,6 +816,7 @@ where
                                 warn!("Codec error processing client '{}': {:?}", client_id, e);
                                 let reason = match e {
                                     codec::CodecError::ProtocolError => 0x82,
+                                    codec::CodecError::PacketTooLarge => 0x95,
                                     _ => 0x81,
                                 };
                                 disconnect_client_with_reason(&state, &session, reason).await;
@@ -745,6 +871,34 @@ where
     }
 
     result
+}
+
+#[inline(always)]
+fn publish_topic_error_reason(topic: &str) -> Option<u8> {
+    let mut non_ascii = false;
+    for &byte in topic.as_bytes() {
+        if byte == b'+' || byte == b'#' {
+            return Some(0x82); // Protocol Error: wildcard in Topic Name
+        }
+        if byte <= 0x1f || byte == 0x7f {
+            return Some(0x81); // Malformed Packet: forbidden MQTT UTF-8 data
+        }
+        non_ascii |= byte >= 0x80;
+    }
+    if !non_ascii {
+        return None;
+    }
+    for ch in topic.chars() {
+        let cp = ch as u32;
+        if (0x80..=0x9f).contains(&cp)
+            || (0xfdd0..=0xfdef).contains(&cp)
+            || (cp & 0xffff == 0xfffe)
+            || (cp & 0xffff == 0xffff)
+        {
+            return Some(0x81);
+        }
+    }
+    None
 }
 
 #[inline(always)]
@@ -814,12 +968,12 @@ async fn process_client_packet(
                 )
                 .await;
             }
-            if topic_contains_wildcard(pkt.topic) {
+            if let Some(reason) = publish_topic_error_reason(pkt.topic) {
                 return protocol_error(
                     state,
                     session,
-                    0x82,
-                    "PUBLISH topic contains wildcard characters",
+                    reason,
+                    "PUBLISH topic contains MQTT-forbidden characters",
                 )
                 .await;
             }
@@ -853,6 +1007,27 @@ async fn process_client_packet(
                 .await;
             }
 
+            let inbound_packet_id = if pkt.qos > 0 {
+                let Some(packet_id) = pkt.packet_id else {
+                    return protocol_error(
+                        state,
+                        session,
+                        0x82,
+                        "QoS PUBLISH missing packet identifier",
+                    )
+                    .await;
+                };
+                if session
+                    .reserve_inbound_receive(packet_id, state.receive_maximum)
+                    .is_err()
+                {
+                    return protocol_error(state, session, 0x93, "Receive Maximum exceeded").await;
+                }
+                Some(packet_id)
+            } else {
+                None
+            };
+
             let application_properties = ApplicationProperties::from_publish(&pkt.properties);
 
             // Check write authorization
@@ -876,7 +1051,9 @@ async fn process_client_packet(
                     if pkt.qos > 0 {
                         let mut buf = Vec::new();
                         encode_packet(&packet, &mut buf);
-                        let _ = state.send_to_session(session, buf).await;
+                        let _ = state
+                            .send_to_session_after_write(session, buf, inbound_packet_id)
+                            .await;
                     }
                 }
                 return Ok(());
@@ -928,7 +1105,9 @@ async fn process_client_packet(
                 });
                 let mut buf = Vec::new();
                 encode_packet(&pubrec, &mut buf);
-                let _ = state.send_to_session(session, buf).await;
+                let _ = state
+                    .send_to_session_after_write(session, buf, Some(packet_id))
+                    .await;
                 return Ok(());
             }
 
@@ -959,7 +1138,9 @@ async fn process_client_packet(
                     });
                     let mut buf = Vec::new();
                     encode_packet(&puback, &mut buf);
-                    let _ = state.send_to_session(session, buf).await;
+                    let _ = state
+                        .send_to_session_after_write(session, buf, Some(pid))
+                        .await;
                 }
             }
         }
@@ -970,6 +1151,10 @@ async fn process_client_packet(
             let username = session.username.as_deref().unwrap_or("");
 
             for sub in &pkt.subscriptions {
+                if !topic_filter_valid(sub.topic_filter) {
+                    return protocol_error(state, session, 0x82, "Malformed MQTT Topic Filter")
+                        .await;
+                }
                 let requested_qos = sub.options & 0x03;
                 let no_local = sub.options & 0x04 != 0;
                 let retain_handling = (sub.options >> 4) & 0x03;
@@ -1037,11 +1222,39 @@ async fn process_client_packet(
                     .await;
             }
         }
+        Packet::Unsubscribe(pkt) => {
+            let mut reason_codes = Vec::with_capacity(pkt.topic_filters.len());
+            for filter in &pkt.topic_filters {
+                if !topic_filter_valid(filter) {
+                    return protocol_error(
+                        state,
+                        session,
+                        0x82,
+                        "Malformed MQTT Topic Filter in UNSUBSCRIBE",
+                    )
+                    .await;
+                }
+                reason_codes.push(if state.unsubscribe(&session.client_id, filter).await {
+                    0x00 // Success
+                } else {
+                    0x11 // No subscription existed
+                });
+            }
+            let ack = Packet::UnsubAck(UnsubAck {
+                packet_id: pkt.packet_id,
+                properties: Default::default(),
+                reason_codes,
+            });
+            let mut buf = Vec::new();
+            encode_packet(&ack, &mut buf);
+            let _ = state.send_to_session(session, buf).await;
+        }
         Packet::PubAck(pkt) => {
             debug!(
                 "Received PUBACK from client '{}' for packet ID {}",
                 session.client_id, pkt.packet_id
             );
+            session.release_outbound_slot(pkt.packet_id);
             session.remove_in_flight(pkt.packet_id);
 
             // Delete from database
@@ -1051,6 +1264,7 @@ async fn process_client_packet(
             tokio::spawn(async move {
                 db.delete_in_flight(cid, pid).await;
             });
+            state.drain_receive_maximum(session).await;
         }
         Packet::PubRec(pkt) => {
             let mut resend_pubrel = false;
@@ -1086,16 +1300,19 @@ async fn process_client_packet(
                         persisted.subscription_identifier,
                         serde_json::to_string(&persisted.properties)
                             .unwrap_or_else(|_| "{}".into()),
+                        persisted.enqueue_order,
                         persisted.delivery_started,
                         persisted.phase as u8,
                     )
                     .await;
             }
             if discard {
+                session.release_outbound_slot(pkt.packet_id);
                 let db = state.db.clone();
                 let cid = session.client_id.clone();
                 let pid = pkt.packet_id;
                 tokio::spawn(async move { db.delete_qos2_outgoing(cid, pid).await });
+                state.drain_receive_maximum(session).await;
             } else if resend_pubrel {
                 let pubrel = Packet::PubRel(PubAck {
                     packet_id: pkt.packet_id,
@@ -1143,12 +1360,14 @@ async fn process_client_packet(
             let _ = state.send_to_session(session, buf).await;
         }
         Packet::PubComp(pkt) => {
+            session.release_outbound_slot(pkt.packet_id);
             let removed = session.outgoing_qos2.write().remove(&pkt.packet_id);
             if removed.is_some() {
                 let db = state.db.clone();
                 let cid = session.client_id.clone();
                 let pid = pkt.packet_id;
                 tokio::spawn(async move { db.delete_qos2_outgoing(cid, pid).await });
+                state.drain_receive_maximum(session).await;
             }
         }
         Packet::PingReq => {

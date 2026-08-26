@@ -48,7 +48,7 @@ Status meanings:
 | Retain As Published | Implemented | Live RETAIN behavior follows subscription option. |
 | Retain Handling | Implemented | Values 0, 1 and 2. |
 | Shared subscriptions | Partial | Routing exists; fairness and broader edge-case conformance remain active work. |
-| UNSUBSCRIBE / UNSUBACK | Not yet | Session/router helper exists, but the full MQTT v5 control-packet path is not yet claimed. |
+| UNSUBSCRIBE / UNSUBACK | Implemented | Full MQTT v5 packet path, ordered per-filter reason codes, durable subscription deletion before UNSUBACK, and SIGKILL/restart recovery tests. |
 
 ## Negotiated limits and control-plane gaps
 
@@ -56,18 +56,18 @@ Status meanings:
 |---|---|---|
 | Authentication + ACL | Implemented (Pipistrelle policy) | Argon2id credentials, fail-closed auth and topic ACLs. |
 | Enhanced AUTH exchange | Not yet | CONNECT authentication-method state machine is not claimed complete. |
-| Receive Maximum enforcement | Partial / not claimed | Parsed capabilities do not yet constitute full bilateral flow-control enforcement. |
-| Maximum Packet Size enforcement | Partial / not claimed | Full negotiated inbound/outbound enforcement remains work. |
+| Receive Maximum enforcement | Implemented | Server advertises a configurable inbound limit; QoS1/2 inbound credits are held until PUBACK/PUBREC bytes are written. Peer Receive Maximum gates outbound QoS1/2 and preserves queue order across restart. |
+| Maximum Packet Size enforcement | Implemented | Oversized inbound packets are rejected from the fixed-header length before full buffering; outbound packets respect the client limit and CONNACK is reduced to a minimal legal form when needed. |
 | Topic Alias Maximum | Implemented as zero capability | Broker elects not to accept/send aliases currently. |
-| Server-assigned zero-length ClientID | Not yet claimed | Do not rely on automatic ClientID assignment. |
-| Strict MQTT UTF-8 rules | Partial | Rust UTF-8 decoding is present; the complete MQTT-specific forbidden-code-point matrix is not yet claimed. |
+| Server-assigned zero-length ClientID | Implemented | Empty CONNECT ClientID receives Assigned Client Identifier in CONNACK and can use it to resume a persistent Session. |
+| Strict MQTT UTF-8 rules | Implemented core rules | Rejects malformed UTF-8, U+0000, disallowed control/noncharacter code points; packet/filter tests cover malformed cases. Exhaustive external conformance/fuzz corpus remains separate work. |
 | Complete malformed-packet/error matrix | Partial | Important property/protocol errors are tested; full corpus/fuzz conformance remains work. |
 
 ## Test gates
 
 - `cargo test --all-targets --locked` — Rust codec/router/session tests.
 - `test_broker.py` — TCP, auth, ACL, TLS/PQC, WebSocket and metrics integration.
-- `test_protocol_v2.py` — raw MQTT v5 packet/state tests, including Application Message properties and Message Expiry.
-- `test_protocol_restart_v2.py` — **destructive local Docker test** which repeatedly sends `SIGKILL` to the broker and validates durable Wills, retained state and QoS1/QoS2 recovery.
+- `test_protocol_v2.py` — raw MQTT v5 packet/state tests, including Application Message properties, Message Expiry, UNSUBSCRIBE, negotiated limits, assigned ClientIDs, TCP-fragmented CONNECT, UTF-8 and varint errors.
+- `test_protocol_restart_v2.py` — **destructive local Docker test** which repeatedly sends `SIGKILL` to the broker and validates durable Wills, retained state, QoS1/QoS2 recovery, durable UNSUBSCRIBE and ordered Receive Maximum queues.
 
 The destructive suite must only be used on a development/test broker.

@@ -425,6 +425,41 @@ pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
     topics.next().is_none()
 }
 
+/// Validates MQTT v5 Topic Filter wildcard placement and Shared Subscription syntax.
+pub fn topic_filter_valid(topic_filter: &str) -> bool {
+    if topic_filter.is_empty() {
+        return false;
+    }
+    let filter = if let Some(rest) = topic_filter.strip_prefix("$share/") {
+        let Some((group, filter)) = rest.split_once('/') else {
+            return false;
+        };
+        if group.is_empty()
+            || group
+                .as_bytes()
+                .iter()
+                .any(|b| matches!(*b, b'/' | b'+' | b'#'))
+            || filter.is_empty()
+        {
+            return false;
+        }
+        filter
+    } else {
+        topic_filter
+    };
+
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (index, level) in levels.iter().enumerate() {
+        if level.as_bytes().contains(&b'#') && (*level != "#" || index + 1 != levels.len()) {
+            return false;
+        }
+        if level.as_bytes().contains(&b'+') && *level != "+" {
+            return false;
+        }
+    }
+    true
+}
+
 /// Parses Shared Subscription prefix `$share/group/topic_filter`.
 /// Returns (Some(group), topic_filter) or (None, topic_filter).
 fn parse_shared_subscription(topic_filter: &str) -> (Option<&str>, &str) {
@@ -489,6 +524,32 @@ mod tests {
         assert!(!router.has_only_exact_routes());
         assert!(router.unsubscribe("client2", "sensor/+"));
         assert!(router.has_only_exact_routes());
+    }
+
+    #[test]
+    fn topic_filter_validation_covers_wildcards_and_shared_syntax() {
+        for valid in [
+            "a/b",
+            "a/+",
+            "a/#",
+            "+/b",
+            "#",
+            "$share/g/a/+",
+            "$share/g/#",
+        ] {
+            assert!(topic_filter_valid(valid), "expected valid: {valid}");
+        }
+        for invalid in [
+            "",
+            "a#",
+            "a/#/b",
+            "a/+b",
+            "$share//a",
+            "$share/g/",
+            "$share/g+/a",
+        ] {
+            assert!(!topic_filter_valid(invalid), "expected invalid: {invalid}");
+        }
     }
 
     #[test]
