@@ -52,10 +52,19 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     queue_capacity_total,
                                     current_subscriptions,
                                     active_published_messages,
+                                    qos2_incoming_pending,
+                                    qos2_outgoing_pending,
+                                    persistent_sessions,
+                                    offline_persistent_sessions,
                                 ) = {
                                     let sessions = state.sessions.read();
+                                    let active_connections = sessions
+                                        .values()
+                                        .filter(|session| session.connected.load(Ordering::Acquire))
+                                        .count();
                                     let queued_messages = sessions
                                         .values()
+                                        .filter(|session| session.connected.load(Ordering::Acquire))
                                         .map(|session| {
                                             session
                                                 .sender
@@ -65,6 +74,7 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                         .sum::<usize>();
                                     let queue_capacity_total = sessions
                                         .values()
+                                        .filter(|session| session.connected.load(Ordering::Acquire))
                                         .map(|session| session.sender.max_capacity())
                                         .sum::<usize>();
                                     let current_subscriptions = sessions
@@ -77,12 +87,35 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                             session.published_messages.load(Ordering::Relaxed)
                                         })
                                         .sum::<u64>();
+                                    let qos2_incoming_pending = sessions
+                                        .values()
+                                        .map(|session| session.incoming_qos2.read().len())
+                                        .sum::<usize>();
+                                    let qos2_outgoing_pending = sessions
+                                        .values()
+                                        .map(|session| session.outgoing_qos2.read().len())
+                                        .sum::<usize>();
+                                    let persistent_sessions = sessions
+                                        .values()
+                                        .filter(|session| session.session_expiry() > 0)
+                                        .count();
+                                    let offline_persistent_sessions = sessions
+                                        .values()
+                                        .filter(|session| {
+                                            session.session_expiry() > 0
+                                                && !session.connected.load(Ordering::Acquire)
+                                        })
+                                        .count();
                                     (
-                                        sessions.len(),
+                                        active_connections,
                                         queued_messages,
                                         queue_capacity_total,
                                         current_subscriptions,
                                         active_published_messages,
+                                        qos2_incoming_pending,
+                                        qos2_outgoing_pending,
+                                        persistent_sessions,
+                                        offline_persistent_sessions,
                                     )
                                 };
                                 let (bridge_queued_messages, bridge_queue_capacity) = state
@@ -135,6 +168,11 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     / 1_000_000_000.0;
                                 let bridge_dropped =
                                     state.metrics_bridge_queue_dropped.load(Ordering::Relaxed);
+                                let retained_messages = state.retained.read().len();
+                                let session_takeovers =
+                                    state.metrics_session_takeovers.load(Ordering::Relaxed);
+                                let wills_published =
+                                    state.metrics_wills_published.load(Ordering::Relaxed);
 
                                 let mut body = String::with_capacity(8192);
                                 macro_rules! metric {
@@ -169,6 +207,59 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                     "pipistrelle_client_subscriptions_current {}",
                                     current_subscriptions
                                 );
+                                metric!(
+                                    "# HELP pipistrelle_retained_messages_current Retained MQTT messages currently stored"
+                                );
+                                metric!("# TYPE pipistrelle_retained_messages_current gauge");
+                                metric!(
+                                    "pipistrelle_retained_messages_current {}",
+                                    retained_messages
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_qos2_incoming_pending QoS 2 inbound flows waiting for PUBREL"
+                                );
+                                metric!("# TYPE pipistrelle_qos2_incoming_pending gauge");
+                                metric!(
+                                    "pipistrelle_qos2_incoming_pending {}",
+                                    qos2_incoming_pending
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_qos2_outgoing_pending QoS 2 outbound flows waiting for PUBREC or PUBCOMP"
+                                );
+                                metric!("# TYPE pipistrelle_qos2_outgoing_pending gauge");
+                                metric!(
+                                    "pipistrelle_qos2_outgoing_pending {}",
+                                    qos2_outgoing_pending
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_persistent_sessions_current MQTT sessions with non-zero expiry currently tracked"
+                                );
+                                metric!("# TYPE pipistrelle_persistent_sessions_current gauge");
+                                metric!(
+                                    "pipistrelle_persistent_sessions_current {}",
+                                    persistent_sessions
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_persistent_sessions_offline Persistent MQTT sessions currently offline"
+                                );
+                                metric!("# TYPE pipistrelle_persistent_sessions_offline gauge");
+                                metric!(
+                                    "pipistrelle_persistent_sessions_offline {}",
+                                    offline_persistent_sessions
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_session_takeovers_total ClientID takeovers completed with DISCONNECT 0x8E"
+                                );
+                                metric!("# TYPE pipistrelle_session_takeovers_total counter");
+                                metric!(
+                                    "pipistrelle_session_takeovers_total {}",
+                                    session_takeovers
+                                );
+                                metric!(
+                                    "# HELP pipistrelle_wills_published_total Last Will messages published by the broker"
+                                );
+                                metric!("# TYPE pipistrelle_wills_published_total counter");
+                                metric!("pipistrelle_wills_published_total {}", wills_published);
                                 metric!(
                                     "# HELP pipistrelle_tls_handshakes_total Successful TLS 1.3 handshakes by negotiated key exchange family"
                                 );
@@ -399,7 +490,7 @@ pub async fn start_metrics_server(port: u16, state: Arc<BrokerState>) {
                                 "200 OK",
                                 "application/json; charset=utf-8",
                                 format!(
-                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
+                                    "{{\"name\":\"pipistrelle\",\"version\":\"{}\",\"series\":\"{}\",\"mqtt\":\"5.0\",\"qos2\":true,\"retained_messages\":true,\"last_will\":true,\"persistent_sessions\":true,\"client_id_takeover\":true,\"tls\":\"1.3\",\"tls_profile\":\"{}\",\"pqc_kx\":\"X25519MLKEM768\",\"client_queue_capacity\":{},\"max_subscriptions_per_client\":{},\"slow_consumer_policy\":\"{}\",\"slow_consumer_timeout_ms\":{},\"bridge_queue_capacity\":{},\"bridge_queue_policy\":\"{}\",\"latency_sample_rate\":{},\"writer_batch_packets\":{},\"writer_batch_bytes\":{}}}\n",
                                     version::VERSION,
                                     version::SERIES,
                                     tls_profile.as_str(),

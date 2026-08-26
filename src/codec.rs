@@ -148,6 +148,9 @@ pub enum Packet<'a> {
     ConnAck(ConnAck<'a>),
     Publish(Publish<'a>),
     PubAck(PubAck<'a>),
+    PubRec(PubRec<'a>),
+    PubRel(PubRel<'a>),
+    PubComp(PubComp<'a>),
     Subscribe(Subscribe<'a>),
     SubAck(SubAck<'a>),
     PingReq,
@@ -162,6 +165,7 @@ pub struct Connect<'a> {
     pub clean_start: bool,
     pub username: Option<&'a str>,
     pub password: Option<&'a [u8]>,
+    pub will: Option<Will<'a>>,
     pub properties: ConnectProperties<'a>,
 }
 
@@ -176,6 +180,26 @@ pub struct ConnectProperties<'a> {
     pub user_properties: Vec<(&'a str, &'a str)>,
     pub auth_method: Option<&'a str>,
     pub auth_data: Option<&'a [u8]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Will<'a> {
+    pub qos: u8,
+    pub retain: bool,
+    pub topic: &'a str,
+    pub payload: &'a [u8],
+    pub properties: WillProperties<'a>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct WillProperties<'a> {
+    pub will_delay_interval: Option<u32>,
+    pub payload_format_indicator: Option<u8>,
+    pub message_expiry_interval: Option<u32>,
+    pub content_type: Option<&'a str>,
+    pub response_topic: Option<&'a str>,
+    pub correlation_data: Option<&'a [u8]>,
+    pub user_properties: Vec<(&'a str, &'a str)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -241,6 +265,10 @@ pub struct PubAckProperties<'a> {
     pub reason_string: Option<&'a str>,
     pub user_properties: Vec<(&'a str, &'a str)>,
 }
+
+pub type PubRec<'a> = PubAck<'a>;
+pub type PubRel<'a> = PubAck<'a>;
+pub type PubComp<'a> = PubAck<'a>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Subscribe<'a> {
@@ -594,6 +622,72 @@ impl<'a> PublishProperties<'a> {
     }
 }
 
+impl<'a> WillProperties<'a> {
+    pub fn decode(buf: &mut &'a [u8]) -> Result<Self, CodecError> {
+        let (prop_len, read) = decode_varint(buf)?;
+        *buf = &buf[read..];
+        if buf.len() < prop_len as usize {
+            return Err(CodecError::Incomplete);
+        }
+        let mut prop_slice = &buf[..prop_len as usize];
+        *buf = &buf[prop_len as usize..];
+        let mut props = WillProperties::default();
+        while !prop_slice.is_empty() {
+            let prop_id = read_u8(&mut prop_slice)?;
+            match prop_id {
+                0x18 => props.will_delay_interval = Some(read_u32(&mut prop_slice)?),
+                0x01 => props.payload_format_indicator = Some(read_u8(&mut prop_slice)?),
+                0x02 => props.message_expiry_interval = Some(read_u32(&mut prop_slice)?),
+                0x03 => props.content_type = Some(read_str(&mut prop_slice)?),
+                0x08 => props.response_topic = Some(read_str(&mut prop_slice)?),
+                0x09 => props.correlation_data = Some(read_bytes(&mut prop_slice)?),
+                0x26 => {
+                    let key = read_str(&mut prop_slice)?;
+                    let value = read_str(&mut prop_slice)?;
+                    props.user_properties.push((key, value));
+                }
+                _ => return Err(CodecError::MalformedPacket),
+            }
+        }
+        Ok(props)
+    }
+
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        let mut props = Vec::new();
+        if let Some(value) = self.will_delay_interval {
+            props.push(0x18);
+            props.extend_from_slice(&value.to_be_bytes());
+        }
+        if let Some(value) = self.payload_format_indicator {
+            props.push(0x01);
+            props.push(value);
+        }
+        if let Some(value) = self.message_expiry_interval {
+            props.push(0x02);
+            props.extend_from_slice(&value.to_be_bytes());
+        }
+        if let Some(value) = self.content_type {
+            props.push(0x03);
+            write_str(value, &mut props);
+        }
+        if let Some(value) = self.response_topic {
+            props.push(0x08);
+            write_str(value, &mut props);
+        }
+        if let Some(value) = self.correlation_data {
+            props.push(0x09);
+            write_bytes(value, &mut props);
+        }
+        for (key, value) in &self.user_properties {
+            props.push(0x26);
+            write_str(key, &mut props);
+            write_str(value, &mut props);
+        }
+        encode_varint(props.len() as u32, buf);
+        buf.extend_from_slice(&props);
+    }
+}
+
 impl<'a> PubAckProperties<'a> {
     pub fn decode(buf: &mut &'a [u8]) -> Result<Self, CodecError> {
         let mut props = PubAckProperties::default();
@@ -843,29 +937,37 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
             let connect_flags = read_u8(&mut payload)?;
             let keep_alive = read_u16(&mut payload)?;
 
+            if connect_flags & 0x01 != 0 {
+                return Err(CodecError::MalformedPacket);
+            }
             let clean_start = (connect_flags & 0x02) != 0;
             let has_will = (connect_flags & 0x04) != 0;
-            let _will_qos = (connect_flags & 0x18) >> 3;
-            let _will_retain = (connect_flags & 0x20) != 0;
+            let will_qos = (connect_flags & 0x18) >> 3;
+            let will_retain = (connect_flags & 0x20) != 0;
             let has_username = (connect_flags & 0x80) != 0;
             let has_password = (connect_flags & 0x40) != 0;
+            if (!has_will && (will_qos != 0 || will_retain)) || will_qos == 3 {
+                return Err(CodecError::MalformedPacket);
+            }
 
             let properties = ConnectProperties::decode(&mut payload)?;
 
             let client_id = read_str(&mut payload)?;
 
-            // If Will is present, it would be decoded here. Skipping for MVP, but payload pointer would advance.
-            if has_will {
-                // Will properties length
-                let (will_props_len, read) = decode_varint(payload)?;
-                payload = &payload[read + will_props_len as usize..];
-                // Will Topic
-                let will_topic_len = read_u16(&mut payload)? as usize;
-                payload = &payload[will_topic_len..];
-                // Will Payload
-                let will_payload_len = read_u16(&mut payload)? as usize;
-                payload = &payload[will_payload_len..];
-            }
+            let will = if has_will {
+                let will_properties = WillProperties::decode(&mut payload)?;
+                let will_topic = read_str(&mut payload)?;
+                let will_payload = read_bytes(&mut payload)?;
+                Some(Will {
+                    qos: will_qos,
+                    retain: will_retain,
+                    topic: will_topic,
+                    payload: will_payload,
+                    properties: will_properties,
+                })
+            } else {
+                None
+            };
 
             let mut username = None;
             if has_username {
@@ -884,6 +986,7 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
                     clean_start,
                     username,
                     password,
+                    will,
                     properties,
                 }),
                 total_read,
@@ -936,27 +1039,33 @@ pub fn decode_packet<'a>(mut raw_buf: &'a [u8]) -> Result<(Packet<'a>, usize), C
                 total_read,
             ))
         }
-        4 => {
-            // PUBACK
+        4 | 5 | 6 | 7 => {
+            let expected_flags = if packet_type == 6 { 0x02 } else { 0x00 };
+            if flags != expected_flags {
+                return Err(CodecError::MalformedPacket);
+            }
             let packet_id = read_u16(&mut payload)?;
-            let mut reason_code = 0; // Default: Success
+            let mut reason_code = 0;
             let mut properties = PubAckProperties::default();
-
             if !payload.is_empty() {
                 reason_code = read_u8(&mut payload)?;
                 if !payload.is_empty() {
                     properties = PubAckProperties::decode(&mut payload)?;
                 }
             }
-
-            Ok((
-                Packet::PubAck(PubAck {
-                    packet_id,
-                    reason_code,
-                    properties,
-                }),
-                total_read,
-            ))
+            let ack = PubAck {
+                packet_id,
+                reason_code,
+                properties,
+            };
+            let packet = match packet_type {
+                4 => Packet::PubAck(ack),
+                5 => Packet::PubRec(ack),
+                6 => Packet::PubRel(ack),
+                7 => Packet::PubComp(ack),
+                _ => unreachable!(),
+            };
+            Ok((packet, total_read))
         }
         8 => {
             // SUBSCRIBE
@@ -1098,6 +1207,13 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
             if pkt.clean_start {
                 connect_flags |= 0x02;
             }
+            if let Some(will) = &pkt.will {
+                connect_flags |= 0x04;
+                connect_flags |= (will.qos & 0x03) << 3;
+                if will.retain {
+                    connect_flags |= 0x20;
+                }
+            }
             if pkt.username.is_some() {
                 connect_flags |= 0x80;
             }
@@ -1110,6 +1226,11 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
             pkt.properties.encode(&mut payload);
             write_str(pkt.client_id, &mut payload);
 
+            if let Some(will) = &pkt.will {
+                will.properties.encode(&mut payload);
+                write_str(will.topic, &mut payload);
+                write_bytes(will.payload, &mut payload);
+            }
             if let Some(user) = pkt.username {
                 write_str(user, &mut payload);
             }
@@ -1141,12 +1262,24 @@ pub fn encode_packet(packet: &Packet, buf: &mut Vec<u8>) {
             pkt.properties.encode(&mut payload);
             payload.extend_from_slice(pkt.payload);
         }
-        Packet::PubAck(pkt) => {
-            fixed_header_byte = 4 << 4;
+        Packet::PubAck(pkt) | Packet::PubRec(pkt) | Packet::PubComp(pkt) => {
+            fixed_header_byte = match packet {
+                Packet::PubAck(_) => 4 << 4,
+                Packet::PubRec(_) => 5 << 4,
+                Packet::PubComp(_) => 7 << 4,
+                _ => unreachable!(),
+            };
             write_u16(pkt.packet_id, &mut payload);
-
-            // Only encode reason code and properties if properties are not empty,
-            // or if reason code is not Success (0x00)
+            let has_props = pkt.properties.reason_string.is_some()
+                || !pkt.properties.user_properties.is_empty();
+            if has_props || pkt.reason_code != 0 {
+                payload.push(pkt.reason_code);
+                pkt.properties.encode(&mut payload);
+            }
+        }
+        Packet::PubRel(pkt) => {
+            fixed_header_byte = (6 << 4) | 0x02;
+            write_u16(pkt.packet_id, &mut payload);
             let has_props = pkt.properties.reason_string.is_some()
                 || !pkt.properties.user_properties.is_empty();
             if has_props || pkt.reason_code != 0 {
@@ -1207,6 +1340,7 @@ mod tests {
             clean_start: true,
             username: Some("admin"),
             password: Some(b"secret123"),
+            will: None,
             properties: ConnectProperties {
                 session_expiry_interval: Some(3600),
                 receive_maximum: Some(100),
@@ -1222,6 +1356,67 @@ mod tests {
         let (decoded, bytes_read) = decode_packet(&buf).unwrap();
         assert_eq!(bytes_read, buf.len());
         assert_eq!(decoded, connect_pkt);
+    }
+
+    #[test]
+    fn test_connect_with_will_roundtrip() {
+        let packet = Packet::Connect(Connect {
+            client_id: "will-client",
+            keep_alive: 30,
+            clean_start: false,
+            username: Some("admin"),
+            password: Some(b"admin123"),
+            will: Some(Will {
+                qos: 2,
+                retain: true,
+                topic: "status/device",
+                payload: b"offline",
+                properties: WillProperties {
+                    will_delay_interval: Some(5),
+                    content_type: Some("text/plain"),
+                    ..Default::default()
+                },
+            }),
+            properties: ConnectProperties {
+                session_expiry_interval: Some(30),
+                ..Default::default()
+            },
+        });
+        let mut buf = Vec::new();
+        encode_packet(&packet, &mut buf);
+        let (decoded, used) = decode_packet(&buf).unwrap();
+        assert_eq!(used, buf.len());
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn test_qos2_ack_roundtrip_and_pubrel_flags() {
+        for packet in [
+            Packet::PubRec(PubAck {
+                packet_id: 7,
+                reason_code: 0,
+                properties: Default::default(),
+            }),
+            Packet::PubRel(PubAck {
+                packet_id: 7,
+                reason_code: 0,
+                properties: Default::default(),
+            }),
+            Packet::PubComp(PubAck {
+                packet_id: 7,
+                reason_code: 0,
+                properties: Default::default(),
+            }),
+        ] {
+            let mut buf = Vec::new();
+            encode_packet(&packet, &mut buf);
+            if matches!(packet, Packet::PubRel(_)) {
+                assert_eq!(buf[0], 0x62);
+            }
+            let (decoded, used) = decode_packet(&buf).unwrap();
+            assert_eq!(used, buf.len());
+            assert_eq!(decoded, packet);
+        }
     }
 
     #[test]

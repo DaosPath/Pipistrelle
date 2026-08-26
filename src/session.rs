@@ -1,14 +1,14 @@
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::codec::{Packet, Publish, PublishProperties, encode_packet, encode_publish_qos0};
 use crate::latency::LatencyHistogram;
-use crate::router::TopicRouter;
+use crate::router::{TopicRouter, topic_matches_filter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlowConsumerPolicy {
@@ -70,6 +70,60 @@ pub struct InFlightMessage {
     pub sent_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct RetainedMessage {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct IncomingQos2Message {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub retain: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutgoingQos2Phase {
+    AwaitPubRec = 0,
+    AwaitPubComp = 1,
+}
+
+impl OutgoingQos2Phase {
+    fn from_db(value: u8) -> Self {
+        if value == 1 {
+            Self::AwaitPubComp
+        } else {
+            Self::AwaitPubRec
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutgoingQos2Message {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub retain: bool,
+    pub subscription_identifier: Option<u32>,
+    pub phase: OutgoingQos2Phase,
+}
+
+#[derive(Debug, Clone)]
+pub struct WillMessage {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+    pub retain: bool,
+    pub delay_interval: u32,
+}
+
+#[derive(Clone)]
+struct PendingWill {
+    cancel: Arc<AtomicBool>,
+    message: WillMessage,
+}
+
 /// Represents an active or offline client session
 pub struct ClientSession {
     pub client_id: String,
@@ -78,8 +132,10 @@ pub struct ClientSession {
     pub allow_all_read: bool,
     pub allow_all_write: bool,
     pub keep_alive: u16,
-    pub session_expiry_interval: u32,
+    pub session_expiry_interval: AtomicU32,
     pub last_activity: RwLock<Instant>,
+    pub connected: AtomicBool,
+    pub will: RwLock<Option<WillMessage>>,
 
     // Channel to send raw serialized bytes to the client's TCP writer task
     pub sender: mpsc::Sender<Vec<u8>>,
@@ -96,6 +152,8 @@ pub struct ClientSession {
     // QoS 1/2 state
     next_packet_id: AtomicU16,
     pub in_flight: RwLock<HashMap<u16, InFlightMessage>>,
+    pub incoming_qos2: RwLock<HashMap<u16, IncomingQos2Message>>,
+    pub outgoing_qos2: RwLock<HashMap<u16, OutgoingQos2Message>>,
 
     // Slow-consumer cancellation path
     disconnect_requested: AtomicBool,
@@ -120,14 +178,18 @@ impl ClientSession {
             allow_all_read,
             allow_all_write,
             keep_alive,
-            session_expiry_interval,
+            session_expiry_interval: AtomicU32::new(session_expiry_interval),
             last_activity: RwLock::new(Instant::now()),
+            connected: AtomicBool::new(true),
+            will: RwLock::new(None),
             sender,
             topic_aliases: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashSet::new()),
             published_messages: AtomicU64::new(0),
             next_packet_id: AtomicU16::new(1),
             in_flight: RwLock::new(HashMap::new()),
+            incoming_qos2: RwLock::new(HashMap::new()),
+            outgoing_qos2: RwLock::new(HashMap::new()),
             disconnect_requested: AtomicBool::new(false),
             disconnect_notify: Notify::new(),
         }
@@ -181,11 +243,27 @@ impl ClientSession {
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.read().len()
     }
+
+    pub fn session_expiry(&self) -> u32 {
+        self.session_expiry_interval.load(Ordering::Acquire)
+    }
+
+    pub fn set_session_expiry(&self, value: u32) {
+        self.session_expiry_interval.store(value, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeOutcome {
+    pub accepted: bool,
+    pub is_new: bool,
 }
 
 /// Global shared state of the Pipistrelle broker
 pub struct BrokerState {
     pub router: TopicRouter,
+    pub retained: RwLock<HashMap<String, RetainedMessage>>,
+    pending_wills: RwLock<HashMap<String, PendingWill>>,
     // Client ID -> Active session reference
     pub sessions: RwLock<HashMap<String, Arc<ClientSession>>>,
     // Auth and ACL engine
@@ -203,6 +281,8 @@ pub struct BrokerState {
     pub metrics_client_queue_backpressure_wait_ns: AtomicU64,
     pub metrics_slow_consumer_disconnects: AtomicUsize,
     pub metrics_subscription_quota_rejections: AtomicUsize,
+    pub metrics_session_takeovers: AtomicUsize,
+    pub metrics_wills_published: AtomicUsize,
     pub metrics_bridge_queue_backpressure_events: AtomicUsize,
     pub metrics_bridge_queue_backpressure_wait_ns: AtomicU64,
     pub metrics_bridge_queue_dropped: AtomicUsize,
@@ -290,6 +370,8 @@ impl BrokerState {
 
         Self {
             router: TopicRouter::new(),
+            retained: RwLock::new(HashMap::new()),
+            pending_wills: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             auth: crate::config::AuthConfig::load(),
             db: Arc::new(crate::persistence::Persistence::new()),
@@ -302,6 +384,8 @@ impl BrokerState {
             metrics_client_queue_backpressure_wait_ns: AtomicU64::new(0),
             metrics_slow_consumer_disconnects: AtomicUsize::new(0),
             metrics_subscription_quota_rejections: AtomicUsize::new(0),
+            metrics_session_takeovers: AtomicUsize::new(0),
+            metrics_wills_published: AtomicUsize::new(0),
             metrics_bridge_queue_backpressure_events: AtomicUsize::new(0),
             metrics_bridge_queue_backpressure_wait_ns: AtomicU64::new(0),
             metrics_bridge_queue_dropped: AtomicUsize::new(0),
@@ -321,32 +405,75 @@ impl BrokerState {
     }
 
     /// Restores all sessions, subscriptions, and in-flight messages from SQLite DB on boot.
-    pub async fn restore_sessions_from_db(&self) {
+    pub async fn restore_sessions_from_db(self: &Arc<Self>) {
         info!("Restoring persistent state from database...");
 
-        // 1. Restore sessions
+        // 1. Restore sessions and reconstruct the remaining Session Expiry timers.
+        // A row marked connected means the broker stopped while the network connection
+        // was active; the Session Expiry countdown therefore starts at this restart.
+        let mut restored_expiry_timers: Vec<(Arc<ClientSession>, Duration)> = Vec::new();
         match self.db.load_all_sessions().await {
             Ok(sessions_loaded) => {
-                let mut sessions_guard = self.sessions.write();
-                for (client_id, username, clean_start, expiry) in sessions_loaded {
-                    // Create offline session with dummy sender channel (replaced when client reconnects)
-                    let (tx, _) = mpsc::channel::<Vec<u8>>(self.client_queue_capacity);
-                    let auth_username = username.as_deref().unwrap_or("");
-                    let allow_all_read = self.auth.authorizes_all(auth_username, "read");
-                    let allow_all_write = self.auth.authorizes_all(auth_username, "write");
-                    let session = Arc::new(ClientSession::new(
-                        client_id.clone(),
-                        username,
-                        clean_start,
-                        allow_all_read,
-                        allow_all_write,
-                        0, // keep-alive is 0 while offline
-                        expiry,
-                        tx,
-                    ));
-                    sessions_guard.insert(client_id, session);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut expired_ids = Vec::new();
+                let mut crashed_active_ids = Vec::new();
+                {
+                    let mut sessions_guard = self.sessions.write();
+                    for (client_id, username, clean_start, expiry, last_activity, was_connected) in
+                        sessions_loaded
+                    {
+                        if expiry == 0 {
+                            expired_ids.push(client_id);
+                            continue;
+                        }
+                        let remaining = if expiry == u32::MAX {
+                            None
+                        } else if was_connected {
+                            Some(expiry as u64)
+                        } else {
+                            let elapsed = now.saturating_sub(last_activity);
+                            if elapsed >= expiry as u64 {
+                                expired_ids.push(client_id);
+                                continue;
+                            }
+                            Some(expiry as u64 - elapsed)
+                        };
+
+                        let (tx, _) = mpsc::channel::<Vec<u8>>(self.client_queue_capacity);
+                        let auth_username = username.as_deref().unwrap_or("");
+                        let allow_all_read = self.auth.authorizes_all(auth_username, "read");
+                        let allow_all_write = self.auth.authorizes_all(auth_username, "write");
+                        let session = Arc::new(ClientSession::new(
+                            client_id.clone(),
+                            username,
+                            clean_start,
+                            allow_all_read,
+                            allow_all_write,
+                            0,
+                            expiry,
+                            tx,
+                        ));
+                        session.connected.store(false, Ordering::Release);
+                        if let Some(seconds) = remaining {
+                            restored_expiry_timers
+                                .push((session.clone(), Duration::from_secs(seconds)));
+                        }
+                        if was_connected {
+                            crashed_active_ids.push(client_id.clone());
+                        }
+                        sessions_guard.insert(client_id, session);
+                    }
+                    info!("Restored {} session(s) from database", sessions_guard.len());
                 }
-                info!("Restored {} session(s) from database", sessions_guard.len());
+                for client_id in crashed_active_ids {
+                    self.db.mark_session_offline(client_id).await;
+                }
+                for client_id in expired_ids {
+                    self.db.delete_session(client_id).await;
+                }
             }
             Err(e) => {
                 error!("Failed to load sessions from database: {:?}", e);
@@ -356,12 +483,18 @@ impl BrokerState {
         // 2. Restore subscriptions
         match self.db.load_all_subscriptions().await {
             Ok(subs_loaded) => {
-                for (client_id, topic_filter, qos, sub_id) in subs_loaded {
+                for (client_id, topic_filter, qos, sub_id, options) in subs_loaded {
                     if let Some(session) = self.sessions.read().get(&client_id).cloned() {
                         session.subscriptions.write().insert(topic_filter.clone());
                     }
-                    self.router
-                        .subscribe(&client_id, &topic_filter, qos, sub_id);
+                    self.router.subscribe_with_options(
+                        &client_id,
+                        &topic_filter,
+                        qos,
+                        sub_id,
+                        options & 0x04 != 0,
+                        options & 0x08 != 0,
+                    );
                 }
                 info!("Restored subscriptions from database");
             }
@@ -387,73 +520,297 @@ impl BrokerState {
                 error!("Failed to load in-flight messages from database: {:?}", e);
             }
         }
+
+        match self.db.load_retained().await {
+            Ok(messages) => {
+                let mut retained = self.retained.write();
+                for (topic, payload, qos) in messages {
+                    retained.insert(
+                        topic.clone(),
+                        RetainedMessage {
+                            topic,
+                            payload,
+                            qos,
+                        },
+                    );
+                }
+                info!(
+                    "Restored {} retained message(s) from database",
+                    retained.len()
+                );
+            }
+            Err(e) => error!("Failed to load retained messages: {:?}", e),
+        }
+
+        match self.db.load_qos2_incoming().await {
+            Ok(messages) => {
+                let sessions = self.sessions.read();
+                for (client_id, packet_id, topic, payload, retain) in messages {
+                    if let Some(session) = sessions.get(&client_id) {
+                        session.incoming_qos2.write().insert(
+                            packet_id,
+                            IncomingQos2Message {
+                                topic,
+                                payload,
+                                retain,
+                            },
+                        );
+                    }
+                }
+            }
+            Err(e) => error!("Failed to restore inbound QoS2 state: {:?}", e),
+        }
+
+        match self.db.load_qos2_outgoing().await {
+            Ok(messages) => {
+                let sessions = self.sessions.read();
+                for (
+                    client_id,
+                    packet_id,
+                    topic,
+                    payload,
+                    retain,
+                    subscription_identifier,
+                    phase,
+                ) in messages
+                {
+                    if let Some(session) = sessions.get(&client_id) {
+                        session.outgoing_qos2.write().insert(
+                            packet_id,
+                            OutgoingQos2Message {
+                                topic,
+                                payload,
+                                retain,
+                                subscription_identifier,
+                                phase: OutgoingQos2Phase::from_db(phase),
+                            },
+                        );
+                    }
+                }
+            }
+            Err(e) => error!("Failed to restore outbound QoS2 state: {:?}", e),
+        }
+
+        for (session, delay) in restored_expiry_timers {
+            self.schedule_session_expiry_after(session, delay);
+        }
     }
 
-    /// Registers a new client session, replacing any existing active session for the same client ID.
-    pub fn register_session(&self, session: Arc<ClientSession>) {
-        let mut sessions = self.sessions.write();
+    pub fn existing_session(&self, client_id: &str) -> Option<Arc<ClientSession>> {
+        self.sessions.read().get(client_id).cloned()
+    }
 
+    pub fn inherit_persistent_state(&self, target: &ClientSession, source: &ClientSession) {
+        *target.subscriptions.write() = source.subscriptions.read().clone();
+        *target.in_flight.write() = source.in_flight.read().clone();
+        *target.incoming_qos2.write() = source.incoming_qos2.read().clone();
+        *target.outgoing_qos2.write() = source.outgoing_qos2.read().clone();
+    }
+
+    /// Registers the network connection/session object that is current for this ClientID.
+    pub async fn register_session(&self, session: Arc<ClientSession>) {
         let client_id = session.client_id.clone();
         let username = session.username.clone();
         let clean_start = session.clean_start;
-        let expiry = session.session_expiry_interval;
+        let expiry = session.session_expiry_interval.load(Ordering::Acquire);
 
-        if let Some(old) = sessions.insert(client_id.clone(), session.clone()) {
+        {
+            let mut sessions = self.sessions.write();
+            if let Some(old) = sessions.insert(client_id.clone(), session.clone()) {
+                let retired = old.published_messages.load(Ordering::Relaxed);
+                self.metrics_messages_published_retired
+                    .fetch_add(retired, Ordering::Relaxed);
+                info!("Replacing session object for client: {}", old.client_id);
+            }
+        }
+
+        // Persist the current connection before CONNACK. This avoids a fast
+        // disconnect racing an older background save and resurrecting connected=1.
+        if expiry > 0 {
+            self.db
+                .save_session(client_id, username, clean_start, expiry)
+                .await;
+        }
+    }
+
+    /// Discards all session state, used by Clean Start before a replacement is installed.
+    pub async fn discard_session_state(&self, client_id: &str) {
+        if let Some(old) = self.sessions.write().remove(client_id) {
             let retired = old.published_messages.load(Ordering::Relaxed);
             self.metrics_messages_published_retired
                 .fetch_add(retired, Ordering::Relaxed);
-            info!("Replacing existing session for client: {}", old.client_id);
         }
+        self.router.remove_client(client_id);
+        if let Some(pending) = self.pending_wills.write().remove(client_id) {
+            pending.cancel.store(true, Ordering::Release);
+        }
+        self.db.delete_session(client_id.to_string()).await;
+    }
 
-        // Persist session if it's persistent (session expiry > 0)
-        if expiry > 0 {
-            let db = self.db.clone();
-            tokio::spawn(async move {
-                db.save_session(client_id, username, clean_start, expiry)
-                    .await;
-            });
+    /// Marks a connection offline only if it is still the current object for this ClientID.
+    /// This prevents an old taken-over connection from deleting its replacement.
+    pub async fn disconnect_session_if_current(&self, session: &Arc<ClientSession>) -> bool {
+        let delete_persistent_row = {
+            let mut sessions = self.sessions.write();
+            let Some(current) = sessions.get(&session.client_id) else {
+                return false;
+            };
+            if !Arc::ptr_eq(current, session) {
+                return false;
+            }
+
+            session.connected.store(false, Ordering::Release);
+            if session.session_expiry_interval.load(Ordering::Acquire) == 0 {
+                sessions.remove(&session.client_id);
+                let retired = session.published_messages.load(Ordering::Relaxed);
+                self.metrics_messages_published_retired
+                    .fetch_add(retired, Ordering::Relaxed);
+                self.router.remove_client(&session.client_id);
+                true
+            } else {
+                false
+            }
+        };
+        if delete_persistent_row {
+            self.db.delete_session(session.client_id.clone()).await;
+        } else {
+            self.db
+                .mark_session_offline(session.client_id.clone())
+                .await;
+        }
+        true
+    }
+
+    pub fn cancel_pending_will(&self, client_id: &str) -> bool {
+        if let Some(pending) = self.pending_wills.write().remove(client_id) {
+            pending.cancel.store(true, Ordering::Release);
+            true
+        } else {
+            false
         }
     }
 
-    /// Removes a client session (e.g. on clean disconnect or session expiration)
-    pub fn remove_session(&self, client_id: &str) {
-        let mut sessions = self.sessions.write();
-        if let Some(session) = sessions.remove(client_id) {
-            let retired = session.published_messages.load(Ordering::Relaxed);
-            self.metrics_messages_published_retired
-                .fetch_add(retired, Ordering::Relaxed);
-            info!("Removed session for client: {}", client_id);
-
-            // A clean/non-persistent session must leave no routing state behind.
-            if session.clean_start || session.session_expiry_interval == 0 {
-                let removed = self.router.remove_client(client_id);
-                if removed > 0 {
-                    debug!(
-                        "Removed {} subscription(s) for disconnected client {}",
-                        removed, client_id
-                    );
-                }
-                let db = self.db.clone();
-                let cid = client_id.to_string();
-                tokio::spawn(async move {
-                    db.delete_session(cid).await;
-                });
-            }
+    pub async fn publish_will_now(&self, message: WillMessage) {
+        self.metrics_wills_published.fetch_add(1, Ordering::Relaxed);
+        if message.retain {
+            self.update_retained(&message.topic, &message.payload, message.qos);
         }
+        let sequence = self
+            .metrics_messages_published_retired
+            .fetch_add(1, Ordering::Relaxed);
+        self.route_publish(
+            "__pipistrelle_will__",
+            &message.topic,
+            &message.payload,
+            message.qos,
+            message.retain,
+            sequence,
+        )
+        .await;
+    }
+
+    pub async fn publish_pending_will_now(self: &Arc<Self>, client_id: &str) -> bool {
+        let pending = self.pending_wills.write().remove(client_id);
+        if let Some(pending) = pending {
+            pending.cancel.store(true, Ordering::Release);
+            self.publish_will_now(pending.message).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn schedule_session_expiry(self: &Arc<Self>, session: Arc<ClientSession>) {
+        let expiry = session.session_expiry();
+        if expiry == 0 || expiry == u32::MAX {
+            return;
+        }
+        self.schedule_session_expiry_after(session, Duration::from_secs(expiry as u64));
+    }
+
+    fn schedule_session_expiry_after(
+        self: &Arc<Self>,
+        session: Arc<ClientSession>,
+        delay: Duration,
+    ) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let still_current_offline = {
+                let sessions = state.sessions.read();
+                sessions
+                    .get(&session.client_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &session))
+                    && !session.connected.load(Ordering::Acquire)
+            };
+            if !still_current_offline {
+                return;
+            }
+            let _ = state.publish_pending_will_now(&session.client_id).await;
+            state.discard_session_state(&session.client_id).await;
+        });
+    }
+
+    pub fn schedule_will(
+        self: &Arc<Self>,
+        client_id: String,
+        message: WillMessage,
+        session_expiry_interval: u32,
+    ) {
+        let delay = if session_expiry_interval == 0 {
+            0
+        } else if message.delay_interval == 0 {
+            0
+        } else {
+            message.delay_interval.min(session_expiry_interval)
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(old) = self.pending_wills.write().insert(
+            client_id.clone(),
+            PendingWill {
+                cancel: cancel.clone(),
+                message: message.clone(),
+            },
+        ) {
+            old.cancel.store(true, Ordering::Release);
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_secs(delay as u64)).await;
+            }
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let should_publish = {
+                let mut pending = state.pending_wills.write();
+                match pending.get(&client_id) {
+                    Some(current) if Arc::ptr_eq(&current.cancel, &cancel) => {
+                        pending.remove(&client_id);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if should_publish && !cancel.load(Ordering::Acquire) {
+                state.publish_will_now(message).await;
+            }
+        });
     }
 
     /// Processes a subscription request and enforces the per-client quota.
-    /// Returns false when the client has exhausted its subscription allowance.
     pub fn subscribe(
         &self,
         client_id: &str,
         topic_filter: &str,
         qos: u8,
         subscription_identifier: Option<u32>,
-    ) -> bool {
+        options: u8,
+    ) -> SubscribeOutcome {
+        let mut is_new = true;
         if let Some(session) = self.sessions.read().get(client_id).cloned() {
             let mut subscriptions = session.subscriptions.write();
-            let is_new = !subscriptions.contains(topic_filter);
+            is_new = !subscriptions.contains(topic_filter);
             if is_new && subscriptions.len() >= self.max_subscriptions_per_client {
                 self.metrics_subscription_quota_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -461,27 +818,88 @@ impl BrokerState {
                     "Client {} exceeded subscription quota ({})",
                     client_id, self.max_subscriptions_per_client
                 );
-                return false;
+                return SubscribeOutcome {
+                    accepted: false,
+                    is_new,
+                };
             }
             subscriptions.insert(topic_filter.to_string());
         }
 
         self.metrics_subscriptions.fetch_add(1, Ordering::Relaxed);
-        self.router
-            .subscribe(client_id, topic_filter, qos, subscription_identifier);
+        self.router.subscribe_with_options(
+            client_id,
+            topic_filter,
+            qos,
+            subscription_identifier,
+            options & 0x04 != 0,
+            options & 0x08 != 0,
+        );
         debug!(
-            "Client {} subscribed to {} with QoS {}",
-            client_id, topic_filter, qos
+            "Client {} subscribed to {} with QoS {} options=0x{:02x}",
+            client_id, topic_filter, qos, options
         );
 
         let db = self.db.clone();
         let cid = client_id.to_string();
         let filter = topic_filter.to_string();
         tokio::spawn(async move {
-            db.save_subscription(cid, filter, qos, subscription_identifier)
+            db.save_subscription(cid, filter, qos, subscription_identifier, options)
                 .await;
         });
-        true
+        SubscribeOutcome {
+            accepted: true,
+            is_new,
+        }
+    }
+
+    pub async fn send_retained_for_subscription(
+        &self,
+        session: &ClientSession,
+        topic_filter: &str,
+        granted_qos: u8,
+        subscription_identifier: Option<u32>,
+    ) {
+        let messages: Vec<RetainedMessage> = self
+            .retained
+            .read()
+            .values()
+            .filter(|message| topic_matches_filter(&message.topic, topic_filter))
+            .cloned()
+            .collect();
+        for message in messages {
+            let qos = message.qos.min(granted_qos);
+            self.send_publish_to_client(
+                &session.client_id,
+                &message.topic,
+                &message.payload,
+                qos,
+                true,
+                subscription_identifier,
+            )
+            .await;
+        }
+    }
+
+    pub fn update_retained(&self, topic: &str, payload: &[u8], qos: u8) {
+        let db = self.db.clone();
+        if payload.is_empty() {
+            self.retained.write().remove(topic);
+            let topic = topic.to_string();
+            tokio::spawn(async move { db.delete_retained(topic).await });
+        } else {
+            self.retained.write().insert(
+                topic.to_string(),
+                RetainedMessage {
+                    topic: topic.to_string(),
+                    payload: payload.to_vec(),
+                    qos,
+                },
+            );
+            let topic = topic.to_string();
+            let payload = payload.to_vec();
+            tokio::spawn(async move { db.save_retained(topic, payload, qos).await });
+        }
     }
 
     /// Processes unsubscription request
@@ -506,7 +924,7 @@ impl BrokerState {
 
     pub async fn route_publish(
         &self,
-        _from_client: &str,
+        from_client: &str,
         topic: &str,
         payload: &[u8],
         qos: u8,
@@ -529,7 +947,7 @@ impl BrokerState {
         // The remote bridge is isolated behind its own bounded queue. Only topics
         // matching the bridge prefix are queued, so unrelated traffic never pays
         // for a slow or disconnected remote broker.
-        if _from_client != "bridge_client" {
+        if from_client != "bridge_client" {
             let bridge = self.bridge_sender.read().clone();
             if let Some(bridge) = bridge {
                 if topic.starts_with(bridge.topic_prefix.as_ref()) {
@@ -565,12 +983,15 @@ impl BrokerState {
         if self.router.has_only_exact_routes() {
             if let Some(subscriptions) = self.router.match_exact(topic) {
                 for sub in subscriptions.iter() {
+                    if sub.no_local && sub.client_id == from_client {
+                        continue;
+                    }
                     self.send_publish_to_client(
                         &sub.client_id,
                         topic,
                         payload,
-                        qos,
-                        retain,
+                        qos.min(sub.qos),
+                        retain && sub.retain_as_published,
                         sub.subscription_identifier,
                     )
                     .await;
@@ -585,12 +1006,15 @@ impl BrokerState {
         let route = self.router.match_topic(topic);
 
         for sub in route.normal {
+            if sub.no_local && sub.client_id == from_client {
+                continue;
+            }
             self.send_publish_to_client(
                 &sub.client_id,
                 topic,
                 payload,
-                qos,
-                retain,
+                qos.min(sub.qos),
+                retain && sub.retain_as_published,
                 sub.subscription_identifier,
             )
             .await;
@@ -618,8 +1042,8 @@ impl BrokerState {
                 &selected_sub.client_id,
                 topic,
                 payload,
-                qos,
-                retain,
+                qos.min(selected_sub.qos),
+                retain && selected_sub.retain_as_published,
                 selected_sub.subscription_identifier,
             )
             .await;
@@ -696,17 +1120,38 @@ impl BrokerState {
         if let Some(session) = session {
             let packet_id = if qos > 0 {
                 let pid = session.get_next_packet_id();
-                session.add_in_flight(pid, topic, payload, qos);
-
-                // Persist the in-flight QoS 1 message.
-                let db = self.db.clone();
-                let cid = client_id.to_string();
-                let t = topic.to_string();
-                let p = payload.to_vec();
-                tokio::spawn(async move {
-                    db.save_in_flight(cid, pid, t, p, qos).await;
-                });
-
+                if qos == 1 {
+                    session.add_in_flight(pid, topic, payload, qos);
+                    let db = self.db.clone();
+                    let cid = client_id.to_string();
+                    let t = topic.to_string();
+                    let p = payload.to_vec();
+                    tokio::spawn(async move {
+                        db.save_in_flight(cid, pid, t, p, qos).await;
+                    });
+                } else {
+                    let message = OutgoingQos2Message {
+                        topic: topic.to_string(),
+                        payload: payload.to_vec(),
+                        retain,
+                        subscription_identifier,
+                        phase: OutgoingQos2Phase::AwaitPubRec,
+                    };
+                    session.outgoing_qos2.write().insert(pid, message.clone());
+                    if session.session_expiry() > 0 {
+                        self.db
+                            .save_qos2_outgoing(
+                                client_id.to_string(),
+                                pid,
+                                message.topic,
+                                message.payload,
+                                message.retain,
+                                message.subscription_identifier,
+                                message.phase as u8,
+                            )
+                            .await;
+                    }
+                }
                 Some(pid)
             } else {
                 None
@@ -732,6 +1177,55 @@ impl BrokerState {
                 buf
             };
             let _ = self.send_to_session(&session, buf).await;
+        }
+    }
+
+    pub async fn resume_persistent_outgoing(&self, session: &ClientSession) {
+        let qos1: Vec<InFlightMessage> = session.in_flight.read().values().cloned().collect();
+        for message in qos1 {
+            let publish = Packet::Publish(Publish {
+                dup: true,
+                qos: 1,
+                retain: false,
+                topic: &message.topic,
+                packet_id: Some(message.packet_id),
+                properties: PublishProperties::default(),
+                payload: &message.payload,
+            });
+            let mut buf = Vec::new();
+            encode_packet(&publish, &mut buf);
+            let _ = self.send_to_session(session, buf).await;
+        }
+
+        let qos2: Vec<(u16, OutgoingQos2Message)> = session
+            .outgoing_qos2
+            .read()
+            .iter()
+            .map(|(packet_id, message)| (*packet_id, message.clone()))
+            .collect();
+        for (packet_id, message) in qos2 {
+            let packet = match message.phase {
+                OutgoingQos2Phase::AwaitPubRec => Packet::Publish(Publish {
+                    dup: true,
+                    qos: 2,
+                    retain: message.retain,
+                    topic: &message.topic,
+                    packet_id: Some(packet_id),
+                    properties: PublishProperties {
+                        subscription_identifier: message.subscription_identifier,
+                        ..Default::default()
+                    },
+                    payload: &message.payload,
+                }),
+                OutgoingQos2Phase::AwaitPubComp => Packet::PubRel(crate::codec::PubAck {
+                    packet_id,
+                    reason_code: 0x00,
+                    properties: Default::default(),
+                }),
+            };
+            let mut buf = Vec::new();
+            encode_packet(&packet, &mut buf);
+            let _ = self.send_to_session(session, buf).await;
         }
     }
 

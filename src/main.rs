@@ -28,7 +28,9 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::codec::{ConnAck, Packet, PubAck, SubAck, decode_packet, encode_packet};
-use crate::session::{BrokerState, ClientSession};
+use crate::session::{
+    BrokerState, ClientSession, IncomingQos2Message, OutgoingQos2Phase, WillMessage,
+};
 use pipistrelle::{crypto, version};
 
 #[tokio::main]
@@ -300,7 +302,7 @@ async fn handle_connection<S>(
     mut socket: S,
     addr: SocketAddr,
     state: Arc<BrokerState>,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -310,7 +312,7 @@ where
 
     // 1. Wait for the CONNECT packet first.
     // It must be the first packet received within a reasonable time (e.g., 5 seconds).
-    let (client_id, keep_alive, clean_start, session_expiry_interval, username, password) =
+    let (client_id, keep_alive, clean_start, session_expiry_interval, username, password, will) =
         match tokio::time::timeout(Duration::from_secs(5), socket.read_buf(&mut read_buf)).await {
             Ok(Ok(n)) if n > 0 => match decode_packet(&read_buf) {
                 Ok((Packet::Connect(pkt), bytes_read)) => {
@@ -323,6 +325,13 @@ where
                     let password = pkt
                         .password
                         .map(|b| String::from_utf8_lossy(b).into_owned());
+                    let will = pkt.will.map(|will| WillMessage {
+                        topic: will.topic.to_string(),
+                        payload: will.payload.to_vec(),
+                        qos: will.qos,
+                        retain: will.retain,
+                        delay_interval: will.properties.will_delay_interval.unwrap_or(0),
+                    });
                     read_buf.advance(bytes_read);
                     (
                         client_id,
@@ -331,6 +340,7 @@ where
                         session_expiry_interval,
                         username,
                         password,
+                        will,
                     )
                 }
                 Ok((other, _)) => {
@@ -377,6 +387,51 @@ where
         client_id, username, addr
     );
 
+    let existing = state.existing_session(&client_id);
+
+    // Pipistrelle binds persistent Session state to the authenticated principal as
+    // well as the MQTT ClientID. Without this guard, a different valid user who
+    // guessed/reused a ClientID could inherit subscriptions and queued messages that
+    // were authorized under another ACL identity.
+    if existing
+        .as_ref()
+        .is_some_and(|session| session.username != username)
+    {
+        warn!(
+            "Rejecting ClientID '{}' because it belongs to a different authenticated principal",
+            client_id
+        );
+        let connack = Packet::ConnAck(ConnAck {
+            session_present: false,
+            reason_code: 0x87, // Not Authorized
+            properties: Default::default(),
+        });
+        let mut connack_buf = Vec::new();
+        encode_packet(&connack, &mut connack_buf);
+        let _ = socket.write_all(&connack_buf).await;
+        let _ = socket.shutdown().await;
+        return Ok(());
+    }
+
+    let session_present = !clean_start
+        && existing
+            .as_ref()
+            .is_some_and(|session| session.session_expiry() > 0);
+
+    // A reconnect continuing the same persistent Session cancels a delayed Will.
+    // Clean Start ends the previous Session, so a pending Will must be published now.
+    if clean_start {
+        let _ = state.publish_pending_will_now(&client_id).await;
+    } else {
+        state.cancel_pending_will(&client_id);
+    }
+
+    // Clean Start discards the previous Session before the replacement is installed.
+    // Keep the old Arc so an active connection can still receive DISCONNECT 0x8E.
+    if clean_start && existing.is_some() {
+        state.discard_session_state(&client_id).await;
+    }
+
     // 2. Set up channels for sending outgoing packets to this client
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(state.client_queue_capacity);
 
@@ -393,8 +448,43 @@ where
         session_expiry_interval,
         tx,
     ));
+    *session.will.write() = will;
+    if session_present {
+        if let Some(old) = existing.as_ref() {
+            state.inherit_persistent_state(&session, old);
+        }
+    }
 
-    state.register_session(session.clone());
+    // Install the replacement as the current owner before waking an old connection.
+    // This closes the takeover race where the old task could otherwise clean up the
+    // ClientID while it was still registered as current.
+    state.register_session(session.clone()).await;
+
+    if let Some(old) = existing.as_ref() {
+        if old.connected.load(Ordering::Acquire) {
+            state
+                .metrics_session_takeovers
+                .fetch_add(1, Ordering::Relaxed);
+            let takeover = Packet::Disconnect(crate::codec::Disconnect {
+                reason_code: 0x8E, // Session taken over
+                properties: Default::default(),
+            });
+            let mut takeover_buf = Vec::new();
+            encode_packet(&takeover, &mut takeover_buf);
+            let _ = state.send_to_session(old, takeover_buf).await;
+
+            let old_will = { old.will.write().take() };
+            if let Some(old_will) = old_will {
+                // MQTT 5 suppresses the exiting connection's delayed Will only when
+                // the new connection continues the Session (Clean Start=0) and delay>0.
+                if clean_start || old_will.delay_interval == 0 || old.session_expiry() == 0 {
+                    state.publish_will_now(old_will).await;
+                }
+            }
+            old.request_disconnect();
+        }
+    }
+    drop(existing);
 
     // 3. Spawn a dedicated TCP writer task for this client
     let (mut read_half, mut write_half) = tokio::io::split(socket);
@@ -439,13 +529,16 @@ where
 
     // 4. Send CONNACK response
     let connack = Packet::ConnAck(ConnAck {
-        session_present: false,
+        session_present,
         reason_code: 0, // Success
         properties: Default::default(),
     });
     let mut connack_buf = Vec::new();
     encode_packet(&connack, &mut connack_buf);
     let _ = state.send_to_session(&session, connack_buf).await;
+    if session_present {
+        state.resume_persistent_outgoing(&session).await;
+    }
 
     // 5. Main packet reading and processing loop
     let keep_alive_duration = if keep_alive > 0 {
@@ -455,7 +548,8 @@ where
         Duration::from_secs(3600 * 24) // Extremely large timeout if keep alive is 0
     };
 
-    let result: Result<(), Box<dyn std::error::Error>> = async {
+    let mut disconnect_reason: Option<u8> = None;
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
         loop {
             if session.disconnect_requested() {
                 warn!("Disconnect requested for client '{}'", client_id);
@@ -484,6 +578,36 @@ where
                     loop {
                         match decode_packet(&read_buf) {
                             Ok((packet, bytes_read)) => {
+                                if let Packet::Disconnect(pkt) = &packet {
+                                    if let Some(expiry) = pkt.properties.session_expiry_interval {
+                                        let connect_expiry = session.session_expiry();
+                                        if connect_expiry == 0 && expiry > 0 {
+                                            let protocol_error = Packet::Disconnect(crate::codec::Disconnect {
+                                                reason_code: 0x82,
+                                                properties: Default::default(),
+                                            });
+                                            let mut buf = Vec::new();
+                                            encode_packet(&protocol_error, &mut buf);
+                                            let _ = state.send_to_session(&session, buf).await;
+                                            return Err("DISCONNECT cannot raise a zero Session Expiry Interval".into());
+                                        }
+                                        session.set_session_expiry(expiry);
+                                        if expiry > 0 {
+                                            state.db
+                                                .save_session(
+                                                    session.client_id.clone(),
+                                                    session.username.clone(),
+                                                    session.clean_start,
+                                                    expiry,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                    disconnect_reason = Some(pkt.reason_code);
+                                    read_buf.advance(bytes_read);
+                                    return Ok(());
+                                }
+
                                 // Zero-routing QoS 0 fast path: authenticated sessions with a
                                 // cached global write ACL need no async dispatch, router lock,
                                 // bridge lock, allocation, ACK, or persistence work.
@@ -537,9 +661,25 @@ where
     }
     .await;
 
-    // 6. Cleanup session on disconnect or error
-    state.remove_session(&client_id);
-    writer_task.abort(); // Cancel writer task
+    // 6. Cleanup session on disconnect or error. Only the currently registered
+    // Arc may transition the ClientID offline; a taken-over connection cannot erase its replacement.
+    let was_current = state.disconnect_session_if_current(&session).await;
+    if was_current {
+        let will = { session.will.write().take() };
+        if let Some(will) = will {
+            if disconnect_reason != Some(0x00) {
+                state.schedule_will(client_id.clone(), will, session.session_expiry());
+            }
+        }
+        if session.session_expiry() > 0 {
+            state.schedule_session_expiry(session.clone());
+        }
+        writer_task.abort();
+    } else {
+        // A taken-over connection has a queued DISCONNECT 0x8E. Detach its writer
+        // so it can flush that packet before the old sender is dropped.
+        drop(writer_task);
+    }
 
     result
 }
@@ -548,7 +688,7 @@ async fn process_client_packet(
     packet: &Packet<'_>,
     state: &BrokerState,
     session: &ClientSession,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match packet {
         Packet::Publish(pkt) => {
             debug!(
@@ -563,19 +703,69 @@ async fn process_client_packet(
                     "Client '{}' (user: '{}') not authorized to publish on topic '{}'",
                     session.client_id, username, pkt.topic
                 );
-                if pkt.qos == 1 {
-                    if let Some(pid) = pkt.packet_id {
-                        let puback = Packet::PubAck(PubAck {
-                            packet_id: pid,
-                            reason_code: 0x87, // Not Authorized
-                            properties: Default::default(),
-                        });
+                if let Some(pid) = pkt.packet_id {
+                    let ack = PubAck {
+                        packet_id: pid,
+                        reason_code: 0x87, // Not Authorized
+                        properties: Default::default(),
+                    };
+                    let packet = if pkt.qos == 2 {
+                        Packet::PubRec(ack)
+                    } else {
+                        Packet::PubAck(ack)
+                    };
+                    if pkt.qos > 0 {
                         let mut buf = Vec::new();
-                        encode_packet(&puback, &mut buf);
+                        encode_packet(&packet, &mut buf);
                         let _ = state.send_to_session(session, buf).await;
                     }
                 }
                 return Ok(());
+            }
+
+            if pkt.qos == 2 {
+                let Some(packet_id) = pkt.packet_id else {
+                    return Err("QoS 2 PUBLISH missing packet identifier".into());
+                };
+                let already_owned = session.incoming_qos2.read().contains_key(&packet_id);
+                if !already_owned {
+                    let message = IncomingQos2Message {
+                        topic: pkt.topic.to_string(),
+                        payload: pkt.payload.to_vec(),
+                        retain: pkt.retain,
+                    };
+                    session
+                        .incoming_qos2
+                        .write()
+                        .insert(packet_id, message.clone());
+                    if session.session_expiry() > 0 {
+                        state
+                            .db
+                            .save_qos2_incoming(
+                                session.client_id.clone(),
+                                packet_id,
+                                message.topic,
+                                message.payload,
+                                message.retain,
+                            )
+                            .await;
+                    }
+                }
+                // Duplicate QoS 2 PUBLISH with the same packet identifier is acknowledged
+                // again but never routed twice while ownership is pending.
+                let pubrec = Packet::PubRec(PubAck {
+                    packet_id,
+                    reason_code: 0x00,
+                    properties: Default::default(),
+                });
+                let mut buf = Vec::new();
+                encode_packet(&pubrec, &mut buf);
+                let _ = state.send_to_session(session, buf).await;
+                return Ok(());
+            }
+
+            if pkt.retain {
+                state.update_retained(pkt.topic, pkt.payload, pkt.qos);
             }
 
             let publish_sequence = session.published_messages.fetch_add(1, Ordering::Relaxed);
@@ -607,21 +797,49 @@ async fn process_client_packet(
         Packet::Subscribe(pkt) => {
             debug!("Received SUBSCRIBE from client '{}'", session.client_id);
             let mut reason_codes = Vec::new();
+            let mut retained_replays: Vec<(String, u8, Option<u32>)> = Vec::new();
             let username = session.username.as_deref().unwrap_or("");
 
             for sub in &pkt.subscriptions {
-                // Check read authorization
+                let requested_qos = sub.options & 0x03;
+                let no_local = sub.options & 0x04 != 0;
+                let retain_handling = (sub.options >> 4) & 0x03;
+                let malformed =
+                    requested_qos == 3 || retain_handling == 3 || sub.options & 0xC0 != 0;
+                let shared_no_local = no_local && sub.topic_filter.starts_with("$share/");
+                if malformed || shared_no_local {
+                    let reason_code = if malformed { 0x81 } else { 0x82 };
+                    let disconnect = Packet::Disconnect(crate::codec::Disconnect {
+                        reason_code,
+                        properties: Default::default(),
+                    });
+                    let mut buf = Vec::new();
+                    encode_packet(&disconnect, &mut buf);
+                    let _ = state.send_to_session(session, buf).await;
+                    return Err("invalid MQTT v5 subscription options".into());
+                }
+
                 if session.allow_all_read
                     || state.auth.authorize(username, sub.topic_filter, "read")
                 {
-                    let accepted = state.subscribe(
+                    let outcome = state.subscribe(
                         &session.client_id,
                         sub.topic_filter,
-                        sub.options & 0x03,
+                        requested_qos,
                         pkt.properties.subscription_identifier,
+                        sub.options,
                     );
-                    if accepted {
-                        reason_codes.push(sub.options & 0x03);
+                    if outcome.accepted {
+                        reason_codes.push(requested_qos);
+                        if !sub.topic_filter.starts_with("$share/")
+                            && (retain_handling == 0 || (retain_handling == 1 && outcome.is_new))
+                        {
+                            retained_replays.push((
+                                sub.topic_filter.to_string(),
+                                requested_qos,
+                                pkt.properties.subscription_identifier,
+                            ));
+                        }
                     } else {
                         reason_codes.push(0x97); // Quota exceeded
                     }
@@ -642,6 +860,13 @@ async fn process_client_packet(
             let mut buf = Vec::new();
             encode_packet(&suback, &mut buf);
             let _ = state.send_to_session(session, buf).await;
+
+            // Retained PUBLISH packets follow the SUBACK and always carry RETAIN=1.
+            for (filter, qos, subscription_identifier) in retained_replays {
+                state
+                    .send_retained_for_subscription(session, &filter, qos, subscription_identifier)
+                    .await;
+            }
         }
         Packet::PubAck(pkt) => {
             debug!(
@@ -657,6 +882,100 @@ async fn process_client_packet(
             tokio::spawn(async move {
                 db.delete_in_flight(cid, pid).await;
             });
+        }
+        Packet::PubRec(pkt) => {
+            let mut resend_pubrel = false;
+            let mut discard = false;
+            let mut persist_transition = None;
+            {
+                let mut outgoing = session.outgoing_qos2.write();
+                if let Some(message) = outgoing.get_mut(&pkt.packet_id) {
+                    if pkt.reason_code >= 0x80 {
+                        discard = true;
+                    } else {
+                        message.phase = OutgoingQos2Phase::AwaitPubComp;
+                        resend_pubrel = true;
+                        if session.session_expiry() > 0 {
+                            persist_transition = Some(message.clone());
+                        }
+                    }
+                }
+                if discard {
+                    outgoing.remove(&pkt.packet_id);
+                }
+            }
+            if let Some(persisted) = persist_transition {
+                state
+                    .db
+                    .save_qos2_outgoing(
+                        session.client_id.clone(),
+                        pkt.packet_id,
+                        persisted.topic,
+                        persisted.payload,
+                        persisted.retain,
+                        persisted.subscription_identifier,
+                        persisted.phase as u8,
+                    )
+                    .await;
+            }
+            if discard {
+                let db = state.db.clone();
+                let cid = session.client_id.clone();
+                let pid = pkt.packet_id;
+                tokio::spawn(async move { db.delete_qos2_outgoing(cid, pid).await });
+            } else if resend_pubrel {
+                let pubrel = Packet::PubRel(PubAck {
+                    packet_id: pkt.packet_id,
+                    reason_code: 0x00,
+                    properties: Default::default(),
+                });
+                let mut buf = Vec::new();
+                encode_packet(&pubrel, &mut buf);
+                let _ = state.send_to_session(session, buf).await;
+            }
+        }
+        Packet::PubRel(pkt) => {
+            let pending = session.incoming_qos2.write().remove(&pkt.packet_id);
+            let reason_code = if let Some(message) = pending {
+                if message.retain {
+                    state.update_retained(&message.topic, &message.payload, 2);
+                }
+                let sequence = session.published_messages.fetch_add(1, Ordering::Relaxed);
+                state
+                    .route_publish(
+                        &session.client_id,
+                        &message.topic,
+                        &message.payload,
+                        2,
+                        message.retain,
+                        sequence,
+                    )
+                    .await;
+                let db = state.db.clone();
+                let cid = session.client_id.clone();
+                let pid = pkt.packet_id;
+                tokio::spawn(async move { db.delete_qos2_incoming(cid, pid).await });
+                0x00
+            } else {
+                0x92 // Packet Identifier not found
+            };
+            let pubcomp = Packet::PubComp(PubAck {
+                packet_id: pkt.packet_id,
+                reason_code,
+                properties: Default::default(),
+            });
+            let mut buf = Vec::new();
+            encode_packet(&pubcomp, &mut buf);
+            let _ = state.send_to_session(session, buf).await;
+        }
+        Packet::PubComp(pkt) => {
+            let removed = session.outgoing_qos2.write().remove(&pkt.packet_id);
+            if removed.is_some() {
+                let db = state.db.clone();
+                let cid = session.client_id.clone();
+                let pid = pkt.packet_id;
+                tokio::spawn(async move { db.delete_qos2_outgoing(cid, pid).await });
+            }
         }
         Packet::PingReq => {
             debug!("Received PINGREQ from client '{}'", session.client_id);

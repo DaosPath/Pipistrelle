@@ -140,6 +140,7 @@ async fn connect_and_run_bridge(
         } else {
             None
         },
+        will: None,
         properties: Default::default(),
     });
 

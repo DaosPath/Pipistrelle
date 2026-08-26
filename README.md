@@ -11,10 +11,14 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 *   **Arquitectura Zero-Copy & Concurrente:** El decodificador de paquetes (`src/codec.rs`) realiza cortes de memoria (*slices*) directamente del búfer de red utilizando tiempos de vida de Rust, minimizando las asignaciones de memoria y maximizando el rendimiento bajo alta concurrencia de clientes.
 *   **Criptografía Post-Cuántica (PQC) TLS 1.3:** Integrado con `tokio-rustls` y el proveedor criptográfico `aws-lc-rs`, priorizando el algoritmo híbrido **`X25519MLKEM768`** para proteger tus comunicaciones IoT contra futuras amenazas de descifrado cuántico.
 *   **Soporte Nativo de WebSockets (Puerto 8083):** Conexiones WebSocket MQTT integradas de forma transparente mediante un adaptador que implementa `AsyncRead` + `AsyncWrite`. Compatible con dashboards web y simuladores basados en navegador (como Wokwi).
-*   **Persistencia Resistente a Pérdida de Energía (SQLite WAL):** Base de datos embebida SQLite con modo **WAL (Write-Ahead Logging)** habilitado por defecto. Ofrece una resiliencia extrema ante apagones repentinos en placas ARM y recupera automáticamente sesiones, suscripciones y mensajes QoS 1 en tránsito.
+*   **Persistencia MQTT y SQLite WAL:** SQLite en modo **WAL (Write-Ahead Logging)** conserva sesiones persistentes, suscripciones, mensajes retained y estados QoS 1/QoS 2 en tránsito, incluyendo reanudación después de reiniciar el broker.
 *   **Exportador de Métricas Prometheus (Puerto 9090):** Expone un endpoint HTTP `/metrics` listo para ser recolectado por instancias de Prometheus. Monitorea conexiones activas, mensajes publicados, suscripciones y rendimiento del broker en tiempo real.
 *   **Puente Bidireccional Integrado:** Conectividad automática a brokers remotos (ej. **HiveMQ Cloud**) para reenviar tópicos locales (ej. `sensor/#`) hacia la nube y recibir comandos remotos (ej. `alerts/#`) localmente.
 *   **Autenticación & ACLs Seguras:** Validación mediante `credentials.json` con contraseñas protegidas por **Argon2id**, ACLs granulares y política **fail-closed** por defecto.
+*   **MQTT QoS 2 End-to-End:** Implementa el handshake `PUBLISH → PUBREC → PUBREL → PUBCOMP`, deduplicación inbound, estado outbound y reanudación persistente de ambos lados.
+*   **Retained Messages MQTT v5:** Persistencia de retained, borrado con payload vacío, Retain Handling `0/1/2`, Retain As Published y Subscription Identifier en replay.
+*   **Last Will and Testament:** Will QoS/retain, Will Delay, supresión en `DISCONNECT 0x00`, cancelación del Will retrasado al reanudar la misma Session y publicación correcta durante pérdida de conexión/takeover.
+*   **Sesiones Persistentes y ClientID Takeover:** `Session Present`, mensajes QoS pendientes offline, Session Expiry y takeover MQTT v5 con `DISCONNECT 0x8E` para el propietario anterior. Pipistrelle liga además la Session persistente al principal autenticado para impedir que otro usuario válido herede estado autorizado bajo ACLs distintas.
 *   **Generación Automática de Certificados:** Si los archivos `cert.pem` y `key.pem` no están en el volumen, Pipistrelle genera automáticamente certificados auto-firmados válidos para `localhost`, `127.0.0.1`, `10.0.1.2` y `host.wokwi.internal`.
 
 ---
@@ -171,6 +175,8 @@ Desde `2.0.0.3`, el hot path QoS 0 sin subscribers/bridge supera **20 M PUBLISH/
 
 Desde `2.0.0.4`, el routing **end-to-end** QoS 0 también supera el objetivo de 2 M/s: la prueba sostenida de 50 millones de mensajes con 10 clientes alcanzó **2.393 M msg/s**, contador Prometheus exacto, 0 fallos y ~103–105 MiB de RAM del broker. La mejora usa cache copy-on-write para topics exactos, encoder QoS0 directo y batching de escrituras sin eliminar las colas bounded ni el backpressure.
 
+Desde `2.1.0.0`, V2 incorpora la primera gran expansión de protocolo: **QoS 2**, **retained messages**, **Last Will and Testament**, `Session Present`, Session Expiry persistente, mensajes QoS pendientes para clientes offline y takeover de ClientID con `DISCONNECT 0x8E`. La suite `test_protocol_v2.py` verifica los estados MQTT v5 directamente sobre sockets, sin depender de las abstracciones de Paho.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración
@@ -186,9 +192,12 @@ Pipistrelle incluye un completo conjunto de pruebas de integración automatizada
 2.  Ejecuta el script de pruebas en la raíz del proyecto:
     ```bash
     python test_broker.py
+    python test_protocol_v2.py
     ```
 
-El script validará automáticamente los siguientes 6 escenarios:
+`test_broker.py` mantiene los 6 checks de transporte/autenticación. `test_protocol_v2.py` habla MQTT v5 directamente por sockets y valida QoS 2, retained, Will, opciones de suscripción y sesiones persistentes/takeover.
+
+El script base validará automáticamente los siguientes 6 escenarios:
 *   **Test 1 (TCP):** Conexión de administrador, publicación, suscripción y loopback.
 *   **Test 2 (Auth Failure):** Verificación de rechazo ante contraseñas incorrectas (Código `0x86`).
 *   **Test 3 (ACLs):** Verificación de restricciones de lectura/escritura (Código `0x87`).

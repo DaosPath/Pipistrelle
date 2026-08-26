@@ -218,3 +218,16 @@ The older-reader intermediate numbers are diagnostic only; the A/B comparison ag
 ### QoS 1 and hybrid PQC regression gates
 
 The final build also completed a 10-client, 200,000-message QoS 1 loopback run at **427.2 k msg/s** with zero failures. A clean TLS 1.3 hybrid run delivered 200,000 QoS 0 messages at **2.108 M msg/s** in a short run, with all **10/10** connections negotiating `X25519MLKEM768` and setup p50 around **200 ms**. The TLS number is a short regression check, not the sustained release headline.
+
+## V2 2.1.0.0 — protocol-feature regression gate
+
+`2.1.0.0` adds QoS 2, retained messages, Last Will, persistent-session/takeover state and principal-bound Session ownership. The release keeps a QoS 0 performance regression gate so protocol completeness does not silently undo the `2.0.0.4` routing work.
+
+Final Orange Pi release gates (ARM64, 128-byte payload, native Rust load generator):
+
+- **50M end-to-end QoS0:** 2.835 M msg/s sustained in 17.634 s on a fresh container; broker memory stayed about 124–125 MiB during the run and 121.6 MiB after 2 s idle.
+- **50M ingest QoS0:** 21.485 M msg/s with the Prometheus publish counter increasing by exactly 50,000,050 (50M publishes + 50 QoS1 completion markers).
+- **Final 10M end-to-end smoke after principal-binding hardening:** 2.941 M msg/s, 0 failures, about 103.2 MiB broker memory after the run.
+- **Hybrid PQC TLS smoke:** 200k end-to-end messages at 1.667 M msg/s, 0 failures, with `X25519MLKEM768` negotiated on 10/10 connections.
+
+These are regression gates, not a claim that protocol-heavy QoS1/QoS2 paths share the QoS0 ceiling.

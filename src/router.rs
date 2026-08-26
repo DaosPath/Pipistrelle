@@ -8,6 +8,8 @@ pub struct SubscriptionInfo {
     pub client_id: String,
     pub qos: u8,
     pub subscription_identifier: Option<u32>,
+    pub no_local: bool,
+    pub retain_as_published: bool,
 }
 
 #[derive(Default, Debug)]
@@ -94,14 +96,34 @@ impl TopicRouter {
         true
     }
 
-    /// Subscribes a client to a topic filter.
-    /// Supports wildcards (`+`, `#`) and Shared Subscriptions (`$share/group/topic_filter`).
+    /// Subscribes with default MQTT v5 options (No Local=0, RAP=0).
     pub fn subscribe(
         &self,
         client_id: &str,
         topic_filter: &str,
         qos: u8,
         subscription_identifier: Option<u32>,
+    ) {
+        self.subscribe_with_options(
+            client_id,
+            topic_filter,
+            qos,
+            subscription_identifier,
+            false,
+            false,
+        );
+    }
+
+    /// Subscribes a client to a topic filter with MQTT v5 routing options.
+    /// Supports wildcards (`+`, `#`) and Shared Subscriptions (`$share/group/topic_filter`).
+    pub fn subscribe_with_options(
+        &self,
+        client_id: &str,
+        topic_filter: &str,
+        qos: u8,
+        subscription_identifier: Option<u32>,
+        no_local: bool,
+        retain_as_published: bool,
     ) {
         let mut root = self.root.write();
         let (group, filter) = parse_shared_subscription(topic_filter);
@@ -134,6 +156,8 @@ impl TopicRouter {
             client_id: client_id.to_string(),
             qos,
             subscription_identifier,
+            no_local,
+            retain_as_published,
         };
 
         let inserted_new = if let Some(grp) = group {
@@ -380,6 +404,25 @@ fn collect_node_subscriptions(node: &TrieNode, result: &mut RouteResult) {
             target.push(sub.clone());
         }
     }
+}
+
+/// Matches a concrete MQTT topic name against a subscription filter.
+/// Used for retained-message replay where the retained set is small and mutations are rare.
+pub fn topic_matches_filter(topic: &str, filter: &str) -> bool {
+    let (_, filter) = parse_shared_subscription(filter);
+    let mut topics = topic.split('/');
+    for level in filter.split('/') {
+        if level == "#" {
+            return true;
+        }
+        let Some(topic_level) = topics.next() else {
+            return false;
+        };
+        if level != "+" && level != topic_level {
+            return false;
+        }
+    }
+    topics.next().is_none()
 }
 
 /// Parses Shared Subscription prefix `$share/group/topic_filter`.
