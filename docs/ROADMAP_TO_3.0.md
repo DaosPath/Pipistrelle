@@ -42,7 +42,7 @@ Estado actual publicado:
 
 Gates de referencia de la Orange Pi:
 
-- QoS0 ingest full-topic: ~58 M msg/s nativo en el hot path validado. MQTT 5 Topic Alias: mediana **161.452 M msg/s** en host normal (3×~1B) y techo optimizado separado de **211.520 M msg/s** de mediana (3×~1B, todas >200M).
+- QoS0 ingest full-topic: ~58 M msg/s nativo en el hot path validado. MQTT 5 Topic Alias: gate sostenido de 10B con mediana **163.550 M msg/s** en host normal y techo optimizado separado de **216.437 M msg/s** de mediana (3×10B, todas >200M).
 - QoS0 full-topic end-to-end: **33.203 M msg/s** en el gate fresco de ~50M con writer batch 1024.
 - PQC híbrido operativo.
 - RAM del broker alrededor de ~100–150 MiB en los gates QoS0 actuales.

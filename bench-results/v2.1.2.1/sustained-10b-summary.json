@@ -1,0 +1,85 @@
+{
+  "release": "v2.1.2.1",
+  "commit": "c0123fceda6ff3cb9db7e13a6a19d594554471c1",
+  "date": "2026-08-27",
+  "payload_bytes": 128,
+  "mqtt": "5.0",
+  "qos": 0,
+  "topic_alias": true,
+  "engine": "rust-native-sendfile",
+  "host_normal": {
+    "clients": 13,
+    "window": 4096,
+    "messages_per_client": 769230769,
+    "workload_messages_per_run": 9999999997,
+    "prometheus_delta_per_run": 10000000010,
+    "runs_mps": [
+      163549817.06287146,
+      160063883.8323491,
+      164865629.7845755
+    ],
+    "elapsed_seconds": [
+      61.143449602,
+      62.475055319,
+      60.655456265
+    ],
+    "median_mps": 163549817.06287146,
+    "min_mps": 160063883.8323491,
+    "max_mps": 164865629.7845755,
+    "peak_rss_mib": [
+      44.555,
+      42.645,
+      43.457
+    ],
+    "max_peak_rss_mib": 44.555,
+    "peak_temperature_c": [
+      43.0,
+      44.0,
+      44.0
+    ],
+    "failures": [
+      0,
+      0,
+      0
+    ],
+    "conditions": "Original host network, nftables/Docker rules present, original CPU frequency caps/governor, broker and load generator pinned to CPUs 0,1,4,5,6,7,8,9,10,11."
+  },
+  "optimized_ceiling": {
+    "clients": 14,
+    "window": 1792,
+    "messages_per_client": 714285714,
+    "workload_messages_per_run": 9999999996,
+    "prometheus_delta_per_run": 10000000010,
+    "runs_mps": [
+      220274489.13552994,
+      216351237.80775413,
+      216436563.25477025
+    ],
+    "elapsed_seconds": [
+      45.397903476,
+      46.221136044,
+      46.202914358
+    ],
+    "median_mps": 216436563.25477025,
+    "min_mps": 216351237.80775413,
+    "max_mps": 220274489.13552994,
+    "peak_rss_mib": [
+      44.27,
+      43.797,
+      43.184
+    ],
+    "max_peak_rss_mib": 44.27,
+    "peak_temperature_c": [
+      45.0,
+      45.0,
+      45.0
+    ],
+    "failures": [
+      0,
+      0,
+      0
+    ],
+    "conditions": "Clean Linux network namespace with loopback only; CPU scaling max/min temporarily set to each policy cpuinfo_max_freq with performance governor; exact original governor/min/max restored after every run; broker/load generator pinned to CPUs 0,1,4,5,6,7,8,9,10,11."
+  },
+  "interpretation": "10B is the sustained V2 gate. 1B remains a tuning/quick benchmark. Topic Alias ingest remains a separate category from full-topic ingest and end-to-end routing."
+}

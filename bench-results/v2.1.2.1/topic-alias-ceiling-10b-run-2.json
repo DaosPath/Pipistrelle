@@ -1,0 +1,22 @@
+{
+  "status": "ok",
+  "engine": "rust-native-sendfile",
+  "transport": "tcp",
+  "mode": "ingest",
+  "tls_profile": null,
+  "clients": 14,
+  "messages_per_client": 714285714,
+  "total_messages": 9999999996,
+  "qos": 0,
+  "payload_bytes": 128,
+  "window": 1792,
+  "topic_alias": true,
+  "sendfile": true,
+  "elapsed_seconds": 46.221136044,
+  "messages_per_second": 216351237.80775413,
+  "payload_mib_per_second": 26410.06320895436,
+  "setup_p50_ms": 26.719888,
+  "setup_p95_ms": 35.605399049999995,
+  "negotiated_groups": {},
+  "failures": 0
+}

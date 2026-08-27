@@ -261,7 +261,33 @@ During the ingest repetitions the board was ~41–45 °C with a shared-system lo
 
 `2.1.2.1` keeps the MQTT correctness/flow-control behavior of `2.1.2.0`, adds Client→Server Topic Alias, a zero-route ARM64 fast path, and a Linux-only native benchmark backend `--sendfile`. Results below use 128-byte payloads and ordered QoS1 completion markers. Docker remains supported but is not used for native ceiling figures.
 
-### Normal host/network configuration
+### Official sustained V2 gate — 10 billion PUBLISH per run
+
+One-billion-message runs complete in only a few seconds at the current throughput, so V2 uses 10B as the sustained performance gate and retains 1B for tuning/short regressions.
+
+Normal host/network configuration, 13 clients / window 4096:
+
+| Run | Workload PUBLISH | Throughput | Elapsed | Failures | Prometheus delta | Peak RSS | Peak temp |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 9,999,999,997 | **163.550 M/s** | 61.14 s | 0 | **10,000,000,010** | 44.6 MiB | 43 °C |
+| 2 | 9,999,999,997 | **160.064 M/s** | 62.48 s | 0 | **10,000,000,010** | 42.6 MiB | 44 °C |
+| 3 | 9,999,999,997 | **164.866 M/s** | 60.66 s | 0 | **10,000,000,010** | 43.5 MiB | 44 °C |
+
+**Sustained normal-host median: 163.550 M msg/s; minimum: 160.064 M msg/s.** No thermal or memory degradation appeared across the minute-long runs.
+
+Optimized ceiling, clean network namespace + advertised hardware max frequencies, 14 clients / window 1792:
+
+| Run | Workload PUBLISH | Throughput | Elapsed | Failures | Prometheus delta | Peak RSS | Peak temp |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 9,999,999,996 | **220.274 M/s** | 45.40 s | 0 | **10,000,000,010** | 44.3 MiB | 45 °C |
+| 2 | 9,999,999,996 | **216.351 M/s** | 46.22 s | 0 | **10,000,000,010** | 43.8 MiB | 45 °C |
+| 3 | 9,999,999,996 | **216.437 M/s** | 46.20 s | 0 | **10,000,000,010** | 43.2 MiB | 45 °C |
+
+**Sustained optimized median: 216.437 M msg/s; minimum: 216.351 M msg/s. All three 10B runs remained above 200 M/s.** CPU governor/min/max values were restored after every run. This is the primary evidence for the >200M optimized-ceiling claim.
+
+Raw run JSON and a machine-readable summary live in `bench-results/v2.1.2.1/`.
+
+### Short/tuning gate — normal host/network configuration
 
 Command shape:
 
