@@ -1499,6 +1499,23 @@ pub fn encode_publish_qos0(
     buf
 }
 
+/// Direct encoder for the common MQTT v5 QoS0 Topic Alias form.
+/// The caller is responsible for using an alias negotiated for the connection.
+pub fn encode_publish_qos0_with_topic_alias(topic: &str, payload: &[u8], alias: u16) -> Vec<u8> {
+    let topic_bytes = topic.as_bytes();
+    let remaining = 2usize + topic_bytes.len() + 4 + payload.len();
+    let mut packet = Vec::with_capacity(remaining + 5);
+    packet.push(0x30);
+    encode_varint(remaining as u32, &mut packet);
+    packet.extend_from_slice(&(topic_bytes.len() as u16).to_be_bytes());
+    packet.extend_from_slice(topic_bytes);
+    packet.push(3); // Property Length
+    packet.push(0x23); // Topic Alias
+    packet.extend_from_slice(&alias.to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
+}
+
 #[inline]
 fn varint_encoded_len(mut value: u32) -> usize {
     let mut len = 1;

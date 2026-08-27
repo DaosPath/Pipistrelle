@@ -55,6 +55,8 @@ struct Args {
     qos: u8,
     window: usize,
     mode: Mode,
+    topic_alias: bool,
+    sendfile: bool,
     username: String,
     password: String,
     timeout: Duration,
@@ -91,6 +93,8 @@ struct Report {
     qos: u8,
     payload_bytes: usize,
     window: usize,
+    topic_alias: bool,
+    sendfile: bool,
     elapsed_seconds: f64,
     messages_per_second: f64,
     payload_mib_per_second: f64,
@@ -100,9 +104,256 @@ struct Report {
     failures: usize,
 }
 
+#[cfg(target_os = "linux")]
+struct SendfilePreparedClient {
+    stream: std::net::TcpStream,
+    memfd: File,
+    mapping: Option<Vec<u8>>,
+    marker: Vec<u8>,
+    packet_len: usize,
+    messages: u64,
+    window: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn read_packet_sync(stream: &mut std::net::TcpStream) -> io::Result<(u8, Vec<u8>)> {
+    use std::io::Read;
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first)?;
+    let mut multiplier = 1usize;
+    let mut remaining = 0usize;
+    for _ in 0..4 {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte)?;
+        remaining += ((byte[0] & 0x7f) as usize) * multiplier;
+        if byte[0] & 0x80 == 0 {
+            let mut body = vec![0u8; remaining];
+            stream.read_exact(&mut body)?;
+            return Ok((first[0], body));
+        }
+        multiplier *= 128;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "malformed MQTT remaining length",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn sendfile_all(socket: &std::net::TcpStream, file: &File, bytes: usize) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut offset: libc::off_t = 0;
+    let mut remaining = bytes;
+    while remaining != 0 {
+        let sent =
+            unsafe { libc::sendfile(socket.as_raw_fd(), file.as_raw_fd(), &mut offset, remaining) };
+        if sent < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if sent == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "sendfile made no progress",
+            ));
+        }
+        remaining -= sent as usize;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_sendfile_client(
+    index: usize,
+    args: &Args,
+) -> Result<(SendfilePreparedClient, f64), BenchError> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    let setup_start = Instant::now();
+    let mut stream = std::net::TcpStream::connect((args.host.as_str(), args.port))?;
+    stream.set_nodelay(true)?;
+    let client_id = format!("pipistrelle_native_bench_{index}");
+    stream.write_all(&encode_connect(&client_id, &args.username, &args.password))?;
+    let (header, body) = read_packet_sync(&mut stream)?;
+    if header >> 4 != 2 || body.len() < 2 || body[1] != 0 {
+        return Err(format!("CONNECT rejected: header=0x{header:02x}, body={body:?}").into());
+    }
+    if args.topic_alias && parse_connack_topic_alias_maximum(&body)? < 1 {
+        return Err("broker did not advertise Topic Alias Maximum >= 1".into());
+    }
+
+    let topic = format!("bench/native/ingest/{index}");
+    let payload = vec![b'x'; args.payload_bytes];
+    let mapping = args
+        .topic_alias
+        .then(|| encode_publish_topic_alias(&topic, &payload, 1));
+    let packet = if args.topic_alias {
+        encode_publish_topic_alias("", &payload, 1)
+    } else {
+        encode_publish(&topic, &payload, 0, None)
+    };
+    let packet_len = packet.len();
+    let mut batch = Vec::with_capacity(packet_len * args.window);
+    for _ in 0..args.window {
+        batch.extend_from_slice(&packet);
+    }
+
+    let name = CString::new(format!("pipistrelle-bench-{index}"))?;
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let mut memfd = unsafe { File::from_raw_fd(fd) };
+    memfd.write_all(&batch)?;
+
+    let marker = encode_publish(
+        &format!("bench/native/ingest/{index}/marker"),
+        b"done",
+        1,
+        Some(65_535),
+    );
+    Ok((
+        SendfilePreparedClient {
+            stream,
+            memfd,
+            mapping,
+            marker,
+            packet_len,
+            messages: args.messages,
+            window: args.window,
+        },
+        setup_start.elapsed().as_secs_f64() * 1000.0,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn run_sendfile_worker(mut client: SendfilePreparedClient) -> Result<u64, BenchError> {
+    use std::io::Write;
+
+    let mut sent = 0u64;
+    if let Some(mapping) = client.mapping.as_ref() {
+        if client.messages != 0 {
+            client.stream.write_all(mapping)?;
+            sent = 1;
+        }
+    }
+    while sent < client.messages {
+        let count = std::cmp::min(client.window as u64, client.messages - sent) as usize;
+        sendfile_all(&client.stream, &client.memfd, client.packet_len * count)?;
+        sent += count as u64;
+    }
+
+    client.stream.write_all(&client.marker)?;
+    let (header, body) = read_packet_sync(&mut client.stream)?;
+    if header >> 4 != 4 || body.len() < 2 || body[0] != 0xff || body[1] != 0xff {
+        return Err(
+            format!("expected marker PUBACK, got header=0x{header:02x}, body={body:?}").into(),
+        );
+    }
+    Ok(client.messages)
+}
+
+#[cfg(target_os = "linux")]
+fn run_sendfile_benchmark(args: &Args) -> Result<(), BenchError> {
+    use std::sync::Barrier;
+
+    let mut prepared = Vec::with_capacity(args.clients);
+    let mut setup_times = Vec::with_capacity(args.clients);
+    for index in 0..args.clients {
+        let (client, setup_ms) = prepare_sendfile_client(index, args)?;
+        prepared.push(client);
+        setup_times.push(setup_ms);
+    }
+
+    let barrier = Arc::new(Barrier::new(args.clients + 1));
+    let mut handles = Vec::with_capacity(args.clients);
+    for client in prepared {
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            run_sendfile_worker(client)
+        }));
+    }
+
+    let start = Instant::now();
+    barrier.wait();
+    let mut completed = 0u64;
+    let mut failures = 0usize;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(messages)) => completed += messages,
+            Ok(Err(error)) => {
+                eprintln!("worker failure: {error}");
+                failures += 1;
+            }
+            Err(_) => {
+                eprintln!("worker thread panicked");
+                failures += 1;
+            }
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let report = Report {
+        status: if failures == 0 { "ok" } else { "partial" },
+        engine: "rust-native-sendfile",
+        transport: "tcp",
+        mode: args.mode.as_str(),
+        tls_profile: None,
+        clients: args.clients,
+        messages_per_client: args.messages,
+        total_messages: completed,
+        qos: args.qos,
+        payload_bytes: args.payload_bytes,
+        window: args.window,
+        topic_alias: args.topic_alias,
+        sendfile: true,
+        elapsed_seconds: elapsed,
+        messages_per_second: if elapsed > 0.0 {
+            completed as f64 / elapsed
+        } else {
+            0.0
+        },
+        payload_mib_per_second: if elapsed > 0.0 {
+            completed as f64 * args.payload_bytes as f64 / 1_048_576.0 / elapsed
+        } else {
+            0.0
+        },
+        setup_p50_ms: percentile(&setup_times, 0.50),
+        setup_p95_ms: percentile(&setup_times, 0.95),
+        negotiated_groups: std::collections::BTreeMap::new(),
+        failures,
+    };
+    let output = serde_json::to_string_pretty(&report)?;
+    println!("{output}");
+    if let Some(path) = args.json_out.as_ref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, format!("{output}\n"))?;
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failures} worker(s) failed").into())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_sendfile_benchmark(_args: &Args) -> Result<(), BenchError> {
+    Err("--sendfile is supported on Linux only".into())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), BenchError> {
     let args = parse_args()?;
+    if args.sendfile {
+        return run_sendfile_benchmark(&args);
+    }
     let (start_tx, start_rx) = watch::channel(false);
     let (setup_tx, mut setup_rx) = tokio::sync::mpsc::channel::<SetupReport>(args.clients);
     let mut workers = JoinSet::new();
@@ -174,6 +425,8 @@ async fn main() -> Result<(), BenchError> {
         qos: args.qos,
         payload_bytes: args.payload_bytes,
         window: args.window,
+        topic_alias: args.topic_alias,
+        sendfile: false,
         elapsed_seconds: elapsed,
         messages_per_second: if elapsed > 0.0 {
             completed as f64 / elapsed
@@ -282,6 +535,7 @@ async fn run_worker_inner(
     let reader_pubacks = pubacks.clone();
     let reader_received_notify = received_notify.clone();
     let reader_puback_notify = puback_notify.clone();
+    let fast_qos0_loopback = args.mode == Mode::Loopback && args.qos == 0;
     let reader = tokio::spawn(async move {
         reader_loop(
             read_half,
@@ -290,6 +544,7 @@ async fn run_worker_inner(
             reader_pubacks,
             reader_received_notify,
             reader_puback_notify,
+            fast_qos0_loopback,
         )
         .await
     });
@@ -301,26 +556,50 @@ async fn run_worker_inner(
     let payload = vec![b'x'; args.payload_bytes];
     let batch_size = args.window.max(1);
 
+    // QoS0 benchmark packets are byte-identical for the lifetime of one client.
+    // Build the full send window once and reuse it instead of copying the same packet
+    // into a new multi-megabyte Vec for every window. With --topic-alias, the first
+    // counted PUBLISH establishes alias 1; all remaining packets use zero-length Topic
+    // Name + Topic Alias=1, exactly as MQTT 5 permits for a Network Connection.
+    let qos0_mapping_packet = (args.qos == 0 && args.topic_alias)
+        .then(|| encode_publish_topic_alias(&topic, &payload, 1));
+    let qos0_packet = (args.qos == 0).then(|| {
+        if args.topic_alias {
+            encode_publish_topic_alias("", &payload, 1)
+        } else {
+            encode_publish(&topic, &payload, 0, None)
+        }
+    });
+    let qos0_full_batch = qos0_packet.as_ref().map(|packet| {
+        let mut batch = Vec::with_capacity(packet.len() * batch_size);
+        for _ in 0..batch_size {
+            batch.extend_from_slice(packet);
+        }
+        batch
+    });
+
     let mut sent = 0u64;
+    if let Some(mapping) = qos0_mapping_packet.as_ref() {
+        if args.messages > 0 {
+            let mut guard = writer.lock().await;
+            guard.write_all(mapping).await?;
+            sent = 1;
+        }
+    }
     while sent < args.messages {
         let count = std::cmp::min(batch_size as u64, args.messages - sent) as usize;
-        let mut batch = Vec::new();
         if args.qos == 0 {
-            let packet = encode_publish(&topic, &payload, 0, None);
-            batch.reserve(packet.len() * count);
-            for _ in 0..count {
-                batch.extend_from_slice(&packet);
-            }
+            let packet_len = qos0_packet.as_ref().expect("qos0 packet").len();
+            let batch = qos0_full_batch.as_ref().expect("qos0 batch");
+            let mut guard = writer.lock().await;
+            guard.write_all(&batch[..packet_len * count]).await?;
         } else {
-            batch.reserve((payload.len() + topic.len() + 16) * count);
+            let mut batch = Vec::with_capacity((payload.len() + topic.len() + 16) * count);
             for offset in 0..count {
                 let sequence = sent + offset as u64;
                 let packet_id = ((sequence % 65_535) + 1) as u16;
                 batch.extend_from_slice(&encode_publish(&topic, &payload, 1, Some(packet_id)));
             }
-        }
-
-        {
             let mut guard = writer.lock().await;
             guard.write_all(&batch).await?;
         }
@@ -375,6 +654,13 @@ async fn setup_client(
     let (header, body) = read_packet(&mut stream).await?;
     if header >> 4 != 2 || body.len() < 2 || body[1] != 0 {
         return Err(format!("CONNECT rejected: header=0x{header:02x}, body={body:?}").into());
+    }
+
+    if args.topic_alias {
+        let maximum = parse_connack_topic_alias_maximum(&body)?;
+        if maximum < 1 {
+            return Err("broker did not advertise Topic Alias Maximum >= 1".into());
+        }
     }
 
     if args.mode == Mode::Loopback {
@@ -435,6 +721,7 @@ async fn reader_loop<R, W>(
     pubacks: Arc<AtomicU64>,
     received_notify: Arc<Notify>,
     puback_notify: Arc<Notify>,
+    fast_qos0_loopback: bool,
 ) -> Result<(), BenchError>
 where
     R: AsyncRead + Unpin,
@@ -442,6 +729,7 @@ where
 {
     let mut read_buf = BytesMut::with_capacity(256 * 1024);
     let mut ack_batch = Vec::with_capacity(16 * 1024);
+    let mut qos0_layout = FastQos0ReadLayout::default();
 
     loop {
         let n = reader.read_buf(&mut read_buf).await?;
@@ -455,12 +743,27 @@ where
         let mut puback_batch = 0u64;
         ack_batch.clear();
 
-        while let Some((header, body_start, packet_len)) = try_packet_bounds(&read_buf)? {
+        loop {
+            if fast_qos0_loopback && qos0_layout.packet_len != 0 {
+                let batch = scan_qos0_read_batch(&read_buf, &qos0_layout);
+                if batch.messages != 0 {
+                    received_batch += batch.messages as u64;
+                    read_buf.advance(batch.bytes);
+                    continue;
+                }
+            }
+
+            let Some((header, body_start, packet_len)) = try_packet_bounds(&read_buf)? else {
+                break;
+            };
             let body = &read_buf[body_start..packet_len];
             match header >> 4 {
                 3 => {
                     let qos = (header >> 1) & 0x03;
                     received_batch += 1;
+                    if fast_qos0_loopback && qos == 0 {
+                        qos0_layout.cache(&read_buf[..body_start], packet_len);
+                    }
                     if qos == 1 {
                         if let Some(packet_id) = parse_publish_packet_id(body, qos)? {
                             ack_batch.extend_from_slice(&encode_puback(packet_id));
@@ -486,6 +789,92 @@ where
             let mut guard = writer.lock().await;
             guard.write_all(&ack_batch).await?;
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FastQos0ReadLayout {
+    packet_len: usize,
+    fixed_header_len: usize,
+    fixed_header: [u8; 5],
+    header_word: u32,
+    header_mask: u32,
+    scalar4: bool,
+}
+
+impl FastQos0ReadLayout {
+    fn cache(&mut self, fixed_header: &[u8], packet_len: usize) {
+        if fixed_header.is_empty() || fixed_header.len() > self.fixed_header.len() {
+            self.packet_len = 0;
+            return;
+        }
+        self.packet_len = packet_len;
+        self.fixed_header_len = fixed_header.len();
+        self.fixed_header = [0; 5];
+        self.fixed_header[..fixed_header.len()].copy_from_slice(fixed_header);
+        self.scalar4 = fixed_header.len() <= 4 && packet_len >= 4;
+        self.header_word = 0;
+        self.header_mask = 0;
+        if self.scalar4 {
+            let mut word = [0u8; 4];
+            let mut mask = [0u8; 4];
+            word[..fixed_header.len()].copy_from_slice(fixed_header);
+            mask[..fixed_header.len()].fill(0xff);
+            self.header_word = u32::from_ne_bytes(word);
+            self.header_mask = u32::from_ne_bytes(mask);
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FastReadBatch {
+    bytes: usize,
+    messages: usize,
+}
+
+#[inline]
+fn scan_qos0_read_batch(buf: &[u8], layout: &FastQos0ReadLayout) -> FastReadBatch {
+    if layout.packet_len == 0 || layout.fixed_header_len == 0 {
+        return FastReadBatch::default();
+    }
+    let mut offset = 0usize;
+    let mut messages = 0usize;
+    if layout.scalar4 {
+        let sixteen = layout.packet_len.saturating_mul(16);
+        while offset + sixteen <= buf.len() {
+            let mut any = 0u32;
+            unsafe {
+                for lane in 0..16 {
+                    let ptr = buf.as_ptr().add(offset + lane * layout.packet_len);
+                    let actual = std::ptr::read_unaligned(ptr.cast::<u32>());
+                    any |= (actual ^ layout.header_word) & layout.header_mask;
+                }
+            }
+            if any != 0 {
+                break;
+            }
+            offset += sixteen;
+            messages += 16;
+        }
+    }
+    while offset + layout.packet_len <= buf.len() {
+        if layout.scalar4 {
+            let actual =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset).cast::<u32>()) };
+            if ((actual ^ layout.header_word) & layout.header_mask) != 0 {
+                break;
+            }
+        } else if buf[offset..offset + layout.fixed_header_len]
+            != layout.fixed_header[..layout.fixed_header_len]
+        {
+            break;
+        }
+        offset += layout.packet_len;
+        messages += 1;
+    }
+    FastReadBatch {
+        bytes: offset,
+        messages,
     }
 }
 
@@ -608,6 +997,16 @@ fn encode_publish(topic: &str, payload: &[u8], qos: u8, packet_id: Option<u16>) 
     make_packet(0x30 | ((qos & 0x03) << 1), body)
 }
 
+fn encode_publish_topic_alias(topic: &str, payload: &[u8], alias: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(topic.len() + payload.len() + 8);
+    put_utf8(&mut body, topic);
+    body.push(3); // property length
+    body.push(0x23); // Topic Alias
+    body.extend_from_slice(&alias.to_be_bytes());
+    body.extend_from_slice(payload);
+    make_packet(0x30, body)
+}
+
 fn encode_puback(packet_id: u16) -> Vec<u8> {
     vec![0x40, 0x02, (packet_id >> 8) as u8, packet_id as u8]
 }
@@ -652,6 +1051,90 @@ fn decode_varint(bytes: &[u8], pos: &mut usize) -> io::Result<usize> {
         io::ErrorKind::InvalidData,
         "invalid MQTT varint",
     ))
+}
+
+fn parse_connack_topic_alias_maximum(body: &[u8]) -> io::Result<u16> {
+    if body.len() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short CONNACK",
+        ));
+    }
+    let mut pos = 2usize;
+    let properties_len = decode_varint(body, &mut pos)?;
+    let end = pos
+        .checked_add(properties_len)
+        .filter(|end| *end <= body.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "short CONNACK properties"))?;
+    let mut maximum = 0u16;
+    while pos < end {
+        let id = body[pos];
+        pos += 1;
+        match id {
+            0x21 => pos += 2, // Receive Maximum
+            0x27 => pos += 4, // Maximum Packet Size
+            0x22 => {
+                if pos + 2 > end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short Topic Alias Maximum",
+                    ));
+                }
+                maximum = u16::from_be_bytes([body[pos], body[pos + 1]]);
+                pos += 2;
+            }
+            0x12 | 0x1A | 0x1C | 0x15 => {
+                // UTF-8 properties
+                if pos + 2 > end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short CONNACK UTF-8 property",
+                    ));
+                }
+                let len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+                pos += 2 + len;
+            }
+            0x16 => {
+                // binary auth data
+                if pos + 2 > end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "short CONNACK binary property",
+                    ));
+                }
+                let len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+                pos += 2 + len;
+            }
+            0x24 | 0x25 | 0x28 | 0x29 | 0x2A => pos += 1,
+            0x13 => pos += 2,
+            0x26 => {
+                // User Property: two UTF-8 strings
+                for _ in 0..2 {
+                    if pos + 2 > end {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "short CONNACK user property",
+                        ));
+                    }
+                    let len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+                    pos += 2 + len;
+                }
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown CONNACK property 0x{other:02x}"),
+                ));
+            }
+        }
+        if pos > end {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated CONNACK property",
+            ));
+        }
+    }
+    Ok(maximum)
 }
 
 fn parse_suback_reason(body: &[u8]) -> io::Result<u8> {
@@ -739,6 +1222,8 @@ fn parse_args() -> Result<Args, BenchError> {
         qos: 0,
         window: 1024,
         mode: Mode::Loopback,
+        topic_alias: false,
+        sendfile: false,
         username: env::var("PIPISTRELLE_BENCH_USER").unwrap_or_else(|_| "admin".to_string()),
         password: env::var("PIPISTRELLE_BENCH_PASSWORD").unwrap_or_else(|_| "admin123".to_string()),
         timeout: Duration::from_secs(60),
@@ -771,6 +1256,8 @@ fn parse_args() -> Result<Args, BenchError> {
             "--qos" => args.qos = value(&mut i)?.parse()?,
             "--window" => args.window = value(&mut i)?.parse()?,
             "--mode" => args.mode = Mode::parse(value(&mut i)?)?,
+            "--topic-alias" => args.topic_alias = true,
+            "--sendfile" => args.sendfile = true,
             "--username" => args.username = value(&mut i)?.to_string(),
             "--password" => args.password = value(&mut i)?.to_string(),
             "--timeout" => args.timeout = Duration::from_secs(value(&mut i)?.parse()?),
@@ -801,6 +1288,16 @@ fn parse_args() -> Result<Args, BenchError> {
     if args.qos > 1 {
         return Err("native benchmark currently supports QoS 0 and 1".into());
     }
+    if args.topic_alias && args.qos != 0 {
+        return Err("--topic-alias currently benchmarks QoS 0 only".into());
+    }
+    if args.sendfile {
+        if args.mode != Mode::Ingest || args.qos != 0 || args.tls {
+            return Err("--sendfile requires plain-TCP --mode ingest --qos 0".into());
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("--sendfile is supported on Linux only".into());
+    }
     if args.tls && !port_explicit {
         args.port = 8883;
     }
@@ -822,6 +1319,8 @@ fn print_help() {
          --payload N              payload bytes (default 128)\n\
          --qos 0|1                MQTT QoS (default 0)\n\
          --window N               batch/in-flight window (default 1024)\n\
+         --topic-alias            use MQTT 5 Topic Alias after first counted PUBLISH\n\
+         --sendfile               Linux ingest backend: memfd -> TCP sendfile for QoS0\n\
          --host HOST              broker host (default 127.0.0.1)\n\
          --port PORT              broker port (1883 TCP, 8883 TLS)\n\
          --tls                    enable native rustls TLS 1.3\n\
@@ -862,5 +1361,32 @@ mod tests {
         let (header, _, second_len) = try_packet_bounds(&combined[first_len..]).unwrap().unwrap();
         assert_eq!(header >> 4, 4);
         assert_eq!(second_len, second.len());
+    }
+    #[test]
+    fn fast_qos0_reader_batches_stable_frames_and_stops_on_change() {
+        let packet = encode_publish("bench/native/1", b"payload", 0, None);
+        let (_, body_start, packet_len) = try_packet_bounds(&packet)
+            .unwrap()
+            .expect("complete packet");
+        let mut layout = FastQos0ReadLayout::default();
+        layout.cache(&packet[..body_start], packet_len);
+
+        let mut block = Vec::new();
+        block.extend_from_slice(&packet);
+        block.extend_from_slice(&packet);
+        block.extend_from_slice(&packet);
+        let batch = scan_qos0_read_batch(&block, &layout);
+        assert_eq!(batch.messages, 3);
+        assert_eq!(batch.bytes, packet_len * 3);
+
+        let mut changed = packet.clone();
+        changed[0] = 0x31; // RETAIN=1 changes the fixed header and must end the fast run.
+        let mut mixed = Vec::new();
+        mixed.extend_from_slice(&packet);
+        mixed.extend_from_slice(&changed);
+        mixed.extend_from_slice(&packet);
+        let batch = scan_qos0_read_batch(&mixed, &layout);
+        assert_eq!(batch.messages, 1);
+        assert_eq!(batch.bytes, packet_len);
     }
 }

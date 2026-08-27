@@ -1,7 +1,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionInfo {
@@ -38,6 +38,7 @@ pub struct TopicRouter {
     exact_routes: RwLock<HashMap<String, Arc<[SubscriptionInfo]>>>,
     active_routes: AtomicUsize,
     non_exact_routes: AtomicUsize,
+    mutation_epoch: AtomicU64,
 }
 
 /// Represents matching subscribers.
@@ -56,6 +57,7 @@ impl TopicRouter {
             exact_routes: RwLock::new(HashMap::new()),
             active_routes: AtomicUsize::new(0),
             non_exact_routes: AtomicUsize::new(0),
+            mutation_epoch: AtomicU64::new(0),
         }
     }
 
@@ -185,6 +187,9 @@ impl TopicRouter {
                 self.non_exact_routes.fetch_add(1, Ordering::Release);
             }
         }
+        // Any subscribe/upsert can change routing semantics (QoS/options included).
+        // Fast zero-route batching snapshots this epoch and falls back if it changes.
+        self.mutation_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Unsubscribes a client from a topic filter.
@@ -271,6 +276,7 @@ impl TopicRouter {
             } else {
                 self.non_exact_routes.fetch_sub(1, Ordering::Release);
             }
+            self.mutation_epoch.fetch_add(1, Ordering::Release);
         }
         removed
     }
@@ -337,6 +343,7 @@ impl TopicRouter {
                 self.non_exact_routes
                     .fetch_sub(non_exact_removed, Ordering::Release);
             }
+            self.mutation_epoch.fetch_add(1, Ordering::Release);
         }
         removed
     }
@@ -346,6 +353,11 @@ impl TopicRouter {
     #[inline]
     pub fn has_routes(&self) -> bool {
         self.active_routes.load(Ordering::Acquire) != 0
+    }
+
+    #[inline]
+    pub fn mutation_epoch(&self) -> u64 {
+        self.mutation_epoch.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -513,6 +525,24 @@ mod tests {
         assert_eq!(router.remove_client("client2"), 1);
         assert!(router.match_exact("sensor/temp").is_none());
         assert!(!router.has_routes());
+    }
+
+    #[test]
+    fn routing_epoch_changes_for_route_semantic_mutations() {
+        let router = TopicRouter::new();
+        let e0 = router.mutation_epoch();
+        router.subscribe_with_options("client1", "sensor/temp", 0, None, false, false);
+        let e1 = router.mutation_epoch();
+        assert!(e1 > e0);
+
+        // Re-subscribing the same route can change QoS/options even though the route
+        // count stays constant, so it must still invalidate zero-route snapshots.
+        router.subscribe_with_options("client1", "sensor/temp", 1, Some(7), true, true);
+        let e2 = router.mutation_epoch();
+        assert!(e2 > e1);
+
+        assert!(router.unsubscribe("client1", "sensor/temp"));
+        assert!(router.mutation_epoch() > e2);
     }
 
     #[test]

@@ -10,20 +10,21 @@ mod tls;
 mod websocket;
 
 use bytes::{Buf, BytesMut};
+use std::borrow::Cow;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, IoSlice};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tracing::{Level, debug, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use smallvec::SmallVec;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 
@@ -32,7 +33,7 @@ use crate::codec::{
 };
 use crate::router::topic_filter_valid;
 use crate::session::{
-    ApplicationProperties, BrokerState, ClientSession, IncomingQos2Message, OutboundPacket,
+    ApplicationProperties, BrokerState, ClientSession, IncomingQos2Message, OutboundQueue,
     OutgoingQos2Phase, WillMessage,
 };
 use pipistrelle::{crypto, version};
@@ -183,6 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match plain_listener.accept().await {
                 Ok((socket, addr)) => {
+                    if let Err(error) = socket.set_nodelay(true) {
+                        debug!("Failed to set TCP_NODELAY for {}: {:?}", addr, error);
+                    }
                     let state = state_clone.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(socket, addr, state).await {
@@ -208,6 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 match tls_listener.accept().await {
                     Ok((socket, addr)) => {
+                        if let Err(error) = socket.set_nodelay(true) {
+                            debug!("Failed to set TCP_NODELAY for TLS {}: {:?}", addr, error);
+                        }
                         let state = state_clone.clone();
                         let acceptor = acceptor.clone();
                         tokio::spawn(async move {
@@ -266,6 +273,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             match ws_listener.accept().await {
                 Ok((socket, addr)) => {
+                    if let Err(error) = socket.set_nodelay(true) {
+                        debug!(
+                            "Failed to set TCP_NODELAY for WebSocket {}: {:?}",
+                            addr, error
+                        );
+                    }
                     let state = state_clone.clone();
                     tokio::spawn(async move {
                         match tokio_tungstenite::accept_async(socket).await {
@@ -312,7 +325,7 @@ where
 {
     debug!("New connection from: {}", addr);
 
-    let mut read_buf = BytesMut::with_capacity(4096);
+    let mut read_buf = BytesMut::with_capacity(CLIENT_READ_BUFFER_INITIAL);
 
     // 1. Wait for the CONNECT packet first. TCP can fragment a Control Packet across
     // arbitrary reads, so accumulate until the entire CONNECT is available or the
@@ -515,6 +528,7 @@ where
     // mutating Session/Will ownership. Optional capability properties are removed
     // if needed; Assigned Client Identifier is mandatory when the CONNECT ClientID was empty.
     let mut connack_buf = Vec::new();
+    let mut negotiated_topic_alias_maximum = state.topic_alias_maximum;
     let full_connack = Packet::ConnAck(ConnAck {
         session_present,
         reason_code: 0,
@@ -522,13 +536,14 @@ where
             receive_maximum: Some(state.receive_maximum),
             maximum_packet_size: Some(state.maximum_packet_size as u32),
             assigned_client_identifier: assigned_client_identifier.as_deref(),
-            topic_alias_maximum: Some(0),
+            topic_alias_maximum: Some(state.topic_alias_maximum),
             ..Default::default()
         },
     });
     encode_packet(&full_connack, &mut connack_buf);
     if connack_buf.len() > client_maximum_packet_size as usize {
         connack_buf.clear();
+        negotiated_topic_alias_maximum = 0;
         let minimal_connack = Packet::ConnAck(ConnAck {
             session_present,
             reason_code: 0,
@@ -565,7 +580,7 @@ where
     }
 
     // 2. Set up channels for sending outgoing packets to this client
-    let (tx, mut rx) = mpsc::channel::<OutboundPacket>(state.client_queue_capacity);
+    let tx = Arc::new(OutboundQueue::new(state.client_queue_capacity));
 
     let auth_username = username.as_deref().unwrap_or("");
     let allow_all_read = state.auth.authorizes_all(auth_username, "read");
@@ -580,6 +595,7 @@ where
         keep_alive,
         client_receive_maximum,
         client_maximum_packet_size,
+        negotiated_topic_alias_maximum,
         session_expiry_interval,
         tx,
     ));
@@ -647,36 +663,85 @@ where
     let writer_batch_packets = state.writer_batch_packets;
     let writer_batch_bytes = state.writer_batch_bytes;
     let inbound_receive_pending = session.inbound_receive_pending.clone();
+    let outbound_queue = session.sender.clone();
     let writer_task = tokio::spawn(async move {
+        let mut packets = Vec::with_capacity(writer_batch_packets.min(4096));
         let mut batch = Vec::with_capacity(writer_batch_bytes.min(256 * 1024));
         let mut release_ids = Vec::with_capacity(writer_batch_packets.min(256));
-        while let Some(first) = rx.recv().await {
+        while outbound_queue
+            .recv_batch(&mut packets, writer_batch_packets, writer_batch_bytes)
+            .await
+        {
             batch.clear();
             release_ids.clear();
-            batch.extend_from_slice(&first.bytes);
-            if let Some(packet_id) = first.release_inbound_packet_id {
-                release_ids.push(packet_id);
-            }
-            let mut packet_count = 1usize;
-
-            // Under load, collapse queued MQTT packets into one socket/TLS write.
-            // Ordering is preserved and the bounded channel remains the source of
-            // backpressure; light traffic is still written immediately.
-            while packet_count < writer_batch_packets && batch.len() < writer_batch_bytes {
-                match rx.try_recv() {
-                    Ok(packet) => {
-                        batch.extend_from_slice(&packet.bytes);
-                        if let Some(packet_id) = packet.release_inbound_packet_id {
-                            release_ids.push(packet_id);
-                        }
-                        packet_count += 1;
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+            for packet in &packets {
+                if let Some(packet_id) = packet.release_inbound_packet_id {
+                    release_ids.push(packet_id);
                 }
             }
 
-            if let Err(e) = write_half.write_all(&batch).await {
+            // Aggregated QoS0 descriptors already contain wire-ready contiguous MQTT
+            // packets. Avoid copying them into another Vec: direct writes trade a small
+            // number of large socket calls for the otherwise dominant memcpy cost.
+            let all_plain_blocks = packets
+                .iter()
+                .all(|packet| packet.release_inbound_packet_id.is_none());
+            let write_result = if all_plain_blocks && write_half.is_write_vectored() {
+                let mut index = 0usize;
+                let mut offset = 0usize;
+                let mut result = Ok(());
+                while index < packets.len() {
+                    let mut slices: SmallVec<[IoSlice<'_>; 64]> = SmallVec::new();
+                    slices.push(IoSlice::new(&packets[index].bytes[offset..]));
+                    for packet in &packets[index + 1..] {
+                        slices.push(IoSlice::new(&packet.bytes));
+                    }
+                    match write_half.write_vectored(&slices).await {
+                        Ok(0) => {
+                            result = Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "vectored MQTT writer made no progress",
+                            ));
+                            break;
+                        }
+                        Ok(mut written) => {
+                            while index < packets.len() {
+                                let remaining = packets[index].bytes.len() - offset;
+                                if written < remaining {
+                                    offset += written;
+                                    break;
+                                }
+                                written -= remaining;
+                                index += 1;
+                                offset = 0;
+                                if written == 0 {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                result
+            } else if all_plain_blocks {
+                let mut result = Ok(());
+                for packet in &packets {
+                    if let Err(error) = write_half.write_all(&packet.bytes).await {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                result
+            } else {
+                for packet in &packets {
+                    batch.extend_from_slice(&packet.bytes);
+                }
+                write_half.write_all(&batch).await
+            };
+            if let Err(e) = write_result {
                 warn!("Failed to write to client {}: {:?}", client_id_clone, e);
                 break;
             }
@@ -692,7 +757,7 @@ where
                 }
             }
         }
-        // Ensure socket write half is closed
+        outbound_queue.close();
         let _ = write_half.shutdown().await;
         debug!("Writer task terminated for client {}", client_id_clone);
     });
@@ -714,11 +779,24 @@ where
     };
 
     let mut disconnect_reason: Option<u8> = None;
+    let mut read_reserve_target = CLIENT_READ_BUFFER_INITIAL;
+    let mut saturated_reads = 0u8;
+    let mut fast_ingest_layout = FastIngestLayout::default();
+    let mut fast_ingest_alias_layout = FastIngestLayout::default();
+    let mut fast_route_layout = FastIngestLayout::default();
+    let mut fast_exact_route = FastExactRouteCache::default();
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
         loop {
             if session.disconnect_requested() {
                 warn!("Disconnect requested for client '{}'", client_id);
                 break;
+            }
+
+            // Hot publishers grow their receive buffer adaptively. Idle/normal clients
+            // remain at 4 KiB, while sustained full reads can reach 64 KiB and amortize
+            // Tokio/select/syscall overhead across hundreds of MQTT packets.
+            if read_buf.capacity().saturating_sub(read_buf.len()) < read_reserve_target {
+                read_buf.reserve(read_reserve_target);
             }
 
             // Slow-consumer policy can interrupt an otherwise idle socket read.
@@ -735,32 +813,150 @@ where
                     info!("Client '{}' closed connection", client_id);
                     break;
                 }
-                Ok(Ok(_)) => {
-                    // Update session keep-alive timer
-                    session.update_activity();
+                Ok(Ok(bytes_read_from_socket)) => {
+                    if bytes_read_from_socket >= read_reserve_target.saturating_sub(512) {
+                        saturated_reads = saturated_reads.saturating_add(1);
+                        let read_buffer_max = if session.allow_all_write
+                            && fast_ingest_alias_layout.total_len != 0
+                            && !state.bridge_active.load(Ordering::Relaxed)
+                            && !state.router.has_routes()
+                        {
+                            CLIENT_READ_BUFFER_MAX_FAST_ALIAS
+                        } else {
+                            CLIENT_READ_BUFFER_MAX_HOT
+                        };
+                        if saturated_reads >= 2 && read_reserve_target < read_buffer_max {
+                            read_reserve_target = (read_reserve_target * 2).min(read_buffer_max);
+                            saturated_reads = 0;
+                        }
+                    } else {
+                        saturated_reads = 0;
+                    }
 
                     // Parse and process all complete packets currently in the read buffer.
-                    // The fixed header reveals total packet size before the payload arrives,
-                    // allowing us to enforce Maximum Packet Size without buffering it all.
+                    // The dominant zero-route QoS0 case is scanned as a native batch: no
+                    // Packet enum, property object, async dispatch, or per-message atomic.
                     loop {
+                        if session.allow_all_write
+                            && !state.bridge_active.load(Ordering::Relaxed)
+                        {
+                            let route_epoch = state.router.mutation_epoch();
+                            if !state.router.has_routes() {
+                                let mut batch = scan_zero_route_qos0_batch(
+                                    &read_buf,
+                                    state.maximum_packet_size,
+                                    &mut fast_ingest_layout,
+                                );
+                                if batch.messages == 0 && session.topic_alias_maximum > 0 {
+                                    batch = scan_zero_route_qos0_alias_batch(
+                                        &read_buf,
+                                        state.maximum_packet_size,
+                                        &mut fast_ingest_alias_layout,
+                                        &session,
+                                    );
+                                }
+                                // A concurrent SUBSCRIBE/UNSUBSCRIBE/upsert invalidates the
+                                // zero-route assumption. Do not advance the buffer in that case;
+                                // the general decoder below will route every packet normally.
+                                if batch.messages != 0
+                                    && route_epoch == state.router.mutation_epoch()
+                                    && !state.router.has_routes()
+                                    && !state.bridge_active.load(Ordering::Relaxed)
+                                {
+                                    let start = session
+                                        .published_messages
+                                        .fetch_add(batch.messages, Ordering::Relaxed);
+                                    let samples = sampled_sequences_in_range(
+                                        start,
+                                        batch.messages,
+                                        state.publish_route_latency_sample_rate as u64,
+                                    );
+                                    state
+                                        .publish_route_latency
+                                        .record_zero_route_samples(samples);
+                                    read_buf.advance(batch.bytes);
+                                    continue;
+                                }
+                            } else if state.router.has_only_exact_routes() {
+                                let batch = scan_zero_route_qos0_batch(
+                                    &read_buf,
+                                    state.maximum_packet_size,
+                                    &mut fast_route_layout,
+                                );
+                                if batch.messages != 0 {
+                                    if let Some(target) = resolve_fast_exact_route(
+                                        &state,
+                                        &session,
+                                        &fast_route_layout,
+                                        &mut fast_exact_route,
+                                    ) {
+                                        let session_epoch =
+                                            state.session_epoch.load(Ordering::Acquire);
+                                        if route_epoch == state.router.mutation_epoch()
+                                            && session_epoch == fast_exact_route.session_epoch
+                                            && !state.bridge_active.load(Ordering::Relaxed)
+                                        {
+                                            let total = fast_route_layout.total_len;
+                                            debug_assert_eq!(
+                                                batch.bytes,
+                                                total * batch.messages as usize
+                                            );
+                                            let routed = read_buf.split_to(batch.bytes).freeze();
+                                            let start = session
+                                                .published_messages
+                                                .fetch_add(batch.messages, Ordering::Relaxed);
+                                            let samples = sampled_sequences_in_range(
+                                                start,
+                                                batch.messages,
+                                                state.publish_route_latency_sample_rate as u64,
+                                            );
+                                            let route_started =
+                                                (samples != 0).then(fast_route_timestamp);
+                                            let _ = state
+                                                .send_bytes_batch_to_session(
+                                                    &target,
+                                                    routed,
+                                                    total,
+                                                    batch.messages as usize,
+                                                )
+                                                .await;
+                                            if let Some(started) = route_started {
+                                                state.publish_route_latency.record_repeated(
+                                                    fast_route_elapsed(started),
+                                                    samples,
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         match decode_packet_limited(&read_buf, state.maximum_packet_size) {
                             Ok((packet, bytes_read)) => {
                                 if let Packet::Disconnect(pkt) = &packet {
                                     if let Some(expiry) = pkt.properties.session_expiry_interval {
                                         let connect_expiry = session.session_expiry();
                                         if connect_expiry == 0 && expiry > 0 {
-                                            let protocol_error = Packet::Disconnect(crate::codec::Disconnect {
-                                                reason_code: 0x82,
-                                                properties: Default::default(),
-                                            });
+                                            let protocol_error = Packet::Disconnect(
+                                                crate::codec::Disconnect {
+                                                    reason_code: 0x82,
+                                                    properties: Default::default(),
+                                                },
+                                            );
                                             let mut buf = Vec::new();
                                             encode_packet(&protocol_error, &mut buf);
                                             let _ = state.send_to_session(&session, buf).await;
-                                            return Err("DISCONNECT cannot raise a zero Session Expiry Interval".into());
+                                            return Err(
+                                                "DISCONNECT cannot raise a zero Session Expiry Interval"
+                                                    .into(),
+                                            );
                                         }
                                         session.set_session_expiry(expiry);
                                         if expiry > 0 {
-                                            state.db
+                                            state
+                                                .db
                                                 .save_session(
                                                     session.client_id.clone(),
                                                     session.username.clone(),
@@ -775,9 +971,8 @@ where
                                     return Ok(());
                                 }
 
-                                // Zero-routing QoS 0 fast path: authenticated sessions with a
-                                // cached global write ACL need no async dispatch, router lock,
-                                // bridge lock, allocation, ACK, or persistence work.
+                                // Zero-routing QoS 0 fallback for legal forms outside the
+                                // native layout cache (for example non-ASCII Topic Names).
                                 if let Packet::Publish(pkt) = &packet {
                                     if pkt.qos == 0
                                         && !pkt.retain
@@ -785,7 +980,7 @@ where
                                         && pkt.properties.topic_alias.is_none()
                                         && pkt.properties.response_topic.is_none()
                                         && !pkt.topic.is_empty()
-                                        && !topic_contains_wildcard(pkt.topic)
+                                        && publish_topic_error_reason(pkt.topic).is_none()
                                         && session.allow_all_write
                                         && !state.router.has_routes()
                                         && !state.bridge_active.load(Ordering::Relaxed)
@@ -809,7 +1004,6 @@ where
                                 read_buf.advance(bytes_read);
                             }
                             Err(codec::CodecError::Incomplete) => {
-                                // Wait for more data
                                 break;
                             }
                             Err(e) => {
@@ -909,6 +1103,604 @@ fn topic_contains_wildcard(topic: &str) -> bool {
         .any(|byte| *byte == b'+' || *byte == b'#')
 }
 
+const CLIENT_READ_BUFFER_INITIAL: usize = 4 * 1024;
+const CLIENT_READ_BUFFER_MAX_HOT: usize = 128 * 1024;
+const CLIENT_READ_BUFFER_MAX_FAST_ALIAS: usize = 512 * 1024;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FastIngestBatch {
+    bytes: usize,
+    messages: u64,
+}
+
+#[derive(Debug, Default)]
+struct FastIngestLayout {
+    total_len: usize,
+    topic: Option<Arc<str>>,
+    prefix: Vec<u8>,
+    prefix32: [u8; 32],
+    mask32: [u8; 32],
+    scalar_words: [u64; 3],
+    scalar_tail_mask: u64,
+    scalar9_word: u64,
+    scalar9_tail: u8,
+    scalar9: bool,
+    scalar24: bool,
+    neon32: bool,
+}
+
+impl FastIngestLayout {
+    #[inline]
+    fn cache_prefix(&mut self, prefix: &[u8], total_len: usize) {
+        self.total_len = total_len;
+        self.prefix.clear();
+        self.prefix.extend_from_slice(prefix);
+        self.prefix32 = [0; 32];
+        self.mask32 = [0; 32];
+        self.scalar_words = [0; 3];
+        self.scalar_tail_mask = 0;
+        self.scalar9_word = 0;
+        self.scalar9_tail = 0;
+        self.scalar9 = prefix.len() == 9 && total_len >= 9;
+        if self.scalar9 {
+            self.scalar9_word = u64::from_ne_bytes(prefix[..8].try_into().unwrap());
+            self.scalar9_tail = prefix[8];
+        }
+        self.scalar24 = prefix.len() > 16 && prefix.len() <= 24 && total_len >= 24;
+        if self.scalar24 {
+            let mut tmp = [0u8; 24];
+            tmp[..prefix.len()].copy_from_slice(prefix);
+            self.scalar_words[0] = u64::from_ne_bytes(tmp[0..8].try_into().unwrap());
+            self.scalar_words[1] = u64::from_ne_bytes(tmp[8..16].try_into().unwrap());
+            self.scalar_words[2] = u64::from_ne_bytes(tmp[16..24].try_into().unwrap());
+            let tail = prefix.len() - 16;
+            self.scalar_tail_mask = if tail == 8 {
+                u64::MAX
+            } else {
+                (1u64 << (tail * 8)) - 1
+            };
+        }
+        self.neon32 = prefix.len() <= 32 && total_len >= 32;
+        if self.neon32 {
+            self.prefix32[..prefix.len()].copy_from_slice(prefix);
+            self.mask32[..prefix.len()].fill(0xff);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_ingest_layout_matches(buf: &[u8], offset: usize, layout: &FastIngestLayout) -> bool {
+    if layout.neon32 {
+        use std::arch::aarch64::{vandq_u8, veorq_u8, vld1q_u8, vmaxvq_u8, vorrq_u8};
+        debug_assert!(offset + 32 <= buf.len());
+        unsafe {
+            let actual0 = vld1q_u8(buf.as_ptr().add(offset));
+            let actual1 = vld1q_u8(buf.as_ptr().add(offset + 16));
+            let expected0 = vld1q_u8(layout.prefix32.as_ptr());
+            let expected1 = vld1q_u8(layout.prefix32.as_ptr().add(16));
+            let mask0 = vld1q_u8(layout.mask32.as_ptr());
+            let mask1 = vld1q_u8(layout.mask32.as_ptr().add(16));
+            let diff0 = vandq_u8(veorq_u8(actual0, expected0), mask0);
+            let diff1 = vandq_u8(veorq_u8(actual1, expected1), mask1);
+            vmaxvq_u8(vorrq_u8(diff0, diff1)) == 0
+        }
+    } else {
+        let prefix_len = layout.prefix.len();
+        offset + prefix_len <= buf.len() && buf[offset..offset + prefix_len] == layout.prefix
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_ingest_layout_matches_8(
+    buf: &[u8],
+    offset: usize,
+    total: usize,
+    layout: &FastIngestLayout,
+) -> bool {
+    if layout.scalar24 {
+        debug_assert!(offset + total * 8 <= buf.len());
+        unsafe {
+            let mut any = 0u64;
+            for lane in 0..8 {
+                let base = buf.as_ptr().add(offset + lane * total);
+                let a0 = std::ptr::read_unaligned(base.cast::<u64>());
+                let a1 = std::ptr::read_unaligned(base.add(8).cast::<u64>());
+                let a2 = std::ptr::read_unaligned(base.add(16).cast::<u64>());
+                any |= a0 ^ layout.scalar_words[0];
+                any |= a1 ^ layout.scalar_words[1];
+                any |= (a2 ^ layout.scalar_words[2]) & layout.scalar_tail_mask;
+            }
+            return any == 0;
+        }
+    }
+    if !layout.neon32 {
+        return (0..8).all(|lane| fast_ingest_layout_matches(buf, offset + lane * total, layout));
+    }
+    use std::arch::aarch64::{vandq_u8, vdupq_n_u8, veorq_u8, vld1q_u8, vmaxvq_u8, vorrq_u8};
+    debug_assert!(offset + total * 8 <= buf.len());
+    unsafe {
+        let expected0 = vld1q_u8(layout.prefix32.as_ptr());
+        let expected1 = vld1q_u8(layout.prefix32.as_ptr().add(16));
+        let mask0 = vld1q_u8(layout.mask32.as_ptr());
+        let mask1 = vld1q_u8(layout.mask32.as_ptr().add(16));
+        let mut any_diff = vdupq_n_u8(0);
+        for lane in 0..8 {
+            let base = buf.as_ptr().add(offset + lane * total);
+            let actual0 = vld1q_u8(base);
+            let actual1 = vld1q_u8(base.add(16));
+            let diff0 = vandq_u8(veorq_u8(actual0, expected0), mask0);
+            let diff1 = vandq_u8(veorq_u8(actual1, expected1), mask1);
+            any_diff = vorrq_u8(any_diff, vorrq_u8(diff0, diff1));
+        }
+        vmaxvq_u8(any_diff) == 0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_ingest_layout_matches_16_scalar24(
+    buf: &[u8],
+    offset: usize,
+    total: usize,
+    layout: &FastIngestLayout,
+) -> bool {
+    if !layout.scalar24 {
+        return false;
+    }
+    debug_assert!(offset + total * 16 <= buf.len());
+    unsafe {
+        let mut any = 0u64;
+        for lane in 0..16 {
+            let base = buf.as_ptr().add(offset + lane * total);
+            let a0 = std::ptr::read_unaligned(base.cast::<u64>());
+            let a1 = std::ptr::read_unaligned(base.add(8).cast::<u64>());
+            let a2 = std::ptr::read_unaligned(base.add(16).cast::<u64>());
+            any |= a0 ^ layout.scalar_words[0];
+            any |= a1 ^ layout.scalar_words[1];
+            any |= (a2 ^ layout.scalar_words[2]) & layout.scalar_tail_mask;
+        }
+        any == 0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_ingest_layout_matches_16_scalar9(
+    buf: &[u8],
+    offset: usize,
+    total: usize,
+    layout: &FastIngestLayout,
+) -> bool {
+    if !layout.scalar9 {
+        return false;
+    }
+    debug_assert!(offset + total * 16 <= buf.len());
+    unsafe {
+        let mut any = 0u64;
+        let mut tail = 0u8;
+        for lane in 0..16 {
+            let base = buf.as_ptr().add(offset + lane * total);
+            any |= std::ptr::read_unaligned(base.cast::<u64>()) ^ layout.scalar9_word;
+            tail |= *base.add(8) ^ layout.scalar9_tail;
+        }
+        (any | tail as u64) == 0
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn fast_ingest_layout_matches(buf: &[u8], offset: usize, layout: &FastIngestLayout) -> bool {
+    let prefix_len = layout.prefix.len();
+    offset + prefix_len <= buf.len() && buf[offset..offset + prefix_len] == layout.prefix
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn fast_ingest_layout_matches_8(
+    buf: &[u8],
+    offset: usize,
+    total: usize,
+    layout: &FastIngestLayout,
+) -> bool {
+    (0..8).all(|lane| fast_ingest_layout_matches(buf, offset + lane * total, layout))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn fast_ingest_layout_matches_16_scalar24(
+    _buf: &[u8],
+    _offset: usize,
+    _total: usize,
+    _layout: &FastIngestLayout,
+) -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn fast_ingest_layout_matches_16_scalar9(
+    _buf: &[u8],
+    _offset: usize,
+    _total: usize,
+    _layout: &FastIngestLayout,
+) -> bool {
+    false
+}
+
+#[derive(Default)]
+struct FastExactRouteCache {
+    route_epoch: u64,
+    session_epoch: u64,
+    topic: Option<Arc<str>>,
+    target: Option<Arc<ClientSession>>,
+}
+
+impl FastExactRouteCache {
+    #[inline]
+    fn invalidate(&mut self) {
+        self.target = None;
+        self.topic = None;
+    }
+}
+
+fn resolve_fast_exact_route(
+    state: &BrokerState,
+    publisher: &ClientSession,
+    layout: &FastIngestLayout,
+    cache: &mut FastExactRouteCache,
+) -> Option<Arc<ClientSession>> {
+    let topic = layout.topic.as_ref()?;
+    let route_epoch = state.router.mutation_epoch();
+    let session_epoch = state.session_epoch.load(Ordering::Acquire);
+
+    if cache.route_epoch == route_epoch
+        && cache.session_epoch == session_epoch
+        && cache.topic.as_deref() == Some(topic.as_ref())
+    {
+        if let Some(target) = cache.target.as_ref() {
+            if target.connected.load(Ordering::Acquire) {
+                return Some(target.clone());
+            }
+        }
+    }
+
+    cache.invalidate();
+    cache.route_epoch = route_epoch;
+    cache.session_epoch = session_epoch;
+    cache.topic = Some(topic.clone());
+
+    if !state.router.has_only_exact_routes() {
+        return None;
+    }
+    let subscriptions = state.router.match_exact(topic)?;
+    if subscriptions.len() != 1 {
+        return None;
+    }
+    let sub = &subscriptions[0];
+    if sub.subscription_identifier.is_some()
+        || (sub.no_local && sub.client_id == publisher.client_id)
+    {
+        return None;
+    }
+    let target = state.sessions.read().get(&sub.client_id).cloned()?;
+    if !target.connected.load(Ordering::Acquire) {
+        return None;
+    }
+    cache.target = Some(target.clone());
+    Some(target)
+}
+
+/// Scans a contiguous run of the simplest valid MQTT v5 PUBLISH form used by the
+/// zero-route ingest path: QoS0, DUP=0, RETAIN=0, ASCII Topic Name, zero properties.
+/// Any other legal form falls back to the full codec; malformed forms are likewise
+/// left to the full codec so reason-code behavior remains centralized and unchanged.
+#[inline]
+fn scan_zero_route_qos0_batch(
+    buf: &[u8],
+    maximum_packet_size: usize,
+    layout: &mut FastIngestLayout,
+) -> FastIngestBatch {
+    let mut offset = 0usize;
+    let mut messages = 0u64;
+
+    while offset < buf.len() {
+        if layout.total_len != 0 {
+            let total = layout.total_len;
+            if layout.scalar24 {
+                let sixteen = total.saturating_mul(16);
+                while offset + sixteen <= buf.len() {
+                    if !fast_ingest_layout_matches_16_scalar24(buf, offset, total, layout) {
+                        break;
+                    }
+                    messages += 16;
+                    offset += sixteen;
+                }
+            }
+            let eight = total.saturating_mul(8);
+            while offset + eight <= buf.len() {
+                if !fast_ingest_layout_matches_8(buf, offset, total, layout) {
+                    break;
+                }
+                messages += 8;
+                offset += eight;
+            }
+            if offset + total > buf.len() {
+                break;
+            }
+            if fast_ingest_layout_matches(buf, offset, layout) {
+                messages += 1;
+                offset += total;
+                continue;
+            }
+        }
+
+        // Fixed header 0x30 means PUBLISH, DUP=0, QoS0, RETAIN=0. Other legal
+        // PUBLISH forms and all other control packets use the general codec.
+        if buf[offset] != 0x30 {
+            break;
+        }
+        if offset + 1 >= buf.len() {
+            break;
+        }
+        let first_remaining = buf[offset + 1];
+        let (remaining_len, remaining_bytes) = if first_remaining & 0x80 == 0 {
+            (first_remaining as usize, 1usize)
+        } else {
+            if offset + 2 >= buf.len() {
+                break;
+            }
+            let second_remaining = buf[offset + 2];
+            // The native ingest scanner intentionally handles the common canonical
+            // 1/2-byte Remaining Length forms. Larger or non-canonical encodings fall
+            // through to the fully general MQTT codec.
+            if second_remaining & 0x80 != 0 {
+                break;
+            }
+            let value =
+                ((first_remaining & 0x7f) as usize) | (((second_remaining & 0x7f) as usize) << 7);
+            if value < 128 {
+                break;
+            }
+            (value, 2usize)
+        };
+        let total = 1usize + remaining_bytes + remaining_len;
+        if total > maximum_packet_size || offset + total > buf.len() {
+            break;
+        }
+
+        let body_start = offset + 1 + remaining_bytes;
+        let body_end = offset + total;
+        if body_start + 3 > body_end {
+            break;
+        }
+        let topic_len = u16::from_be_bytes([buf[body_start], buf[body_start + 1]]) as usize;
+        if topic_len == 0 {
+            break;
+        }
+        let topic_start = body_start + 2;
+        let topic_end = topic_start + topic_len;
+        if topic_end >= body_end {
+            break;
+        }
+
+        let topic_bytes = &buf[topic_start..topic_end];
+        // The ASCII case needs no UTF-8 decoder. Non-ASCII is fully legal, but it
+        // deliberately falls back to the normal codec + MQTT Unicode validation.
+        let mut valid_ascii_topic = true;
+        for &byte in topic_bytes {
+            if byte >= 0x80 || byte <= 0x1f || byte == 0x7f || byte == b'+' || byte == b'#' {
+                valid_ascii_topic = false;
+                break;
+            }
+        }
+        if !valid_ascii_topic {
+            break;
+        }
+
+        // Property Length encoded as the canonical single zero byte. Any property
+        // whatsoever (or a non-canonical encoding) is handled by the full codec.
+        if buf[topic_end] != 0 {
+            break;
+        }
+
+        layout.cache_prefix(&buf[offset..=topic_end], total);
+        layout.topic = Some(Arc::<str>::from(unsafe {
+            std::str::from_utf8_unchecked(topic_bytes)
+        }));
+
+        messages += 1;
+        offset += total;
+    }
+
+    FastIngestBatch {
+        bytes: offset,
+        messages,
+    }
+}
+
+/// Scans the MQTT 5 Topic Alias form used by a hot zero-route publisher after the
+/// alias mapping has been established on this Network Connection:
+/// QoS0, DUP=0, RETAIN=0, zero-length Topic Name, exactly one Topic Alias property.
+/// Mapping/range validation is performed once when caching a new alias layout. Any
+/// mismatch or unsupported property falls back to the full MQTT codec.
+#[inline]
+fn scan_zero_route_qos0_alias_batch(
+    buf: &[u8],
+    maximum_packet_size: usize,
+    layout: &mut FastIngestLayout,
+    session: &ClientSession,
+) -> FastIngestBatch {
+    let mut offset = 0usize;
+    let mut messages = 0u64;
+
+    while offset < buf.len() {
+        if layout.total_len != 0 {
+            let total = layout.total_len;
+            if layout.scalar9 {
+                let sixteen = total.saturating_mul(16);
+                while offset + sixteen <= buf.len() {
+                    if !fast_ingest_layout_matches_16_scalar9(buf, offset, total, layout) {
+                        break;
+                    }
+                    messages += 16;
+                    offset += sixteen;
+                }
+            }
+            let eight = total.saturating_mul(8);
+            while offset + eight <= buf.len() {
+                if !fast_ingest_layout_matches_8(buf, offset, total, layout) {
+                    break;
+                }
+                messages += 8;
+                offset += eight;
+            }
+            if offset + total > buf.len() {
+                break;
+            }
+            if fast_ingest_layout_matches(buf, offset, layout) {
+                messages += 1;
+                offset += total;
+                continue;
+            }
+        }
+
+        if buf[offset] != 0x30 || offset + 1 >= buf.len() {
+            break;
+        }
+        let first_remaining = buf[offset + 1];
+        let (remaining_len, remaining_bytes) = if first_remaining & 0x80 == 0 {
+            (first_remaining as usize, 1usize)
+        } else {
+            if offset + 2 >= buf.len() {
+                break;
+            }
+            let second_remaining = buf[offset + 2];
+            if second_remaining & 0x80 != 0 {
+                break;
+            }
+            let value =
+                ((first_remaining & 0x7f) as usize) | (((second_remaining & 0x7f) as usize) << 7);
+            if value < 128 {
+                break;
+            }
+            (value, 2usize)
+        };
+        let total = 1usize + remaining_bytes + remaining_len;
+        if total > maximum_packet_size || offset + total > buf.len() {
+            break;
+        }
+
+        let body_start = offset + 1 + remaining_bytes;
+        let body_end = offset + total;
+        // Topic length (2) + property length (1) + property id (1) + alias (2).
+        if body_start + 6 > body_end {
+            break;
+        }
+        if buf[body_start] != 0 || buf[body_start + 1] != 0 {
+            break;
+        }
+        let prop_start = body_start + 2;
+        if buf[prop_start] != 3 || buf[prop_start + 1] != 0x23 {
+            break;
+        }
+        let alias = u16::from_be_bytes([buf[prop_start + 2], buf[prop_start + 3]]);
+        if alias == 0 || alias > session.topic_alias_maximum {
+            break;
+        }
+        // This lock is only taken when discovering/changing an alias packet layout.
+        // Once cached, the same connection owns the mapping for its lifetime.
+        if !session.topic_aliases.read().contains_key(&alias) {
+            break;
+        }
+
+        let prefix_end = prop_start + 4;
+        layout.cache_prefix(&buf[offset..prefix_end], total);
+        layout.topic = None;
+        messages += 1;
+        offset += total;
+    }
+
+    FastIngestBatch {
+        bytes: offset,
+        messages,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+type FastRouteTimestamp = u64;
+#[cfg(not(target_arch = "aarch64"))]
+type FastRouteTimestamp = Instant;
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_route_timestamp() -> FastRouteTimestamp {
+    let value: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {value}, cntvct_el0",
+            value = out(reg) value,
+            options(nostack, preserves_flags),
+        );
+    }
+    value
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_route_elapsed(start: FastRouteTimestamp) -> Duration {
+    let end = fast_route_timestamp();
+    let ticks = end.wrapping_sub(start);
+    let frequency: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {frequency}, cntfrq_el0",
+            frequency = out(reg) frequency,
+            options(nostack, preserves_flags),
+        );
+    }
+    if frequency == 1_000_000_000 {
+        Duration::from_nanos(ticks)
+    } else if frequency == 0 {
+        Duration::ZERO
+    } else {
+        let nanos = (ticks as u128)
+            .saturating_mul(1_000_000_000)
+            .checked_div(frequency as u128)
+            .unwrap_or(0)
+            .min(u64::MAX as u128) as u64;
+        Duration::from_nanos(nanos)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn fast_route_timestamp() -> FastRouteTimestamp {
+    Instant::now()
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn fast_route_elapsed(start: FastRouteTimestamp) -> Duration {
+    start.elapsed()
+}
+
+#[inline]
+fn sampled_sequences_in_range(start: u64, count: u64, sample_rate: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    debug_assert!(sample_rate.is_power_of_two());
+    let mask = sample_rate - 1;
+    let first_delta = sample_rate.wrapping_sub(start & mask) & mask;
+    if first_delta >= count {
+        0
+    } else {
+        1 + (count - 1 - first_delta) / sample_rate
+    }
+}
+
 async fn disconnect_client_with_reason(
     state: &BrokerState,
     session: &ClientSession,
@@ -959,24 +1751,74 @@ async fn process_client_packet(
                 )
                 .await;
             }
-            if pkt.topic.is_empty() {
-                return protocol_error(
-                    state,
-                    session,
-                    0x82,
-                    "Zero-length PUBLISH topic without supported Topic Alias",
-                )
-                .await;
-            }
-            if let Some(reason) = publish_topic_error_reason(pkt.topic) {
-                return protocol_error(
-                    state,
-                    session,
-                    reason,
-                    "PUBLISH topic contains MQTT-forbidden characters",
-                )
-                .await;
-            }
+
+            // Topic Alias is Network Connection state in MQTT 5. A non-empty Topic
+            // Name + alias creates/replaces a mapping; an empty Topic Name resolves
+            // an existing mapping. Alias 0/out-of-range is 0x94, while using an alias
+            // before it has a mapping is a Protocol Error (0x82).
+            let resolved_topic: Cow<'_, str> = match pkt.properties.topic_alias {
+                Some(alias) => {
+                    if alias == 0 || alias > session.topic_alias_maximum {
+                        return protocol_error(
+                            state,
+                            session,
+                            0x94,
+                            "Topic Alias outside the server-advertised range",
+                        )
+                        .await;
+                    }
+                    if pkt.topic.is_empty() {
+                        let mapped = session.topic_aliases.read().get(&alias).cloned();
+                        let Some(mapped) = mapped else {
+                            return protocol_error(
+                                state,
+                                session,
+                                0x82,
+                                "Topic Alias used before a mapping was established",
+                            )
+                            .await;
+                        };
+                        Cow::Owned(mapped)
+                    } else {
+                        if let Some(reason) = publish_topic_error_reason(pkt.topic) {
+                            return protocol_error(
+                                state,
+                                session,
+                                reason,
+                                "PUBLISH topic contains MQTT-forbidden characters",
+                            )
+                            .await;
+                        }
+                        session
+                            .topic_aliases
+                            .write()
+                            .insert(alias, pkt.topic.to_string());
+                        Cow::Borrowed(pkt.topic)
+                    }
+                }
+                None => {
+                    if pkt.topic.is_empty() {
+                        return protocol_error(
+                            state,
+                            session,
+                            0x82,
+                            "Zero-length PUBLISH topic without Topic Alias",
+                        )
+                        .await;
+                    }
+                    if let Some(reason) = publish_topic_error_reason(pkt.topic) {
+                        return protocol_error(
+                            state,
+                            session,
+                            reason,
+                            "PUBLISH topic contains MQTT-forbidden characters",
+                        )
+                        .await;
+                    }
+                    Cow::Borrowed(pkt.topic)
+                }
+            };
+            let topic = resolved_topic.as_ref();
             if let Some(response_topic) = pkt.properties.response_topic {
                 if response_topic.is_empty() || topic_contains_wildcard(response_topic) {
                     return protocol_error(state, session, 0x82, "Invalid PUBLISH Response Topic")
@@ -994,19 +1836,6 @@ async fn process_client_packet(
                     .await;
                 }
             }
-            // Pipistrelle currently advertises no Topic Alias Maximum, so a client
-            // must not send a Topic Alias. The property is connection-local and is
-            // never forwarded to subscribers.
-            if pkt.properties.topic_alias.is_some() {
-                return protocol_error(
-                    state,
-                    session,
-                    0x94,
-                    "Topic Alias received while server maximum is zero",
-                )
-                .await;
-            }
-
             let inbound_packet_id = if pkt.qos > 0 {
                 let Some(packet_id) = pkt.packet_id else {
                     return protocol_error(
@@ -1032,10 +1861,10 @@ async fn process_client_packet(
 
             // Check write authorization
             let username = session.username.as_deref().unwrap_or("");
-            if !session.allow_all_write && !state.auth.authorize(username, pkt.topic, "write") {
+            if !session.allow_all_write && !state.auth.authorize(username, topic, "write") {
                 warn!(
                     "Client '{}' (user: '{}') not authorized to publish on topic '{}'",
-                    session.client_id, username, pkt.topic
+                    session.client_id, username, topic
                 );
                 if let Some(pid) = pkt.packet_id {
                     let ack = PubAck {
@@ -1072,7 +1901,7 @@ async fn process_client_packet(
                 let already_owned = session.incoming_qos2.read().contains_key(&packet_id);
                 if !already_owned {
                     let message = IncomingQos2Message {
-                        topic: pkt.topic.to_string(),
+                        topic: topic.to_string(),
                         payload: pkt.payload.to_vec(),
                         retain: pkt.retain,
                         properties: application_properties.clone(),
@@ -1112,14 +1941,14 @@ async fn process_client_packet(
             }
 
             if pkt.retain {
-                state.update_retained(pkt.topic, pkt.payload, pkt.qos, &application_properties);
+                state.update_retained(topic, pkt.payload, pkt.qos, &application_properties);
             }
 
             let publish_sequence = session.published_messages.fetch_add(1, Ordering::Relaxed);
             state
                 .route_publish(
                     &session.client_id,
-                    pkt.topic,
+                    topic,
                     pkt.payload,
                     pkt.qos,
                     pkt.retain,
@@ -1396,6 +2225,201 @@ async fn process_client_packet(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fast_ingest_tests {
+    use super::*;
+
+    #[test]
+    fn native_batch_scans_multiple_simple_publishes() {
+        let one = crate::codec::encode_publish_qos0("bench/native/1", b"payload", false, None);
+        let two = crate::codec::encode_publish_qos0("bench/native/2", b"payload2", false, None);
+        let mut joined = one.clone();
+        joined.extend_from_slice(&two);
+        let batch =
+            scan_zero_route_qos0_batch(&joined, 1024 * 1024, &mut FastIngestLayout::default());
+        assert_eq!(batch.messages, 2);
+        assert_eq!(batch.bytes, joined.len());
+    }
+
+    #[test]
+    fn native_batch_falls_back_for_non_ascii_or_properties() {
+        let non_ascii = crate::codec::encode_publish_qos0("bench/café", b"x", false, None);
+        assert_eq!(
+            scan_zero_route_qos0_batch(&non_ascii, 1024, &mut FastIngestLayout::default()).messages,
+            0
+        );
+
+        let packet = Packet::Publish(crate::codec::Publish {
+            dup: false,
+            qos: 0,
+            retain: false,
+            topic: "bench/native/props",
+            packet_id: None,
+            properties: crate::codec::PublishProperties {
+                content_type: Some("application/octet-stream"),
+                ..Default::default()
+            },
+            payload: b"x",
+        });
+        let mut buf = Vec::new();
+        encode_packet(&packet, &mut buf);
+        assert_eq!(
+            scan_zero_route_qos0_batch(&buf, 1024, &mut FastIngestLayout::default()).messages,
+            0
+        );
+    }
+
+    #[test]
+    fn native_layout_cache_revalidates_when_header_changes() {
+        let one = crate::codec::encode_publish_qos0("bench/native/a", b"payload", false, None);
+        let two =
+            crate::codec::encode_publish_qos0("bench/native/b", b"different-size", false, None);
+        let mut joined = one;
+        joined.extend_from_slice(&two);
+        let mut layout = FastIngestLayout::default();
+        let batch = scan_zero_route_qos0_batch(&joined, 1024 * 1024, &mut layout);
+        assert_eq!(batch.messages, 2);
+        assert_eq!(batch.bytes, joined.len());
+    }
+
+    #[test]
+    fn vector_layout_match_masks_payload_and_rejects_header_change() {
+        let first = crate::codec::encode_publish_qos0("bench/native/a", &[b'a'; 128], false, None);
+        let second = crate::codec::encode_publish_qos0("bench/native/a", &[b'z'; 128], false, None);
+        let mut layout = FastIngestLayout::default();
+        assert_eq!(
+            scan_zero_route_qos0_batch(&first, 1024 * 1024, &mut layout).messages,
+            1
+        );
+        assert!(fast_ingest_layout_matches(&second, 0, &layout));
+        let changed_topic =
+            crate::codec::encode_publish_qos0("bench/native/b", &[b'z'; 128], false, None);
+        assert!(!fast_ingest_layout_matches(&changed_topic, 0, &layout));
+    }
+
+    #[test]
+    fn vector_layout_match_8_detects_any_header_change() {
+        let packet =
+            crate::codec::encode_publish_qos0("bench/native/eight", &[b'x'; 128], false, None);
+        let mut layout = FastIngestLayout::default();
+        assert_eq!(
+            scan_zero_route_qos0_batch(&packet, 1024 * 1024, &mut layout).messages,
+            1
+        );
+        let mut eight = Vec::with_capacity(packet.len() * 8);
+        for _ in 0..8 {
+            eight.extend_from_slice(&packet);
+        }
+        assert!(fast_ingest_layout_matches_8(
+            &eight,
+            0,
+            packet.len(),
+            &layout
+        ));
+        let second_packet = packet.len();
+        let topic_byte = 5usize;
+        eight[second_packet + topic_byte] ^= 1;
+        assert!(!fast_ingest_layout_matches_8(
+            &eight,
+            0,
+            packet.len(),
+            &layout
+        ));
+    }
+
+    #[test]
+    fn alias_batch_requires_established_connection_mapping() {
+        let tx = Arc::new(OutboundQueue::new(1));
+        let session = ClientSession::new(
+            "alias-fast".into(),
+            None,
+            true,
+            true,
+            true,
+            60,
+            u16::MAX,
+            268_435_455,
+            32,
+            0,
+            tx,
+        );
+        let payload = [b'x'; 128];
+        let packet = crate::codec::encode_publish_qos0_with_topic_alias("", &payload, 1);
+        let mut layout = FastIngestLayout::default();
+        assert_eq!(
+            scan_zero_route_qos0_alias_batch(&packet, 1024 * 1024, &mut layout, &session).messages,
+            0
+        );
+        session
+            .topic_aliases
+            .write()
+            .insert(1, "bench/alias".into());
+        assert_eq!(
+            scan_zero_route_qos0_alias_batch(&packet, 1024 * 1024, &mut layout, &session).messages,
+            1
+        );
+    }
+
+    #[test]
+    fn alias_scalar9_batch_accepts_variable_payload_and_stops_on_alias_change() {
+        let tx = Arc::new(OutboundQueue::new(1));
+        let session = ClientSession::new(
+            "alias-scalar9".into(),
+            None,
+            true,
+            true,
+            true,
+            60,
+            u16::MAX,
+            268_435_455,
+            32,
+            0,
+            tx,
+        );
+        session
+            .topic_aliases
+            .write()
+            .insert(1, "bench/alias".into());
+        let seed = crate::codec::encode_publish_qos0_with_topic_alias("", &[b'x'; 128], 1);
+        let mut layout = FastIngestLayout::default();
+        assert_eq!(
+            scan_zero_route_qos0_alias_batch(&seed, 1024 * 1024, &mut layout, &session).messages,
+            1
+        );
+        assert!(layout.scalar9);
+
+        let mut batch = Vec::with_capacity(seed.len() * 16);
+        for lane in 0..16u8 {
+            let mut payload = [b'x'; 128];
+            payload[0] = lane;
+            batch.extend_from_slice(&crate::codec::encode_publish_qos0_with_topic_alias(
+                "", &payload, 1,
+            ));
+        }
+        let accepted = scan_zero_route_qos0_alias_batch(&batch, 1024 * 1024, &mut layout, &session);
+        assert_eq!(accepted.messages, 16);
+        assert_eq!(accepted.bytes, batch.len());
+
+        let packet_len = seed.len();
+        batch[7 * packet_len + 8] = 2;
+        let stopped = scan_zero_route_qos0_alias_batch(&batch, 1024 * 1024, &mut layout, &session);
+        assert_eq!(stopped.messages, 7);
+        assert_eq!(stopped.bytes, 7 * packet_len);
+    }
+
+    #[test]
+    fn sample_counter_matches_scalar_rule() {
+        for start in [0_u64, 1, 63, 64, 65, 127, 1024] {
+            for count in [0_u64, 1, 2, 63, 64, 65, 130] {
+                let expected = (start..start + count)
+                    .filter(|sequence| sequence & 63 == 0)
+                    .count() as u64;
+                assert_eq!(sampled_sequences_in_range(start, count, 64), expected);
+            }
+        }
+    }
 }
 
 // Helper functions for loading certificates and private keys

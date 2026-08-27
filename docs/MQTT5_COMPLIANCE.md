@@ -23,7 +23,7 @@ Status meanings:
 | Correlation Data | Implemented | Preserved byte-for-byte. |
 | User Properties | Implemented | All pairs preserved, including duplicates and order. |
 | Subscription Identifier | Implemented | Generated from matching subscriptions; illegal Client->Server use is rejected. |
-| Topic Alias | Partial / disabled | Server currently advertises maximum 0 and sends no aliases. Incoming alias is rejected; alias mappings are never propagated across connections. |
+| Topic Alias | Partial / inbound implemented | Client→Server aliases support establish/use/update semantics, zero-length Topic Name reuse, per-Network-Connection reset, range checks and protocol errors. Alias mappings are never forwarded to subscribers. Server→Client alias emission is not implemented yet. |
 
 ## Last Will and Session state
 
@@ -58,7 +58,7 @@ Status meanings:
 | Enhanced AUTH exchange | Not yet | CONNECT authentication-method state machine is not claimed complete. |
 | Receive Maximum enforcement | Implemented | Server advertises a configurable inbound limit; QoS1/2 inbound credits are held until PUBACK/PUBREC bytes are written. Peer Receive Maximum gates outbound QoS1/2 and preserves queue order across restart. |
 | Maximum Packet Size enforcement | Implemented | Oversized inbound packets are rejected from the fixed-header length before full buffering; outbound packets respect the client limit and CONNACK is reduced to a minimal legal form when needed. |
-| Topic Alias Maximum | Implemented as zero capability | Broker elects not to accept/send aliases currently. |
+| Topic Alias Maximum | Partial / inbound implemented | CONNACK advertises configurable `PIPISTRELLE_TOPIC_ALIAS_MAXIMUM` (default 32) and enforces it for Client→Server PUBLISH. CONNECT Topic Alias Maximum is decoded, but Pipistrelle does not yet emit Server→Client aliases. |
 | Server-assigned zero-length ClientID | Implemented | Empty CONNECT ClientID receives Assigned Client Identifier in CONNACK and can use it to resume a persistent Session. |
 | Strict MQTT UTF-8 rules | Implemented core rules | Rejects malformed UTF-8, U+0000, disallowed control/noncharacter code points; packet/filter tests cover malformed cases. Exhaustive external conformance/fuzz corpus remains separate work. |
 | Complete malformed-packet/error matrix | Partial | Important property/protocol errors are tested; full corpus/fuzz conformance remains work. |
@@ -67,7 +67,7 @@ Status meanings:
 
 - `cargo test --all-targets --locked` — Rust codec/router/session tests.
 - `test_broker.py` — TCP, auth, ACL, TLS/PQC, WebSocket and metrics integration.
-- `test_protocol_v2.py` — raw MQTT v5 packet/state tests, including Application Message properties, Message Expiry, UNSUBSCRIBE, negotiated limits, assigned ClientIDs, TCP-fragmented CONNECT, UTF-8 and varint errors.
+- `test_protocol_v2.py` — raw MQTT v5 packet/state tests, including Application Message properties, Message Expiry, Topic Alias lifecycle/reset, UNSUBSCRIBE, negotiated limits, assigned ClientIDs, TCP-fragmented CONNECT, UTF-8 and varint errors.
 - `test_protocol_restart_v2.py` — **destructive local Docker test** which repeatedly sends `SIGKILL` to the broker and validates durable Wills, retained state, QoS1/QoS2 recovery, durable UNSUBSCRIBE and ordered Receive Maximum queues.
 
 The destructive suite must only be used on a development/test broker.

@@ -27,6 +27,36 @@ impl LatencyHistogram {
         }
     }
 
+    /// Bulk-records zero-route fast-path samples. Historically this path measured an
+    /// `Instant::now()` followed immediately by `elapsed()`, so observations always
+    /// landed in the first <=5us bucket. Batching preserves the exact sample count
+    /// without paying three atomics and a clock read per sampled PUBLISH.
+    #[inline]
+    pub fn record_zero_route_samples(&self, samples: u64) {
+        if samples == 0 {
+            return;
+        }
+        self.buckets[0].fetch_add(samples, Ordering::Relaxed);
+        self.count.fetch_add(samples, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_repeated(&self, duration: Duration, samples: u64) {
+        if samples == 0 {
+            return;
+        }
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        let bucket = ROUTE_LATENCY_BOUNDS_US
+            .iter()
+            .position(|bound| micros <= *bound)
+            .unwrap_or(ROUTE_LATENCY_BOUNDS_US.len());
+        self.buckets[bucket].fetch_add(samples, Ordering::Relaxed);
+        self.count.fetch_add(samples, Ordering::Relaxed);
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.sum_ns
+            .fetch_add(nanos.saturating_mul(samples), Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn record(&self, duration: Duration) {
         let micros = duration.as_micros().min(u64::MAX as u128) as u64;
@@ -95,6 +125,15 @@ impl Default for LatencyHistogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_zero_route_samples_preserve_count_and_first_bucket() {
+        let histogram = LatencyHistogram::new();
+        histogram.record_zero_route_samples(64);
+        assert_eq!(histogram.count(), 64);
+        assert_eq!(histogram.cumulative_buckets()[0].1, 64);
+        assert_eq!(histogram.sum_seconds(), 0.0);
+    }
 
     #[test]
     fn quantiles_use_bucket_upper_bounds() {

@@ -1,6 +1,6 @@
 # Pipistrelle — Roadmap hacia 3.0.0.0
 
-Este documento fija el plan de evolución de Pipistrelle desde la release estable actual `2.1.2.0` hasta `3.0.0.0`.
+Este documento fija el plan de evolución de Pipistrelle desde la release estable actual `2.1.2.1` hasta `3.0.0.0`.
 
 La intención es evitar saltos de versión artificiales: cada minor de la serie `2.x` debe representar una etapa de producto claramente terminada. `3.0.0.0` queda reservado para el cambio arquitectónico mayor: Pipistrelle como plataforma MQTT distribuida, con clustering y alta disponibilidad estables.
 
@@ -15,7 +15,7 @@ La intención es evitar saltos de versión artificiales: cada minor de la serie 
 
 ---
 
-## Baseline actual — 2.1.2.0
+## Baseline actual — 2.1.2.1
 
 Estado actual publicado:
 
@@ -37,11 +37,13 @@ Estado actual publicado:
 - Prometheus, `/health`, `/info`.
 - Colas bounded, backpressure, slow-consumer policy.
 - Bounded bridge queue.
+- Topic Alias Client→Server con máximo configurable y reset por Network Connection.
+- Fast-path ARM64/NEON de ingest QoS0 aislado del routing general.
 
 Gates de referencia de la Orange Pi:
 
-- QoS0 ingest: ~20 M msg/s en mediana de repeticiones largas.
-- QoS0 end-to-end: >2 M msg/s.
+- QoS0 ingest full-topic: ~58 M msg/s nativo en el hot path validado. MQTT 5 Topic Alias: mediana **161.452 M msg/s** en host normal (3×~1B) y techo optimizado separado de **211.520 M msg/s** de mediana (3×~1B, todas >200M).
+- QoS0 full-topic end-to-end: **33.203 M msg/s** en el gate fresco de ~50M con writer batch 1024.
 - PQC híbrido operativo.
 - RAM del broker alrededor de ~100–150 MiB en los gates QoS0 actuales.
 
@@ -560,7 +562,8 @@ Estas pueden entrar cuando su base correspondiente esté madura, pero no deben d
 
 | Versión | Objetivo principal |
 |---|---|
-| `2.1.2.0` | Baseline actual: MQTT flow-control/compliance sólido |
+| `2.1.2.0` | MQTT flow-control/compliance sólido |
+| `2.1.2.1` | Baseline actual: Topic Alias inbound + >200M/s optimized ingest ceiling |
 | `2.1.3.0` | Cierre restante de MQTT 5 + fuzzing/compliance |
 | `2.2.0.0` | Management REST API |
 | `2.3.0.0` | Control Center / Web UI |

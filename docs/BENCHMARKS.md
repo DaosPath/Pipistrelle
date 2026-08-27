@@ -256,3 +256,60 @@ Final exact-image Orange Pi gates, native Rust load generator, 128-byte payload:
 - **200k hybrid PQC TLS QoS0:** **2.112 M msg/s**, 0 failures, `X25519MLKEM768` on **10/10** connections.
 
 During the ingest repetitions the board was ~41–45 °C with a shared-system load average around 4, which explains part of the observed scheduling variance.
+
+## V2 2.1.2.1 — Topic Alias ingest: 161M normal-host median / 211M optimized ceiling
+
+`2.1.2.1` keeps the MQTT correctness/flow-control behavior of `2.1.2.0`, adds Client→Server Topic Alias, a zero-route ARM64 fast path, and a Linux-only native benchmark backend `--sendfile`. Results below use 128-byte payloads and ordered QoS1 completion markers. Docker remains supported but is not used for native ceiling figures.
+
+### Normal host/network configuration
+
+Command shape:
+
+```bash
+./target/release/pipistrelle-bench \
+  --mode ingest --clients 13 --messages 76923076 \
+  --payload 128 --qos 0 --window 4096 \
+  --topic-alias --sendfile
+```
+
+Three fresh broker instances, original host network rules and original CPU frequency caps:
+
+| Run | Workload PUBLISH | Throughput | Failures | Prometheus delta |
+|---|---:|---:|---:|---:|
+| 1 | 999,999,988 | **161.452 M msg/s** | 0 | **1,000,000,001** |
+| 2 | 999,999,988 | **162.198 M msg/s** | 0 | **1,000,000,001** |
+| 3 | 999,999,988 | **154.922 M msg/s** | 0 | **1,000,000,001** |
+
+**Median: 161.452 M msg/s; minimum: 154.922 M msg/s.** The delta includes 13 ordered QoS1 completion markers per run.
+
+### Optimized hardware/software ceiling
+
+This is deliberately reported separately from the normal-host result. The benchmark ran inside a clean Linux network namespace with only loopback, so host Docker/nftables/conntrack rules did not process the traffic. CPU policy max/min values were temporarily set to each policy's advertised hardware maximum and the governor to `performance`; the exact original governor/min/max values were restored after every run. The broker/loadgen were pinned to CPUs `0,1,4,5,6,7,8,9,10,11`.
+
+Topic Alias ingest, 14 clients / window 1792, three fresh ~1B-message brokers:
+
+| Run | Workload PUBLISH | Throughput | Failures | Prometheus delta |
+|---|---:|---:|---:|---:|
+| 1 | 999,999,994 | **211.520 M msg/s** | 0 | **1,000,000,008** |
+| 2 | 999,999,994 | **222.957 M msg/s** | 0 | **1,000,000,008** |
+| 3 | 999,999,994 | **210.799 M msg/s** | 0 | **1,000,000,008** |
+
+**Median: 211.520 M msg/s; minimum: 210.799 M msg/s; maximum: 222.957 M msg/s.** All three long runs exceeded 200 M PUBLISH/s. Temperature observed during the preceding full-frequency validation remained around 40–42 °C. These are ceiling conditions, not a promise for the default host configuration.
+
+### Why `--sendfile` is a valid separate benchmark engine
+
+The old generator repeatedly copied its prebuilt QoS0 window from load-generator userspace into the kernel. At ~80M/s that generator copy was already stealing a large fraction of the SoC from the broker. `rust-native-sendfile` keeps the MQTT stream identical but stores each publisher's prebuilt window in its own `memfd` and asks Linux to transmit it with `sendfile()`. CONNECT, CONNACK parsing, Topic Alias Maximum validation, the first mapping PUBLISH, final QoS1 marker and PUBACK requirement all remain explicit. The benchmark JSON includes `"sendfile": true` and `"engine": "rust-native-sendfile"` so results cannot be confused with the portable engine.
+
+The broker itself still validates every steady alias frame. The AArch64 scalar9×16 matcher checks the 9 structural bytes of every frame and falls back to the general MQTT path on any mismatch. It intentionally ignores payload bytes; a dedicated unit test verifies that 16 different payloads are accepted while a changed alias stops the batch at the exact frame boundary.
+
+### Fresh current-source regression gates
+
+Each performance case below used a fresh native broker and fresh SQLite DB. `PIPISTRELLE_WRITER_BATCH_PACKETS=1024` was enabled for the routing regression set.
+
+- **500M full-topic QoS0 ingest (28 clients, window 16384):** **57.987 M msg/s**, 0 failures, Prometheus delta **500,000,004** (499,999,976 QoS0 publishes + 28 completion markers).
+- **~50M full-topic QoS0 end-to-end (13 clients, window 1024):** **33.203 M msg/s**, 0 failures, Prometheus delta exactly **49,999,989**.
+- **200k QoS1 end-to-end:** **221.82k msg/s**, 0 failures, Prometheus delta exactly **200,000**.
+- **200k hybrid PQC TLS QoS0:** data phase **7.458 M msg/s**, 0 failures, `X25519MLKEM768` on **10/10** connections, setup p50 **197.0 ms** / p95 **233.2 ms**; Prometheus delta **200,010** includes the 10 completion markers.
+- Functional gates: **45/45 Rust**, **24/24 raw MQTT v5**, **10/10 SIGKILL/restart**, **6/6 integration**.
+
+Do not compare the 161/211 M/s Topic Alias figures directly to full-topic ingest as if the wire format were identical, and do not compare ingest to end-to-end routing. Topic Alias is a standard MQTT 5 optimization that removes repeated Topic Name bytes after a mapping is established; all benchmark categories remain separately labeled.

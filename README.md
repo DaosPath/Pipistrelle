@@ -19,7 +19,7 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 *   **Retained Messages MQTT v5:** Persistencia de retained, borrado con payload vacío, Retain Handling `0/1/2`, Retain As Published y Subscription Identifier en replay.
 *   **Last Will and Testament:** Will QoS/retain, Will Delay, supresión en `DISCONNECT 0x00`, cancelación del Will retrasado al reanudar la misma Session y publicación correcta durante pérdida de conexión/takeover.
 *   **Sesiones Persistentes y ClientID Takeover:** `Session Present`, mensajes QoS pendientes offline, Session Expiry y takeover MQTT v5 con `DISCONNECT 0x8E` para el propietario anterior. Pipistrelle liga además la Session persistente al principal autenticado para impedir que otro usuario válido herede estado autorizado bajo ACLs distintas.
-*   **Propiedades MQTT v5 End-to-End:** Preserva Payload Format Indicator, Message Expiry Interval, Content Type, Response Topic, Correlation Data y User Properties (incluyendo orden y duplicados) durante routing live, retained, QoS1/QoS2 offline y reanudación tras restart. Topic Alias permanece deliberadamente deshabilitado (`Maximum=0`) y nunca se propaga entre conexiones.
+*   **Propiedades MQTT v5 End-to-End + Topic Alias inbound:** Preserva Payload Format Indicator, Message Expiry Interval, Content Type, Response Topic, Correlation Data y User Properties (incluyendo orden y duplicados) durante routing live, retained, QoS1/QoS2 offline y reanudación tras restart. Client→Server Topic Alias implementa alta/uso/actualización/reset por Network Connection, con máximo configurable; Pipistrelle no emite todavía aliases Server→Client.
 *   **Last Will Persistente ante Crash:** El Will completo se persiste antes de CONNACK. Un `SIGKILL`/fallo del proceso puede restaurar Wills activos o delayed, conservar su metadata, respetar el deadline ya armado y cancelar un Will retrasado si la misma Session se reanuda.
 *   **Generación Automática de Certificados:** Si los archivos `cert.pem` y `key.pem` no están en el volumen, Pipistrelle genera automáticamente certificados auto-firmados válidos para `localhost`, `127.0.0.1`, `10.0.1.2` y `host.wokwi.internal`.
 
@@ -100,6 +100,9 @@ Puedes personalizar el comportamiento del broker modificando las variables de en
 | `PIPISTRELLE_DB_PATH` | Ruta interna de persistencia SQLite. | `/app/data/pipistrelle.db` |
 | `PIPISTRELLE_CREDENTIALS_PATH`| Ruta del archivo de usuarios y ACLs. | `/app/config/credentials.json` |
 | `PIPISTRELLE_ALLOW_ANONYMOUS` | Permite acceso anónimo solo si se establece explícitamente en `true`. | `false` |
+| `PIPISTRELLE_RECEIVE_MAXIMUM` | Máximo de PUBLISH QoS1/2 Client→Server simultáneos anunciado en CONNACK. | `1024` |
+| `PIPISTRELLE_MAX_PACKET_SIZE` | Máximo tamaño de paquete MQTT aceptado por el broker. | `16777216` |
+| `PIPISTRELLE_TOPIC_ALIAS_MAXIMUM` | Máximo Topic Alias Client→Server anunciado en CONNACK; `0` deshabilita aliases inbound. | `32` |
 | `PIPISTRELLE_BRIDGE_HOST` | Host remoto de HiveMQ Cloud para puente. | *Desactivado por defecto* |
 | `PIPISTRELLE_BRIDGE_USER` | Usuario de autenticación del puente. | *Ninguno* |
 | `PIPISTRELLE_BRIDGE_PASS` | Contraseña de autenticación del puente. | *Ninguna* |
@@ -182,7 +185,8 @@ Desde `2.1.0.0`, V2 incorpora la primera gran expansión de protocolo: **QoS 2**
 Desde `2.1.1.0`, Pipistrelle preserva las propiedades de aplicación de PUBLISH/Will a través de routing y persistencia, aplica **Message Expiry** al tiempo real que el mensaje espera en el broker y guarda el Will en SQLite para recuperarlo tras un crash completo. La suite destructiva `test_protocol_restart_v2.py` usa `SIGKILL` del contenedor para validar recuperación real, no solo shutdown limpio. Consulta [`docs/MQTT5_COMPLIANCE.md`](docs/MQTT5_COMPLIANCE.md) para la matriz explícita de soporte; Pipistrelle todavía no se anuncia como MQTT v5 100% conforme.
 
 Desde `2.1.2.0`, el broker implementa además **UNSUBSCRIBE/UNSUBACK**, Receive Maximum bilateral, Maximum Packet Size bilateral, ClientID asignado por servidor, CONNECT fragmentado sobre TCP y validación MQTT UTF-8/varint más estricta. Los límites por defecto son `PIPISTRELLE_RECEIVE_MAXIMUM=1024` y `PIPISTRELLE_MAX_PACKET_SIZE=16777216`.
-La release mantiene una mediana de **20.33 M msg/s ingest QoS0** (tres repeticiones de 50M) y **2.656 M msg/s end-to-end QoS0** en la Orange Pi; QoS1 queda como objetivo de optimización de persistence/flow-control, no como motivo para relajar compliance.
+
+`2.1.2.1` es un build de performance/compliance sin saltar la etapa `2.1.3.0`: añade **Topic Alias Client→Server** (`PIPISTRELLE_TOPIC_ALIAS_MAXIMUM=32` por defecto), fast paths QoS0 aislados, scanner ARM64 especializado y un backend Linux opcional `pipistrelle-bench --sendfile` para medir ingest sin hacer que el propio generador desperdicie CPU copiando una y otra vez el mismo window MQTT. Con la red normal del host y sus límites de CPU originales, tres corridas frescas de ~1B PUBLISH con Topic Alias dieron **161.452 / 162.198 / 154.922 M msg/s**; mediana **161.452 M msg/s**, 0 fallos y contador Prometheus exacto. En un **ceiling benchmark explícitamente optimizado** (network namespace limpio, sin reglas nftables/Docker, y frecuencias nominales completas restauradas al terminar), tres corridas frescas de ~1B dieron **211.520 / 222.957 / 210.799 M msg/s**; mediana **211.520 M msg/s** y todas superaron 200 M/s. Esta segunda cifra no representa el deployment normal y se reporta separadamente. Full-topic ingest y routing end-to-end también son categorías distintas; en el source actual se midieron **57.987 M/s** full-topic ingest y **33.203 M/s** full-topic end-to-end (writer batch 1024).
 
 ---
 

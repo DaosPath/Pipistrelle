@@ -839,6 +839,59 @@ def test_will_application_properties():
     sub.disconnect()
 
 
+def test_topic_alias_lifecycle_and_routing():
+    root = "protocol/v2/topic-alias"
+    first_topic = root + "/first"
+    second_topic = root + "/second"
+    sub = RawClient("proto_alias_sub")
+    sub.subscribe(root + "/#", qos=0, pid=201)
+
+    pub = RawClient("proto_alias_pub", clean_start=True, session_expiry=30)
+    maximum = pub.connack_properties["topic_alias_maximum"]
+    assert maximum == 32, pub.connack_properties
+
+    # Non-empty Topic Name + alias establishes the mapping. Topic Alias is
+    # connection-local and must not be forwarded to the subscriber.
+    pub.publish(first_topic, b"mapped", properties={"topic_alias": 1})
+    h, body = sub.expect_type(3)
+    msg = parse_publish(h, body)
+    assert msg["topic"] == first_topic and msg["payload"] == b"mapped", msg
+    assert msg["parsed_properties"]["topic_alias"] is None, msg
+
+    # Empty Topic Name resolves the established alias.
+    pub.publish("", b"reused", properties={"topic_alias": 1})
+    h, body = sub.expect_type(3)
+    msg = parse_publish(h, body)
+    assert msg["topic"] == first_topic and msg["payload"] == b"reused", msg
+
+    # A non-empty Topic Name updates the same alias.
+    pub.publish(second_topic, b"updated", properties={"topic_alias": 1})
+    h, body = sub.expect_type(3)
+    msg = parse_publish(h, body)
+    assert msg["topic"] == second_topic and msg["payload"] == b"updated", msg
+    pub.publish("", b"updated-reuse", properties={"topic_alias": 1})
+    h, body = sub.expect_type(3)
+    msg = parse_publish(h, body)
+    assert msg["topic"] == second_topic and msg["payload"] == b"updated-reuse", msg
+
+    # Alias mappings are Network Connection state, not persistent Session state.
+    pub.disconnect()
+    resumed = RawClient("proto_alias_pub", clean_start=False, session_expiry=30)
+    assert resumed.session_present, "persistent Session did not resume"
+    resumed.sock.sendall(publish_packet("", b"must-fail", properties={"topic_alias": 1}))
+    _, body = resumed.expect_type(14)
+    assert body and body[0] == 0x82, body
+    resumed.sock.close()
+
+    # Using an in-range alias before establishing it is also Protocol Error.
+    unknown = RawClient("proto_alias_unknown")
+    unknown.sock.sendall(publish_packet("", b"unknown", properties={"topic_alias": 2}))
+    _, body = unknown.expect_type(14)
+    assert body and body[0] == 0x82, body
+    unknown.sock.close()
+    sub.disconnect()
+
+
 def test_publish_property_protocol_errors():
     # Client->Server Subscription Identifier is a Protocol Error (0x82).
     bad_subid = RawClient("proto_bad_publish_subid")
@@ -851,16 +904,29 @@ def test_publish_property_protocol_errors():
     assert body and body[0] == 0x82, body
     bad_subid.sock.close()
 
-    # Server advertises Topic Alias Maximum=0, so any alias is invalid (0x94).
-    bad_alias = RawClient("proto_bad_publish_alias")
-    bad_alias.sock.sendall(publish_packet(
+    # Topic Alias 0 is always invalid (0x94).
+    bad_alias_zero = RawClient("proto_bad_publish_alias_zero")
+    bad_alias_zero.sock.sendall(publish_packet(
         "protocol/v2/bad/alias",
         b"bad",
-        properties={"topic_alias": 1},
+        properties={"topic_alias": 0},
     ))
-    _, body = bad_alias.expect_type(14)
+    _, body = bad_alias_zero.expect_type(14)
     assert body and body[0] == 0x94, body
-    bad_alias.sock.close()
+    bad_alias_zero.sock.close()
+
+    # Alias above the server-advertised maximum is also 0x94.
+    bad_alias_high = RawClient("proto_bad_publish_alias_high")
+    maximum = bad_alias_high.connack_properties["topic_alias_maximum"]
+    assert maximum and maximum > 0, bad_alias_high.connack_properties
+    bad_alias_high.sock.sendall(publish_packet(
+        "protocol/v2/bad/alias",
+        b"bad",
+        properties={"topic_alias": maximum + 1},
+    ))
+    _, body = bad_alias_high.expect_type(14)
+    assert body and body[0] == 0x94, body
+    bad_alias_high.sock.close()
 
     # A singleton PUBLISH property repeated twice is a Protocol Error.
     duplicate_pfi = RawClient("proto_bad_publish_duplicate")
@@ -983,7 +1049,7 @@ def test_server_assigned_client_id_and_connack_limits():
     assert generated.client_id == assigned
     assert generated.connack_properties["receive_maximum"] == 1024, generated.connack_properties
     assert generated.connack_properties["maximum_packet_size"] == 16 * 1024 * 1024, generated.connack_properties
-    assert generated.connack_properties["topic_alias_maximum"] == 0, generated.connack_properties
+    assert generated.connack_properties["topic_alias_maximum"] == 32, generated.connack_properties
     generated.disconnect()
 
     resumed = RawClient(assigned, clean_start=False, session_expiry=30)
@@ -1114,6 +1180,7 @@ if __name__ == "__main__":
         ("started QoS1 retries after expiry", test_started_qos1_retries_after_expiry),
         ("started QoS2 continues after expiry", test_started_qos2_continues_after_expiry),
         ("Will application properties", test_will_application_properties),
+        ("Topic Alias lifecycle/routing/reset", test_topic_alias_lifecycle_and_routing),
         ("PUBLISH property protocol errors", test_publish_property_protocol_errors),
         ("UNSUBSCRIBE/UNSUBACK + filter validation", test_unsubscribe_unsuback_and_filter_validation),
         ("server-assigned ClientID + CONNACK limits", test_server_assigned_client_id_and_connack_limits),

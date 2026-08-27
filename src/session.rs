@@ -1,6 +1,7 @@
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -71,10 +72,263 @@ pub struct BridgeQueueHandle {
 
 #[derive(Debug)]
 pub struct OutboundPacket {
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
+    /// Number of logical MQTT Control Packets represented by this contiguous block.
+    /// Normal control/QoS packets use 1; the QoS0 exact-route fast path can aggregate
+    /// many byte-identical-layout packets while logical queue capacity still counts each.
+    pub logical_packets: usize,
+    /// Equal per-packet length for an aggregated block. For normal packets this is
+    /// simply `bytes.len()` and `logical_packets == 1`.
+    pub packet_len: usize,
     /// Inbound QoS Packet Identifier whose Receive Maximum slot is released only
     /// after these bytes have actually been written to the network.
     pub release_inbound_packet_id: Option<u16>,
+}
+
+#[derive(Debug)]
+pub enum OutboundQueuePushError {
+    Full(OutboundPacket),
+    Closed(OutboundPacket),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundQueueSendStats {
+    pub pressured: bool,
+    pub waited_ns: u64,
+}
+
+struct OutboundQueueState {
+    queue: VecDeque<OutboundPacket>,
+    /// Logical MQTT packet occupancy, independent of physical descriptor count.
+    logical_len: usize,
+}
+
+pub struct OutboundQueue {
+    state: Mutex<OutboundQueueState>,
+    max_capacity: usize,
+    closed: AtomicBool,
+    not_empty: Notify,
+    not_full: Notify,
+}
+
+impl OutboundQueue {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(OutboundQueueState {
+                queue: VecDeque::with_capacity(max_capacity.min(4096)),
+                logical_len: 0,
+            }),
+            max_capacity,
+            closed: AtomicBool::new(false),
+            not_empty: Notify::new(),
+            not_full: Notify::new(),
+        }
+    }
+
+    #[inline]
+    pub fn max_capacity(&self) -> usize {
+        self.max_capacity
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.max_capacity
+            .saturating_sub(self.state.lock().logical_len)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.state.lock().logical_len
+    }
+
+    pub fn try_send(&self, packet: OutboundPacket) -> Result<(), OutboundQueuePushError> {
+        debug_assert_eq!(packet.logical_packets, 1);
+        if self.closed.load(Ordering::Acquire) {
+            return Err(OutboundQueuePushError::Closed(packet));
+        }
+        let mut state = self.state.lock();
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(OutboundQueuePushError::Closed(packet));
+        }
+        if state.logical_len >= self.max_capacity {
+            return Err(OutboundQueuePushError::Full(packet));
+        }
+        let was_empty = state.logical_len == 0;
+        state.logical_len += 1;
+        state.queue.push_back(packet);
+        drop(state);
+        if was_empty {
+            self.not_empty.notify_one();
+        }
+        Ok(())
+    }
+
+    pub async fn send(&self, mut packet: OutboundPacket) -> Result<(), ()> {
+        loop {
+            let notified = self.not_full.notified();
+            match self.try_send(packet) {
+                Ok(()) => return Ok(()),
+                Err(OutboundQueuePushError::Closed(_)) => return Err(()),
+                Err(OutboundQueuePushError::Full(returned)) => packet = returned,
+            }
+            notified.await;
+        }
+    }
+
+    fn try_send_block(
+        &self,
+        block: &Bytes,
+        packet_len: usize,
+        start_packet: usize,
+        packet_count: usize,
+    ) -> Result<usize, ()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let mut state = self.state.lock();
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(());
+        }
+        let available = self.max_capacity.saturating_sub(state.logical_len);
+        let pushed = available.min(packet_count);
+        if pushed == 0 {
+            return Ok(0);
+        }
+        let start = start_packet * packet_len;
+        let end = start + pushed * packet_len;
+        let was_empty = state.logical_len == 0;
+        state.queue.push_back(OutboundPacket {
+            bytes: block.slice(start..end),
+            logical_packets: pushed,
+            packet_len,
+            release_inbound_packet_id: None,
+        });
+        state.logical_len += pushed;
+        drop(state);
+        if was_empty {
+            self.not_empty.notify_one();
+        }
+        Ok(pushed)
+    }
+
+    /// Enqueues a contiguous run while charging queue capacity per MQTT packet, not
+    /// per physical descriptor. A 256-message block therefore consumes 256 of the
+    /// default 1024 logical slots even though it needs only one `Bytes` refcount.
+    pub async fn send_block(
+        &self,
+        block: Bytes,
+        packet_len: usize,
+        packet_count: usize,
+    ) -> Result<OutboundQueueSendStats, ()> {
+        let mut sent = 0usize;
+        let mut pressured = false;
+        let mut wait_started: Option<Instant> = None;
+        while sent < packet_count {
+            let notified = self.not_full.notified();
+            let pushed = self.try_send_block(&block, packet_len, sent, packet_count - sent)?;
+            sent += pushed;
+            if sent == packet_count {
+                let waited_ns = wait_started
+                    .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0);
+                return Ok(OutboundQueueSendStats {
+                    pressured,
+                    waited_ns,
+                });
+            }
+            if !pressured {
+                pressured = true;
+                wait_started = Some(Instant::now());
+            }
+            notified.await;
+        }
+        Ok(OutboundQueueSendStats::default())
+    }
+
+    /// Drains up to writer limits under one mutex hold. Aggregated descriptors are
+    /// split only at writer-batch boundaries, so refcount/slice work is O(batches)
+    /// rather than O(messages), while logical capacity is released packet-for-packet.
+    pub fn drain_into(
+        &self,
+        out: &mut Vec<OutboundPacket>,
+        max_packets: usize,
+        max_bytes: usize,
+    ) -> usize {
+        let mut state = self.state.lock();
+        let was_full = state.logical_len >= self.max_capacity;
+        let mut logical_packets = 0usize;
+        let mut bytes = 0usize;
+
+        while logical_packets < max_packets {
+            let Some(front) = state.queue.front() else {
+                break;
+            };
+            let packet_room = max_packets - logical_packets;
+            let byte_room = max_bytes.saturating_sub(bytes);
+            let by_bytes = if front.packet_len == 0 {
+                0
+            } else {
+                byte_room / front.packet_len
+            };
+            let take = front.logical_packets.min(packet_room).min(by_bytes);
+            if take == 0 {
+                break;
+            }
+
+            if take == front.logical_packets {
+                let packet = state.queue.pop_front().expect("front existed");
+                bytes = bytes.saturating_add(packet.bytes.len());
+                logical_packets += packet.logical_packets;
+                out.push(packet);
+            } else {
+                let split_bytes = take * front.packet_len;
+                let packet = OutboundPacket {
+                    bytes: front.bytes.slice(..split_bytes),
+                    logical_packets: take,
+                    packet_len: front.packet_len,
+                    release_inbound_packet_id: None,
+                };
+                let front = state.queue.front_mut().expect("front existed");
+                front.bytes = front.bytes.slice(split_bytes..);
+                front.logical_packets -= take;
+                bytes += split_bytes;
+                logical_packets += take;
+                out.push(packet);
+            }
+            state.logical_len -= take;
+        }
+
+        drop(state);
+        if was_full && logical_packets != 0 {
+            self.not_full.notify_one();
+        }
+        logical_packets
+    }
+
+    pub async fn recv_batch(
+        &self,
+        out: &mut Vec<OutboundPacket>,
+        max_packets: usize,
+        max_bytes: usize,
+    ) -> bool {
+        loop {
+            let notified = self.not_empty.notified();
+            out.clear();
+            if self.drain_into(out, max_packets, max_bytes) != 0 {
+                return true;
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.not_empty.notify_waiters();
+        self.not_full.notify_waiters();
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,13 +525,15 @@ pub struct ClientSession {
     pub receive_maximum: u16,
     /// Maximum MQTT Control Packet size this client accepts from the server.
     pub maximum_packet_size: u32,
+    /// Highest Topic Alias value this server advertised for Client -> Server PUBLISH.
+    /// This is connection-local and deliberately not inherited by persistent Sessions.
+    pub topic_alias_maximum: u16,
     pub session_expiry_interval: AtomicU32,
-    pub last_activity: RwLock<Instant>,
     pub connected: AtomicBool,
     pub will: RwLock<Option<WillMessage>>,
 
     // Channel to send raw serialized bytes to the client's TCP writer task
-    pub sender: mpsc::Sender<OutboundPacket>,
+    pub sender: Arc<OutboundQueue>,
 
     // Topic aliases sent by the client: Alias ID -> Topic String
     pub topic_aliases: RwLock<HashMap<u16, String>>,
@@ -314,8 +570,9 @@ impl ClientSession {
         keep_alive: u16,
         receive_maximum: u16,
         maximum_packet_size: u32,
+        topic_alias_maximum: u16,
         session_expiry_interval: u32,
-        sender: mpsc::Sender<OutboundPacket>,
+        sender: Arc<OutboundQueue>,
     ) -> Self {
         Self {
             client_id,
@@ -326,8 +583,8 @@ impl ClientSession {
             keep_alive,
             receive_maximum,
             maximum_packet_size,
+            topic_alias_maximum,
             session_expiry_interval: AtomicU32::new(session_expiry_interval),
-            last_activity: RwLock::new(Instant::now()),
             connected: AtomicBool::new(true),
             will: RwLock::new(None),
             sender,
@@ -344,10 +601,6 @@ impl ClientSession {
             disconnect_requested: AtomicBool::new(false),
             disconnect_notify: Notify::new(),
         }
-    }
-
-    pub fn update_activity(&self) {
-        *self.last_activity.write() = Instant::now();
     }
 
     fn get_next_packet_id(&self) -> u16 {
@@ -473,6 +726,8 @@ pub struct BrokerState {
     pending_wills: RwLock<HashMap<String, PendingWill>>,
     // Client ID -> Active session reference
     pub sessions: RwLock<HashMap<String, Arc<ClientSession>>>,
+    /// Monotonic connection/session ownership generation for read-mostly route caches.
+    pub session_epoch: AtomicU64,
     // Auth and ACL engine
     pub auth: crate::config::AuthConfig,
     // Database Persistence Engine
@@ -509,6 +764,8 @@ pub struct BrokerState {
     pub receive_maximum: u16,
     /// Server-advertised inbound Maximum Packet Size.
     pub maximum_packet_size: usize,
+    /// Maximum Topic Alias accepted from each client connection.
+    pub topic_alias_maximum: u16,
     next_assigned_client_id: AtomicU64,
 
     // Bridge channel
@@ -574,6 +831,10 @@ impl BrokerState {
             .and_then(|value| value.parse::<usize>().ok())
             .map(|value| value.clamp(1_024, 268_435_455))
             .unwrap_or(16 * 1024 * 1024);
+        let topic_alias_maximum = std::env::var("PIPISTRELLE_TOPIC_ALIAS_MAXIMUM")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(32);
         info!(
             "Client limits: outbound_queue={}, subscriptions={}, slow_consumer={} ({} ms)",
             client_queue_capacity,
@@ -590,8 +851,8 @@ impl BrokerState {
             writer_batch_bytes,
         );
         info!(
-            "MQTT flow limits: receive_maximum={}, maximum_packet_size={} bytes",
-            receive_maximum, maximum_packet_size
+            "MQTT flow limits: receive_maximum={}, maximum_packet_size={} bytes, topic_alias_maximum={}",
+            receive_maximum, maximum_packet_size, topic_alias_maximum
         );
 
         Self {
@@ -599,6 +860,7 @@ impl BrokerState {
             retained: RwLock::new(HashMap::new()),
             pending_wills: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
+            session_epoch: AtomicU64::new(0),
             auth: crate::config::AuthConfig::load(),
             db: Arc::new(crate::persistence::Persistence::new()),
             shared_group_counters: RwLock::new(HashMap::new()),
@@ -627,6 +889,7 @@ impl BrokerState {
             writer_batch_bytes,
             receive_maximum,
             maximum_packet_size,
+            topic_alias_maximum,
             next_assigned_client_id: AtomicU64::new(1),
             bridge_active: AtomicBool::new(false),
             bridge_sender: RwLock::new(None),
@@ -683,7 +946,7 @@ impl BrokerState {
                             Some(expiry as u64 - elapsed)
                         };
 
-                        let (tx, _) = mpsc::channel::<OutboundPacket>(self.client_queue_capacity);
+                        let tx = Arc::new(OutboundQueue::new(self.client_queue_capacity));
                         let auth_username = username.as_deref().unwrap_or("");
                         let allow_all_read = self.auth.authorizes_all(auth_username, "read");
                         let allow_all_write = self.auth.authorizes_all(auth_username, "write");
@@ -696,6 +959,7 @@ impl BrokerState {
                             0,
                             u16::MAX,
                             268_435_455,
+                            0, // Topic Alias mappings are Network Connection state, not Session state.
                             expiry,
                             tx,
                         ));
@@ -947,6 +1211,7 @@ impl BrokerState {
                 info!("Replacing session object for client: {}", old.client_id);
             }
         }
+        self.session_epoch.fetch_add(1, Ordering::Release);
 
         // Persist the current connection before CONNACK. This avoids a fast
         // disconnect racing an older background save and resurrecting connected=1.
@@ -963,6 +1228,7 @@ impl BrokerState {
             let retired = old.published_messages.load(Ordering::Relaxed);
             self.metrics_messages_published_retired
                 .fetch_add(retired, Ordering::Relaxed);
+            self.session_epoch.fetch_add(1, Ordering::Release);
         }
         self.router.remove_client(client_id);
         if let Some(pending) = self.pending_wills.write().remove(client_id) {
@@ -984,6 +1250,7 @@ impl BrokerState {
             }
 
             session.connected.store(false, Ordering::Release);
+            self.session_epoch.fetch_add(1, Ordering::Release);
             if session.session_expiry_interval.load(Ordering::Acquire) == 0 {
                 sessions.remove(&session.client_id);
                 let retired = session.published_messages.load(Ordering::Relaxed);
@@ -1610,7 +1877,73 @@ impl BrokerState {
     /// when the queue is full, pressure propagates back to the publisher until the
     /// socket writer drains enough capacity.
     pub async fn send_to_session(&self, session: &ClientSession, bytes: Vec<u8>) -> bool {
-        self.send_to_session_after_write(session, bytes, None).await
+        self.send_bytes_to_session_after_write(session, Bytes::from(bytes), None)
+            .await
+    }
+
+    pub async fn send_bytes_to_session(&self, session: &ClientSession, bytes: Bytes) -> bool {
+        self.send_bytes_to_session_after_write(session, bytes, None)
+            .await
+    }
+
+    pub async fn send_bytes_batch_to_session(
+        &self,
+        session: &ClientSession,
+        bytes: Bytes,
+        packet_len: usize,
+        packet_count: usize,
+    ) -> bool {
+        if packet_count == 0 {
+            return true;
+        }
+        if packet_len > session.maximum_packet_size as usize {
+            return false;
+        }
+
+        let result = match self.slow_consumer_policy {
+            SlowConsumerPolicy::Backpressure => {
+                session
+                    .sender
+                    .send_block(bytes, packet_len, packet_count)
+                    .await
+            }
+            SlowConsumerPolicy::Disconnect => match tokio::time::timeout(
+                self.slow_consumer_timeout,
+                session.sender.send_block(bytes, packet_len, packet_count),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    self.metrics_client_queue_backpressure_events
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics_client_queue_backpressure_wait_ns.fetch_add(
+                        self.slow_consumer_timeout.as_nanos().min(u64::MAX as u128) as u64,
+                        Ordering::Relaxed,
+                    );
+                    if session.request_disconnect() {
+                        self.metrics_slow_consumer_disconnects
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return false;
+                }
+            },
+        };
+
+        match result {
+            Ok(stats) => {
+                if stats.pressured {
+                    self.metrics_client_queue_backpressure_events
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if stats.waited_ns != 0 {
+                    self.metrics_client_queue_backpressure_wait_ns
+                        .fetch_add(stats.waited_ns, Ordering::Relaxed);
+                }
+                true
+            }
+            Err(()) => false,
+        }
     }
 
     /// Enqueues an MQTT packet and optionally releases one inbound Receive Maximum
@@ -1619,6 +1952,20 @@ impl BrokerState {
         &self,
         session: &ClientSession,
         bytes: Vec<u8>,
+        release_inbound_packet_id: Option<u16>,
+    ) -> bool {
+        self.send_bytes_to_session_after_write(
+            session,
+            Bytes::from(bytes),
+            release_inbound_packet_id,
+        )
+        .await
+    }
+
+    pub async fn send_bytes_to_session_after_write(
+        &self,
+        session: &ClientSession,
+        bytes: Bytes,
         release_inbound_packet_id: Option<u16>,
     ) -> bool {
         if bytes.len() > session.maximum_packet_size as usize {
@@ -1630,13 +1977,16 @@ impl BrokerState {
             );
             return false;
         }
+        let packet_len = bytes.len();
         let packet = OutboundPacket {
             bytes,
+            logical_packets: 1,
+            packet_len,
             release_inbound_packet_id,
         };
         match session.sender.try_send(packet) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(packet)) => {
+            Err(OutboundQueuePushError::Full(packet)) => {
                 self.metrics_client_queue_backpressure_events
                     .fetch_add(1, Ordering::Relaxed);
                 let started = Instant::now();
@@ -1675,7 +2025,7 @@ impl BrokerState {
                     .fetch_add(waited_ns, Ordering::Relaxed);
                 result.is_ok()
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(OutboundQueuePushError::Closed(_)) => {
                 debug!("Outbound queue closed for client {}", session.client_id);
                 false
             }
@@ -2082,8 +2432,81 @@ mod policy_tests {
     }
 
     #[test]
+    fn outbound_queue_aggregated_blocks_charge_logical_capacity() {
+        let queue = OutboundQueue::new(1024);
+        let packet_len = 4usize;
+        let mut raw = Vec::with_capacity(1024 * packet_len);
+        for index in 0..1024u32 {
+            raw.extend_from_slice(&index.to_be_bytes());
+        }
+        let block = Bytes::from(raw.clone());
+
+        assert_eq!(queue.try_send_block(&block, packet_len, 0, 1024), Ok(1024));
+        assert_eq!(queue.len(), 1024);
+        assert_eq!(queue.capacity(), 0);
+
+        let extra = OutboundPacket {
+            bytes: Bytes::from_static(b"more"),
+            logical_packets: 1,
+            packet_len: 4,
+            release_inbound_packet_id: None,
+        };
+        assert!(matches!(
+            queue.try_send(extra),
+            Err(OutboundQueuePushError::Full(_))
+        ));
+
+        let mut drained = Vec::new();
+        assert_eq!(queue.drain_into(&mut drained, 256, usize::MAX), 256);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].logical_packets, 256);
+        assert_eq!(drained[0].bytes.as_ref(), &raw[..256 * packet_len]);
+        assert_eq!(queue.len(), 768);
+        assert_eq!(queue.capacity(), 256);
+
+        assert_eq!(queue.try_send_block(&block, packet_len, 0, 257), Ok(256));
+        assert_eq!(queue.len(), 1024);
+        assert_eq!(queue.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_queue_backpressure_waits_for_logical_credit() {
+        let queue = Arc::new(OutboundQueue::new(4));
+        let initial = Bytes::from_static(b"aaaabbbbccccdddd");
+        let stats = queue.send_block(initial, 4, 4).await.unwrap();
+        assert!(!stats.pressured);
+        assert_eq!(queue.capacity(), 0);
+
+        let producer_queue = queue.clone();
+        let producer = tokio::spawn(async move {
+            producer_queue
+                .send_block(Bytes::from_static(b"eeee"), 4, 1)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !producer.is_finished(),
+            "producer bypassed a full logical queue"
+        );
+
+        let mut drained = Vec::new();
+        assert_eq!(queue.drain_into(&mut drained, 1, 4), 1);
+        assert_eq!(drained[0].bytes.as_ref(), b"aaaa");
+        assert_eq!(queue.capacity(), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), producer)
+            .await
+            .expect("producer did not resume after credit release")
+            .expect("producer task panicked")
+            .expect("queue unexpectedly closed");
+        assert_eq!(queue.len(), 4);
+        assert_eq!(queue.capacity(), 0);
+    }
+
+    #[test]
     fn disconnect_request_is_idempotent() {
-        let (tx, _rx) = mpsc::channel(1);
+        let tx = Arc::new(OutboundQueue::new(1));
         let session = ClientSession::new(
             "slow".to_string(),
             None,
@@ -2093,6 +2516,7 @@ mod policy_tests {
             60,
             u16::MAX,
             268_435_455,
+            0,
             0,
             tx,
         );

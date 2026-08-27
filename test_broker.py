@@ -369,6 +369,7 @@ def run_test_metrics():
             "pipistrelle_writer_batch_bytes",
             "pipistrelle_receive_maximum",
             "pipistrelle_maximum_packet_size_bytes",
+            "pipistrelle_topic_alias_maximum",
             "pipistrelle_retained_messages_current",
             "pipistrelle_pending_wills_current",
             "pipistrelle_qos2_incoming_pending",
