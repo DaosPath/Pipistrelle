@@ -22,6 +22,13 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxStream = Box<dyn AsyncStream>;
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
+// QoS0 loopback is full-duplex on each benchmark connection: the same client writes
+// PUBLISH packets while its reader drains broker-routed copies. Keep a small bounded
+// pipeline so a stalled reader cannot accumulate an unbounded TCP backlog during an
+// endurance run.
+const QOS0_LOOPBACK_INFLIGHT_WINDOWS: usize = 4;
+const QOS0_LOOPBACK_PROGRESS_TIMEOUT_SECS: u64 = 30;
+
 enum BenchWriter<W> {
     Direct(W),
     Shared(Arc<Mutex<W>>),
@@ -594,6 +601,12 @@ async fn run_worker_inner(
     };
     let payload = vec![b'x'; args.payload_bytes];
     let batch_size = args.window.max(1);
+    let qos0_loopback_max_inflight = (args.mode == Mode::Loopback && args.qos == 0)
+        .then(|| batch_size as u64 * QOS0_LOOPBACK_INFLIGHT_WINDOWS as u64);
+    let qos0_loopback_progress_timeout = std::cmp::min(
+        args.timeout,
+        Duration::from_secs(QOS0_LOOPBACK_PROGRESS_TIMEOUT_SECS),
+    );
 
     // QoS0 benchmark packets are byte-identical for the lifetime of one client.
     // Build the full send window once and reuse it instead of copying the same packet
@@ -626,6 +639,38 @@ async fn run_worker_inner(
     }
     while sent < args.messages {
         let count = std::cmp::min(batch_size as u64, args.messages - sent) as usize;
+        if let Some(max_inflight) = qos0_loopback_max_inflight {
+            let next_sent = sent + count as u64;
+            let required_received = next_sent.saturating_sub(max_inflight);
+            if required_received != 0 {
+                if let Err(error) = wait_counter(
+                    &received,
+                    &received_notify,
+                    required_received,
+                    qos0_loopback_progress_timeout,
+                )
+                .await
+                {
+                    return Err(format!(
+                        "QoS0 loopback reader stalled: received={}/{}, max_inflight={}, error={}",
+                        received.load(Ordering::Relaxed),
+                        next_sent,
+                        max_inflight,
+                        error
+                    )
+                    .into());
+                }
+            }
+            if reader.is_finished() {
+                return Err(format!(
+                    "QoS0 loopback reader terminated early: received={}, sent={}",
+                    received.load(Ordering::Relaxed),
+                    sent
+                )
+                .into());
+            }
+        }
+
         if args.qos == 0 {
             let packet_len = qos0_packet.as_ref().expect("qos0 packet").len();
             let batch = qos0_full_batch.as_ref().expect("qos0 batch");
@@ -647,11 +692,18 @@ async fn run_worker_inner(
     }
 
     match (args.mode, args.qos) {
-        (Mode::Loopback, _) => {
+        (Mode::Loopback, 0) => {
+            wait_counter(
+                &received,
+                &received_notify,
+                args.messages,
+                qos0_loopback_progress_timeout,
+            )
+            .await?;
+        }
+        (Mode::Loopback, 1) => {
             wait_counter(&received, &received_notify, args.messages, args.timeout).await?;
-            if args.qos == 1 {
-                wait_counter(&pubacks, &puback_notify, args.messages, args.timeout).await?;
-            }
+            wait_counter(&pubacks, &puback_notify, args.messages, args.timeout).await?;
         }
         (Mode::Ingest, 1) => {
             wait_counter(&pubacks, &puback_notify, args.messages, args.timeout).await?;
