@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [v2, main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.98.0
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2.9.2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D clippy::correctness -D clippy::suspicious -D clippy::await_holding_lock
+
+      - name: Release tests
+        run: cargo test --release
+
+  protocol:
+    name: MQTT v5 + Docker integration
+    needs: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Install Python test dependency
+        run: python -m pip install --disable-pip-version-check paho-mqtt==2.1.0
+
+      - name: Prepare isolated test state
+        run: |
+          rm -rf config data
+          mkdir -p config data
+          cp credentials.json.example config/credentials.json
+
+      - name: Build broker image
+        run: docker build --tag pipistrelle-ci:${{ github.sha }} .
+
+      - name: Start isolated broker
+        run: |
+          docker run -d \
+            --name pipistrelle_broker_test \
+            --restart=no \
+            -p 127.0.0.1:1883:1883 \
+            -p 127.0.0.1:8883:8883 \
+            -p 127.0.0.1:8083:8083 \
+            -p 127.0.0.1:9095:9090 \
+            -e PIPISTRELLE_PORT_TCP=1883 \
+            -e PIPISTRELLE_PORT_TLS=8883 \
+            -e PIPISTRELLE_PORT_WS=8083 \
+            -e PIPISTRELLE_PORT_METRICS=9090 \
+            -e PIPISTRELLE_DB_PATH=/app/data/pipistrelle.db \
+            -e PIPISTRELLE_CREDENTIALS_PATH=/app/config/credentials.json \
+            -v "$PWD/config:/app/config" \
+            -v "$PWD/data:/app/data" \
+            pipistrelle-ci:${{ github.sha }} \
+            --cert /app/config/cert.pem --key /app/config/key.pem
+
+      - name: Wait for health
+        run: |
+          for attempt in $(seq 1 120); do
+            if curl --fail --silent http://127.0.0.1:9095/health; then
+              exit 0
+            fi
+            sleep 0.25
+          done
+          docker logs pipistrelle_broker_test
+          exit 1
+
+      - name: Transport, auth, ACL, TLS, WebSocket and metrics
+        run: python test_broker.py
+
+      - name: Raw MQTT v5 protocol suite
+        run: python test_protocol_v2.py
+
+      - name: Destructive restart/persistence suite
+        run: python test_protocol_restart_v2.py
+
+      - name: Broker logs on failure
+        if: failure()
+        run: docker logs pipistrelle_broker_test || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pipistrelle_broker_test >/dev/null 2>&1 || true
+
+  release-metadata:
+    name: Tag/version consistency
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rust, protocol]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Verify VERSION matches tag
+        shell: bash
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(tr -d '[:space:]' < VERSION)"
+          echo "tag=$expected VERSION=$actual"
+          test "$expected" = "$actual"

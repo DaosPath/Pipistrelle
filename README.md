@@ -1,8 +1,33 @@
 # <img src="https://api.iconify.design/mdi:bat.svg?color=%233b82f6" width="36" height="36" style="vertical-align: middle; margin-right: 8px;" /> Pipistrelle MQTT v5.0 Broker
 
+[![CI](https://github.com/DaosPath/Pipistrelle/actions/workflows/ci.yml/badge.svg?branch=v2)](https://github.com/DaosPath/Pipistrelle/actions/workflows/ci.yml)
+[![Security](https://github.com/DaosPath/Pipistrelle/actions/workflows/security.yml/badge.svg?branch=v2)](https://github.com/DaosPath/Pipistrelle/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/DaosPath/Pipistrelle?include_prereleases&sort=semver)](https://github.com/DaosPath/Pipistrelle/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.98.0](https://img.shields.io/badge/Rust-1.98.0-orange?logo=rust)](rust-toolchain.toml)
+
+**Release estable:** `v2.1.2.3` · **Rama activa:** `v2` · **Rust:** `1.98.0`
+
 ¡Bienvenido a **Pipistrelle**, un broker MQTT v5.0 ultraligero y de alto rendimiento escrito en **Rust**! Diseñado específicamente para sistemas embebidos, computadoras de placa única (SBCs como Raspberry Pi u Orange Pi) y entornos de producción modernos. 
 
 Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TLS 1.3, persistencia tolerante a fallos basada en **SQLite WAL**, soporte nativo para **WebSockets**, métricas en formato **Prometheus** y un motor de **puente bidireccional** hacia la nube (como HiveMQ Cloud).
+
+> [!NOTE]
+> Pipistrelle implementa una parte amplia de MQTT 5, pero **todavía no se anuncia como 100% conforme**. La matriz explícita de soporte y los puntos pendientes están en [`docs/MQTT5_COMPLIANCE.md`](docs/MQTT5_COMPLIANCE.md).
+
+### Estado de `v2.1.2.3`
+
+| Gate / capacidad | Estado |
+| :--- | :--- |
+| Rust unit/integration tests | **52/52** en el source exacto del release |
+| MQTT v5 raw protocol suite | **25/25** |
+| SIGKILL/restart persistence suite | **10/10** |
+| Integración TCP/Auth/ACL/TLS/WS/Prometheus | **6/6** |
+| Topic Alias QoS0 end-to-end | **~38–39 M msg/s** en tuning controlado; mejor run corto **38.981 M/s** |
+| Topic Alias ingest ceiling (categoría separada) | hasta **216.437 M/s** de mediana en el gate optimizado 3×10B de `2.1.2.1` |
+| CI / seguridad | GitHub Actions, Clippy, **RustSec audit limpio**, CodeQL y Dependabot |
+
+Los números de ingest y end-to-end representan datapaths distintos y se reportan por separado; no se usan para esconder regresiones de QoS1/QoS2 o de correctness.
 
 ---
 
@@ -22,6 +47,7 @@ Pipistrelle ofrece capacidades de **Criptografía Post-Cuántica (PQC)** para TL
 *   **Propiedades MQTT v5 End-to-End + Topic Alias bidireccional:** Preserva Payload Format Indicator, Message Expiry Interval, Content Type, Response Topic, Correlation Data y User Properties (incluyendo orden y duplicados) durante routing live, retained, QoS1/QoS2 offline y reanudación tras restart. Client→Server Topic Alias implementa alta/uso/remap/reset por Network Connection; desde `2.1.2.2`, si el subscriber anuncia Topic Alias Maximum, Pipistrelle también emite Server→Client aliases y reutiliza Topic Name vacío después de establecer el mapping.
 *   **Last Will Persistente ante Crash:** El Will completo se persiste antes de CONNACK. Un `SIGKILL`/fallo del proceso puede restaurar Wills activos o delayed, conservar su metadata, respetar el deadline ya armado y cancelar un Will retrasado si la misma Session se reanuda.
 *   **Generación Automática de Certificados:** Si los archivos `cert.pem` y `key.pem` no están en el volumen, Pipistrelle genera automáticamente certificados auto-firmados válidos para `localhost`, `127.0.0.1`, `10.0.1.2` y `host.wokwi.internal`.
+*   **CI y seguridad de dependencias:** Cada push/PR ejecuta formato, Clippy, tests Rust de release y las suites MQTT reales sobre un contenedor aislado. RustSec/CodeQL se ejecutan de forma continua y Dependabot mantiene Cargo, Actions y Docker visibles para actualización.
 
 ---
 
@@ -55,7 +81,8 @@ graph TD
 El broker se distribuye mediante un contenedor Docker multi-etapa optimizado que reduce al mínimo el tamaño de la imagen y garantiza compatibilidad con la librería de C de SQLite.
 
 ### Requisitos Previos
-*   Tener instalado **Docker** y **Docker Desktop** en tu equipo.
+*   Tener instalado **Docker** (Docker Desktop en Windows/macOS o Docker Engine + Compose plugin en Linux).
+*   Para compilar fuera de Docker: **Rust 1.98.0**, fijado en `rust-toolchain.toml`.
 
 ### Instrucciones de Inicio Rápido
 
@@ -103,6 +130,13 @@ Puedes personalizar el comportamiento del broker modificando las variables de en
 | `PIPISTRELLE_RECEIVE_MAXIMUM` | Máximo de PUBLISH QoS1/2 Client→Server simultáneos anunciado en CONNACK. | `1024` |
 | `PIPISTRELLE_MAX_PACKET_SIZE` | Máximo tamaño de paquete MQTT aceptado por el broker. | `16777216` |
 | `PIPISTRELLE_TOPIC_ALIAS_MAXIMUM` | Máximo Topic Alias Client→Server anunciado en CONNACK; `0` deshabilita aliases inbound. | `32` |
+| `PIPISTRELLE_CLIENT_QUEUE_CAPACITY` | Capacidad lógica bounded de la cola outbound por cliente. | `1024` |
+| `PIPISTRELLE_MAX_SUBSCRIPTIONS_PER_CLIENT` | Cuota máxima de subscriptions por cliente. | `256` |
+| `PIPISTRELLE_SLOW_CONSUMER_POLICY` | Política ante consumidor lento: `backpressure` o `disconnect`. | `backpressure` |
+| `PIPISTRELLE_WRITER_BATCH_PACKETS` | Máximo de paquetes por batch de escritura outbound. | `256` |
+| `PIPISTRELLE_WRITER_BATCH_BYTES` | Máximo de bytes por batch de escritura outbound. | `262144` |
+| `PIPISTRELLE_LATENCY_SAMPLE_RATE` | Tasa de muestreo para métricas de latencia de routing. | `64` |
+| `PIPISTRELLE_TLS_PROFILE` | Perfil TLS: `hybrid`, `pqc-strict` o `classical`. | `hybrid` |
 | `PIPISTRELLE_BRIDGE_HOST` | Host remoto de HiveMQ Cloud para puente. | *Desactivado por defecto* |
 | `PIPISTRELLE_BRIDGE_USER` | Usuario de autenticación del puente. | *Ninguno* |
 | `PIPISTRELLE_BRIDGE_PASS` | Contraseña de autenticación del puente. | *Ninguna* |
@@ -190,6 +224,8 @@ Desde `2.1.2.0`, el broker implementa además **UNSUBSCRIBE/UNSUBACK**, Receive 
 
 `2.1.2.2` añade **Topic Alias end-to-end bidireccional** sin relajar los gates de correctness: el subscriber anuncia su Topic Alias Maximum en CONNECT; el primer Server→Client PUBLISH establece `topic + alias` y el steady state usa Topic Name vacío + alias. El fast-route usa un epoch de mapping inbound para invalidar caches cuando un publisher remapea un alias. En tres corridas sostenidas de ~2B PUBLISH, Topic Alias E2E alcanzó **35.184 / 34.543 / 35.587 M msg/s**, mediana **35.184 M msg/s**, 0 fallos y contadores Prometheus exactos: ~**14.25×** sobre el baseline anterior de 2.469 M/s y ligeramente por encima del gate full-topic E2E de ~33 M/s. Como regresiones separadas, 500M full-topic E2E dio **33.415 M msg/s** y 500M Topic Alias ingest `sendfile` **150.808 M msg/s**. El release exacto pasó **51/51 Rust**, **25/25 MQTT v5 raw**, **10/10 SIGKILL/restart** y **6/6 integración**.
 
+`2.1.2.3` cierra esta ronda de performance con un **scanner SVE gather4** para el layout estructural de 9 bytes de Topic Alias QoS0 en Linux/AArch64. La detección SVE es runtime y cualquier mismatch vuelve al scanner escalar para localizar exactamente el primer frame distinto; no se adelanta forwarding de paquetes no validados. El benchmark nativo QoS0 también evita un `Tokio Mutex` innecesario en su único writer sin reducir la validación de recepción. En tuning controlado sobre la Orange Pi, el nuevo candidato se movió en la zona de **38–39 M msg/s E2E**, con un mejor run corto validado de **38.981 M msg/s**. No se alcanzaron 40M sostenidos y el README no los reclama.
+
 ---
 
 ## <img src="https://api.iconify.design/lucide:flask-conical.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Pruebas de Integración
@@ -212,6 +248,16 @@ Pipistrelle incluye un completo conjunto de pruebas de integración automatizada
 
 `test_broker.py` mantiene los 6 checks de transporte/autenticación. `test_protocol_v2.py` habla MQTT v5 directamente por sockets y valida QoS 2, retained, propiedades PUBLISH/Will, Message Expiry, opciones de suscripción y sesiones persistentes/takeover. `test_protocol_restart_v2.py` es destructivo y valida la misma persistencia a través de `SIGKILL`/restart del contenedor local.
 
+Antes de un release también se ejecutan los gates Rust locales:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features
+cargo test --release
+```
+
+El workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) reproduce estos checks en GitHub y levanta un broker Docker aislado para ejecutar automáticamente las tres suites Python. Los tags `v*` validan además que el tag coincida exactamente con el archivo `VERSION`.
+
 El script base validará automáticamente los siguientes 6 escenarios:
 *   **Test 1 (TCP):** Conexión de administrador, publicación, suscripción y loopback.
 *   **Test 2 (Auth Failure):** Verificación de rechazo ante contraseñas incorrectas (Código `0x86`).
@@ -219,6 +265,17 @@ El script base validará automáticamente los siguientes 6 escenarios:
 *   **Test 4 (TLS PQC):** Validación de canal seguro y cifrado híbrido post-cuántico.
 *   **Test 5 (WebSockets):** Conexión sobre WebSockets, publicación y loopback.
 *   **Test 6 (Métricas):** Validación de lectura y scrapeo del endpoint HTTP Prometheus en el puerto `9095`.
+
+---
+
+## CI, seguridad y mantenimiento
+
+Pipistrelle mantiene dos pipelines principales en GitHub Actions:
+
+- **CI:** `cargo fmt`, Clippy, tests Rust de release, build Docker, 6 checks de integración, 25 escenarios MQTT v5 raw y 10 escenarios destructivos de persistencia/restart.
+- **Security:** auditoría de `Cargo.lock` contra RustSec y análisis CodeQL para Rust, además de ejecución semanal.
+
+Dependabot revisa semanalmente dependencias Cargo y GitHub Actions, y mensualmente las imágenes Docker. Consulta [`SECURITY.md`](SECURITY.md) para reportar vulnerabilidades sin publicar detalles explotables y [`CHANGELOG.md`](CHANGELOG.md) para los cambios por release.
 
 ---
 

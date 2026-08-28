@@ -257,6 +257,16 @@ Final exact-image Orange Pi gates, native Rust load generator, 128-byte payload:
 
 During the ingest repetitions the board was ~41–45 °C with a shared-system load average around 4, which explains part of the observed scheduling variance.
 
+## V2 2.1.2.3 — SVE Topic Alias E2E closing pass
+
+`2.1.2.3` is the final micro-optimization pass before moving on to the next product work. On Linux/AArch64 with SVE available, the 9-byte Topic Alias QoS0 structural scanner gathers four frames per vector group and processes 16-frame blocks. Runtime feature detection preserves portability, and any mismatching block falls back to the scalar matcher to identify the exact first changed frame before general MQTT parsing.
+
+The native QoS0 loopback benchmark also keeps its `WriteHalf` directly owned by the publisher task because QoS0 has no reader-side PUBACK writes. This removes one Tokio mutex from the load generator only; the receiver still validates and counts the complete routed stream.
+
+Controlled Orange Pi tuning reached a best short validated run of **38.981 M msg/s** and repeatedly operated in the **~38–39 M msg/s** region. A sustained 40 M/s claim is intentionally **not** made. The `2.1.2.2` sustained ~2B release median of 35.184 M/s remains the prior release baseline, and the >200M numbers below remain a separate ingest/sendfile ceiling rather than an E2E result.
+
+Release engineering in `2.1.2.3` also adds reproducible CI, RustSec/CodeQL security checks and a pinned Rust 1.98.0 toolchain.
+
 ## V2 2.1.2.2 — Topic Alias end-to-end routing
 
 `2.1.2.2` adds Server→Client Topic Alias negotiation and a specialized exact-route fast path while preserving connection-local alias semantics. The receiving client must advertise a non-zero Topic Alias Maximum in CONNECT. The broker sends the first mapping as full Topic Name + alias and may then send zero-length Topic Name + alias. Publisher-side alias remaps invalidate the fast-route cache through a connection-local epoch.

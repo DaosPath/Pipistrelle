@@ -1128,33 +1128,35 @@ impl BrokerState {
 
         match self.db.load_retained().await {
             Ok(messages) => {
-                let mut retained = self.retained.write();
-                let mut expired = Vec::new();
-                for (topic, payload, qos, properties_json) in messages {
-                    let properties: ApplicationProperties =
-                        serde_json::from_str(&properties_json).unwrap_or_default();
-                    if properties.is_expired() {
-                        expired.push(topic);
-                        continue;
+                let expired = {
+                    let mut retained = self.retained.write();
+                    let mut expired = Vec::new();
+                    for (topic, payload, qos, properties_json) in messages {
+                        let properties: ApplicationProperties =
+                            serde_json::from_str(&properties_json).unwrap_or_default();
+                        if properties.is_expired() {
+                            expired.push(topic);
+                            continue;
+                        }
+                        retained.insert(
+                            topic.clone(),
+                            RetainedMessage {
+                                topic,
+                                payload,
+                                qos,
+                                properties,
+                            },
+                        );
                     }
-                    retained.insert(
-                        topic.clone(),
-                        RetainedMessage {
-                            topic,
-                            payload,
-                            qos,
-                            properties,
-                        },
-                    );
-                }
-                drop(retained);
+                    expired
+                };
                 for topic in expired {
                     self.db.delete_retained(topic).await;
                 }
-                let retained = self.retained.read();
+                let retained_count = self.retained.read().len();
                 info!(
                     "Restored {} retained message(s) from database",
-                    retained.len()
+                    retained_count
                 );
             }
             Err(e) => error!("Failed to load retained messages: {:?}", e),

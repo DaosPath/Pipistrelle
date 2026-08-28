@@ -11,8 +11,7 @@ mod websocket;
 
 use bytes::{Buf, BytesMut};
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::{self, BufReader, IoSlice};
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,7 +22,7 @@ use tokio::net::TcpListener;
 use tracing::{Level, debug, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use smallvec::SmallVec;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -1922,7 +1921,6 @@ fn expand_fast_alias_batch(
     let payload_len = layout.total_len.checked_sub(cache.payload_offset)?;
     let output_len = cache.packet_len.checked_mul(count)?;
     let mut output = Vec::<u8>::with_capacity(output_len);
-    unsafe { output.set_len(output_len) };
 
     #[cfg(target_arch = "aarch64")]
     if cache.fast_prefix32 && payload_len == 128 {
@@ -1931,7 +1929,7 @@ fn expand_fast_alias_batch(
             let prefix0 = vld1q_u8(cache.prefix32.as_ptr());
             let prefix1 = vld1q_u8(cache.prefix32.as_ptr().add(16));
             let source = buf.as_ptr();
-            let destination = output.as_mut_ptr();
+            let destination = output.spare_capacity_mut().as_mut_ptr().cast::<u8>();
             for index in 0..count {
                 let source_payload = source.add(index * layout.total_len + cache.payload_offset);
                 let dest_packet = destination.add(index * cache.packet_len);
@@ -1942,13 +1940,14 @@ fn expand_fast_alias_batch(
                     vst1q_u8(dest_packet.add(cache.prefix.len() + lane * 16), value);
                 }
             }
+            output.set_len(output_len);
         }
         return Some((bytes::Bytes::from(output), cache.packet_len));
     }
 
     unsafe {
         let source = buf.as_ptr();
-        let destination = output.as_mut_ptr();
+        let destination = output.spare_capacity_mut().as_mut_ptr().cast::<u8>();
         for index in 0..count {
             let input_start = index * layout.total_len;
             let dest_packet = destination.add(index * cache.packet_len);
@@ -1959,6 +1958,7 @@ fn expand_fast_alias_batch(
                 payload_len,
             );
         }
+        output.set_len(output_len);
     }
     Some((bytes::Bytes::from(output), cache.packet_len))
 }
@@ -3159,15 +3159,13 @@ mod fast_ingest_tests {
 
 // Helper functions for loading certificates and private keys
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let certfile = File::open(path)?;
-    let mut reader = BufReader::new(certfile);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    certs.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    CertificateDer::pem_file_iter(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 fn load_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let keyfile = File::open(path)?;
-    let mut reader = BufReader::new(keyfile);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "private key not found"))
+    PrivateKeyDer::from_pem_file(path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }

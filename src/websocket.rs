@@ -1,11 +1,11 @@
+use futures_util::{Sink, Stream};
+use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::{Stream, Sink};
-use pin_project::pin_project;
 
 #[pin_project]
 pub struct WebSocketStreamAdapter<S> {
@@ -37,7 +37,7 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut this = self.project();
-        
+
         loop {
             // If we have data in the buffer, read it
             if *this.read_cursor < this.read_buffer.len() {
@@ -47,7 +47,7 @@ where
                 *this.read_cursor += to_copy;
                 return Poll::Ready(Ok(()));
             }
-            
+
             // Otherwise, get next frame from WebSocket
             match this.ws.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
@@ -103,10 +103,7 @@ where
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut this = self.as_mut().project();
         if this.write_buffer.is_empty() {
             return Poll::Ready(Ok(()));
@@ -116,13 +113,13 @@ where
             Poll::Ready(Ok(())) => {
                 let msg = Message::Binary(std::mem::take(this.write_buffer));
                 match this.ws.as_mut().start_send(msg) {
-                    Ok(()) => {
-                        match this.ws.as_mut().poll_flush(cx) {
-                            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-                            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-                            Poll::Pending => Poll::Pending,
+                    Ok(()) => match this.ws.as_mut().poll_flush(cx) {
+                        Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                        Poll::Ready(Err(e)) => {
+                            Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
                         }
-                    }
+                        Poll::Pending => Poll::Pending,
+                    },
                     Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
                 }
             }
@@ -131,12 +128,9 @@ where
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
-        
+
         let this = self.project();
         match this.ws.poll_close(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),

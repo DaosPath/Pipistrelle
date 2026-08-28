@@ -1,6 +1,6 @@
 # Pipistrelle — Roadmap hacia 3.0.0.0
 
-Este documento fija el plan de evolución de Pipistrelle desde la release estable actual `2.1.2.2` hasta `3.0.0.0`.
+Este documento fija el plan de evolución de Pipistrelle desde la release estable actual `2.1.2.3` hasta `3.0.0.0`.
 
 La intención es evitar saltos de versión artificiales: cada minor de la serie `2.x` debe representar una etapa de producto claramente terminada. `3.0.0.0` queda reservado para el cambio arquitectónico mayor: Pipistrelle como plataforma MQTT distribuida, con clustering y alta disponibilidad estables.
 
@@ -15,7 +15,7 @@ La intención es evitar saltos de versión artificiales: cada minor de la serie 
 
 ---
 
-## Baseline actual — 2.1.2.2
+## Baseline actual — 2.1.2.3
 
 Estado actual publicado:
 
@@ -39,11 +39,13 @@ Estado actual publicado:
 - Bounded bridge queue.
 - Topic Alias bidireccional por Network Connection: máximo Client→Server anunciado en CONNACK y máximo Server→Client respetando lo anunciado por el peer en CONNECT; mapping/remap/reset connection-local.
 - Fast-path ARM64/NEON de ingest QoS0 aislado del routing general.
+- SVE gather fast-path opcional para Topic Alias QoS0 E2E en Linux/AArch64, con fallback escalar exacto.
+- CI de protocolo/restart, RustSec, CodeQL y Dependabot como gates de ingeniería.
 
 Gates de referencia de la Orange Pi:
 
 - QoS0 ingest full-topic: ~58 M msg/s nativo en el hot path validado. MQTT 5 Topic Alias: gate sostenido de 10B con mediana **163.550 M msg/s** en host normal y techo optimizado separado de **216.437 M msg/s** de mediana (3×10B, todas >200M).
-- QoS0 full-topic end-to-end: **33.415 M msg/s** en la regresión fresca de 500M. Topic Alias end-to-end: **35.184 M msg/s** de mediana en 3×~2B, frente a 2.469 M/s antes del fast-route.
+- QoS0 full-topic end-to-end: **33.415 M msg/s** en la regresión fresca de 500M. Topic Alias end-to-end: **35.184 M msg/s** de mediana en el release sostenido `2.1.2.2`; `2.1.2.3` elevó el tuning controlado a la zona ~38–39 M/s con un mejor run corto de **38.981 M/s**.
 - PQC híbrido operativo.
 - RAM del broker alrededor de ~100–150 MiB en los gates QoS0 actuales.
 
@@ -564,7 +566,8 @@ Estas pueden entrar cuando su base correspondiente esté madura, pero no deben d
 |---|---|
 | `2.1.2.0` | MQTT flow-control/compliance sólido |
 | `2.1.2.1` | Topic Alias inbound + >200M/s optimized ingest ceiling |
-| `2.1.2.2` | Baseline actual: Topic Alias bidireccional + ~35M/s E2E fast-route |
+| `2.1.2.2` | Topic Alias bidireccional + ~35M/s E2E fast-route |
+| `2.1.2.3` | Baseline actual: SVE Topic Alias E2E + CI/security hardening (~38–39M/s tuning) |
 | `2.1.3.0` | Cierre restante de MQTT 5 + fuzzing/compliance |
 | `2.2.0.0` | Management REST API |
 | `2.3.0.0` | Control Center / Web UI |

@@ -1,11 +1,11 @@
 use bytes::{Buf, BytesMut};
 use pipistrelle::crypto::{self, TlsProfile};
 use rustls::ClientConfig;
-use rustls_pki_types::ServerName;
+use rustls_pki_types::{CertificateDer, ServerName, pem::PemObject};
 use serde::Serialize;
 use std::env;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -731,10 +731,8 @@ async fn open_stream(args: &Args) -> Result<(BoxStream, Option<String>), BenchEr
         .as_ref()
         .ok_or("--ca is required for TLS benchmarking")?;
     let mut roots = rustls::RootCertStore::empty();
-    let mut reader = BufReader::new(File::open(ca)?);
-    for cert in rustls_pemfile::certs(&mut reader) {
-        roots.add(cert?)?;
-    }
+    let certs = CertificateDer::pem_file_iter(ca)?.collect::<Result<Vec<_>, _>>()?;
+    roots.add_parsable_certificates(certs);
 
     let provider = crypto::provider(args.tls_profile);
     let config = ClientConfig::builder_with_provider(Arc::new(provider))

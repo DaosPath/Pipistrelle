@@ -1,8 +1,8 @@
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use tracing::info;
-use rcgen::{generate_simple_self_signed, CertifiedKey};
 
 /// Ensures that TLS certificates exist at the specified paths.
 /// If they do not, it generates a new self-signed certificate valid for localhost,
@@ -43,7 +43,10 @@ pub fn ensure_certificates(cert_path: &Path, key_path: &Path) -> io::Result<()> 
     let mut key_file = File::create(key_path)?;
     key_file.write_all(key_pem.as_bytes())?;
 
-    info!("Successfully generated self-signed certificate at: {:?}", cert_path);
+    info!(
+        "Successfully generated self-signed certificate at: {:?}",
+        cert_path
+    );
     info!("Successfully generated private key at: {:?}", key_path);
 
     Ok(())
