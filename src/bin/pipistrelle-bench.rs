@@ -22,6 +22,27 @@ impl<T> AsyncStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxStream = Box<dyn AsyncStream>;
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
+enum BenchWriter<W> {
+    Direct(W),
+    Shared(Arc<Mutex<W>>),
+}
+
+impl<W> BenchWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    #[inline]
+    async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Direct(writer) => writer.write_all(bytes).await,
+            Self::Shared(writer) => {
+                let mut guard = writer.lock().await;
+                guard.write_all(bytes).await
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Loopback,
@@ -533,13 +554,20 @@ async fn run_worker_inner(
     }
 
     let (read_half, write_half) = tokio::io::split(stream);
-    let writer = Arc::new(Mutex::new(write_half));
+    // QoS0 has only one socket writer: the publisher task. Keep the WriteHalf owned
+    // directly and avoid a Tokio mutex on every benchmark send window. QoS1 still
+    // shares it because the reader must emit PUBACKs for routed QoS1 PUBLISH packets.
+    let (reader_writer, mut writer) = if args.qos == 0 {
+        (None, BenchWriter::Direct(write_half))
+    } else {
+        let shared = Arc::new(Mutex::new(write_half));
+        (Some(shared.clone()), BenchWriter::Shared(shared))
+    };
     let received = Arc::new(AtomicU64::new(0));
     let pubacks = Arc::new(AtomicU64::new(0));
     let received_notify = Arc::new(Notify::new());
     let puback_notify = Arc::new(Notify::new());
 
-    let reader_writer = writer.clone();
     let reader_received = received.clone();
     let reader_pubacks = pubacks.clone();
     let reader_received_notify = received_notify.clone();
@@ -592,8 +620,7 @@ async fn run_worker_inner(
     let mut sent = 0u64;
     if let Some(mapping) = qos0_mapping_packet.as_ref() {
         if args.messages > 0 {
-            let mut guard = writer.lock().await;
-            guard.write_all(mapping).await?;
+            writer.write_all(mapping).await?;
             sent = 1;
         }
     }
@@ -602,8 +629,7 @@ async fn run_worker_inner(
         if args.qos == 0 {
             let packet_len = qos0_packet.as_ref().expect("qos0 packet").len();
             let batch = qos0_full_batch.as_ref().expect("qos0 batch");
-            let mut guard = writer.lock().await;
-            guard.write_all(&batch[..packet_len * count]).await?;
+            writer.write_all(&batch[..packet_len * count]).await?;
         } else {
             let mut batch = Vec::with_capacity((payload.len() + topic.len() + 16) * count);
             for offset in 0..count {
@@ -611,8 +637,7 @@ async fn run_worker_inner(
                 let packet_id = ((sequence % 65_535) + 1) as u16;
                 batch.extend_from_slice(&encode_publish(&topic, &payload, 1, Some(packet_id)));
             }
-            let mut guard = writer.lock().await;
-            guard.write_all(&batch).await?;
+            writer.write_all(&batch).await?;
         }
         sent += count as u64;
 
@@ -640,10 +665,7 @@ async fn run_worker_inner(
                 1,
                 Some(65_535),
             );
-            {
-                let mut guard = writer.lock().await;
-                guard.write_all(&marker).await?;
-            }
+            writer.write_all(&marker).await?;
             wait_counter(&pubacks, &puback_notify, 1, args.timeout).await?;
         }
         _ => unreachable!(),
@@ -732,7 +754,7 @@ async fn open_stream(args: &Args) -> Result<(BoxStream, Option<String>), BenchEr
 
 async fn reader_loop<R, W>(
     mut reader: R,
-    writer: Arc<Mutex<W>>,
+    writer: Option<Arc<Mutex<W>>>,
     received: Arc<AtomicU64>,
     pubacks: Arc<AtomicU64>,
     received_notify: Arc<Notify>,
@@ -816,7 +838,10 @@ where
             puback_notify.notify_waiters();
         }
         if !ack_batch.is_empty() {
-            let mut guard = writer.lock().await;
+            let shared = writer.as_ref().ok_or_else(|| {
+                io::Error::other("QoS0 benchmark reader unexpectedly needed a socket writer")
+            })?;
+            let mut guard = shared.lock().await;
             guard.write_all(&ack_batch).await?;
         }
     }

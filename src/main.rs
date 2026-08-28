@@ -38,6 +38,70 @@ use crate::session::{
 };
 use pipistrelle::{crypto, version};
 
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+core::arch::global_asm!(
+    r#"
+    .text
+    .arch armv8.2-a+sve
+    .hidden pipistrelle_sve_alias_blocks4
+    .global pipistrelle_sve_alias_blocks4
+    .type pipistrelle_sve_alias_blocks4,%function
+// x0=base, x1=packet stride, x2=16-frame blocks,
+// w3=bytes[0..4], w4=bytes[4..8], w5=byte[8].
+// Four MQTT frames are gathered per vector group. ptrue vl4 keeps the routine
+// correct for any Linux SVE vector length >= 128 bits.
+pipistrelle_sve_alias_blocks4:
+    ptrue p0.s, vl4
+    index z0.s, #0, w1
+    dup z4.s, w3
+    dup z5.s, w4
+    dup z6.s, w5
+    mov x6, x0
+    mov x7, #0
+    lsl x8, x1, #2
+1:
+    cmp x7, x2
+    b.hs 3f
+    eor z7.d, z7.d, z7.d
+    .rept 4
+        ld1w { z1.s }, p0/z, [x6, z0.s, uxtw]
+        add x9, x6, #4
+        ld1w { z2.s }, p0/z, [x9, z0.s, uxtw]
+        add x10, x6, #8
+        ld1b { z3.s }, p0/z, [x10, z0.s, uxtw]
+        eor z1.d, z1.d, z4.d
+        eor z2.d, z2.d, z5.d
+        eor z3.d, z3.d, z6.d
+        orr z1.d, z1.d, z2.d
+        orr z1.d, z1.d, z3.d
+        orr z7.d, z7.d, z1.d
+        add x6, x6, x8
+    .endr
+    orv d0, p0, z7.d
+    fmov x11, d0
+    cbnz x11, 3f
+    add x7, x7, #1
+    b 1b
+3:
+    mov x0, x7
+    ret
+    .size pipistrelle_sve_alias_blocks4, .-pipistrelle_sve_alias_blocks4
+"#,
+    options(raw)
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+unsafe extern "C" {
+    fn pipistrelle_sve_alias_blocks4(
+        base: *const u8,
+        packet_stride: usize,
+        blocks: usize,
+        expected0: u32,
+        expected1: u32,
+        expected8: u32,
+    ) -> usize;
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keep benchmark/production logging cheap by default; DEBUG/TRACE are opt-in.
@@ -1387,7 +1451,9 @@ struct FastIngestLayout {
     scalar_words: [u64; 3],
     scalar_tail_mask: u64,
     scalar9_word: u64,
+    scalar9_words32: [u32; 2],
     scalar9_tail: u8,
+    sve_alias_gather4: bool,
     scalar9: bool,
     scalar24: bool,
     neon32: bool,
@@ -1405,11 +1471,19 @@ impl FastIngestLayout {
         self.scalar_words = [0; 3];
         self.scalar_tail_mask = 0;
         self.scalar9_word = 0;
+        self.scalar9_words32 = [0; 2];
         self.scalar9_tail = 0;
+        self.sve_alias_gather4 = false;
         self.scalar9 = prefix.len() == 9 && total_len >= 9;
         if self.scalar9 {
             self.scalar9_word = u64::from_ne_bytes(prefix[..8].try_into().unwrap());
+            self.scalar9_words32[0] = u32::from_ne_bytes(prefix[..4].try_into().unwrap());
+            self.scalar9_words32[1] = u32::from_ne_bytes(prefix[4..8].try_into().unwrap());
             self.scalar9_tail = prefix[8];
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            {
+                self.sve_alias_gather4 = std::arch::is_aarch64_feature_detected!("sve");
+            }
         }
         self.scalar24 = prefix.len() > 16 && prefix.len() <= 24 && total_len >= 24;
         if self.scalar24 {
@@ -1528,6 +1602,44 @@ fn fast_ingest_layout_matches_16_scalar24(
         }
         any == 0
     }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[inline(always)]
+fn fast_ingest_layout_matches_sve_blocks4(
+    buf: &[u8],
+    offset: usize,
+    total: usize,
+    blocks: usize,
+    layout: &FastIngestLayout,
+) -> Option<usize> {
+    if !layout.scalar9 || !layout.sve_alias_gather4 || blocks == 0 {
+        return None;
+    }
+    debug_assert!(offset + total.saturating_mul(blocks).saturating_mul(16) <= buf.len());
+    let accepted = unsafe {
+        pipistrelle_sve_alias_blocks4(
+            buf.as_ptr().add(offset),
+            total,
+            blocks,
+            layout.scalar9_words32[0],
+            layout.scalar9_words32[1],
+            layout.scalar9_tail as u32,
+        )
+    };
+    Some(accepted.min(blocks))
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+#[inline(always)]
+fn fast_ingest_layout_matches_sve_blocks4(
+    _buf: &[u8],
+    _offset: usize,
+    _total: usize,
+    _blocks: usize,
+    _layout: &FastIngestLayout,
+) -> Option<usize> {
+    None
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2025,6 +2137,24 @@ fn scan_zero_route_qos0_alias_batch(
             let total = layout.total_len;
             if layout.scalar9 {
                 let sixteen = total.saturating_mul(16);
+                let available_blocks = if sixteen == 0 {
+                    0
+                } else {
+                    (buf.len().saturating_sub(offset)) / sixteen
+                };
+                if let Some(accepted_blocks) = fast_ingest_layout_matches_sve_blocks4(
+                    buf,
+                    offset,
+                    total,
+                    available_blocks,
+                    layout,
+                ) {
+                    let accepted_messages = accepted_blocks.saturating_mul(16);
+                    messages += accepted_messages as u64;
+                    offset += accepted_messages.saturating_mul(total);
+                }
+                // If the vector pass stopped on a changed block, scalar validation
+                // pinpoints the first mismatching MQTT frame before any bytes advance.
                 while offset + sixteen <= buf.len() {
                     if !fast_ingest_layout_matches_16_scalar9(buf, offset, total, layout) {
                         break;
@@ -2973,6 +3103,45 @@ mod fast_ingest_tests {
         assert_eq!(batch.messages, 16);
         let rewritten = rewrite_fast_alias_batch(&input, batch, &layout, 2).unwrap();
         assert_eq!(rewritten.as_ref(), expected.as_slice());
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    fn sve_alias_gather4_detects_changed_prefix_block() {
+        if !std::arch::is_aarch64_feature_detected!("sve") {
+            return;
+        }
+        let packet = crate::codec::encode_publish_qos0_with_topic_alias("", &[b'x'; 128], 1);
+        let total = packet.len();
+        let mut input = Vec::with_capacity(total * 48);
+        for _ in 0..48 {
+            input.extend_from_slice(&packet);
+        }
+        let expected0 = u32::from_ne_bytes(packet[..4].try_into().unwrap());
+        let expected1 = u32::from_ne_bytes(packet[4..8].try_into().unwrap());
+        let accepted = unsafe {
+            pipistrelle_sve_alias_blocks4(
+                input.as_ptr(),
+                total,
+                3,
+                expected0,
+                expected1,
+                packet[8] as u32,
+            )
+        };
+        assert_eq!(accepted, 3);
+        input[20 * total + 8] ^= 1;
+        let accepted = unsafe {
+            pipistrelle_sve_alias_blocks4(
+                input.as_ptr(),
+                total,
+                3,
+                expected0,
+                expected1,
+                packet[8] as u32,
+            )
+        };
+        assert_eq!(accepted, 1);
     }
 
     #[test]
