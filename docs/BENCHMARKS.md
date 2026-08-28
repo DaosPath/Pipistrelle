@@ -257,6 +257,30 @@ Final exact-image Orange Pi gates, native Rust load generator, 128-byte payload:
 
 During the ingest repetitions the board was ~41–45 °C with a shared-system load average around 4, which explains part of the observed scheduling variance.
 
+## V2 2.1.2.2 — Topic Alias end-to-end routing
+
+`2.1.2.2` adds Server→Client Topic Alias negotiation and a specialized exact-route fast path while preserving connection-local alias semantics. The receiving client must advertise a non-zero Topic Alias Maximum in CONNECT. The broker sends the first mapping as full Topic Name + alias and may then send zero-length Topic Name + alias. Publisher-side alias remaps invalidate the fast-route cache through a connection-local epoch.
+
+Sustained ~2B-message end-to-end runs on the Orange Pi:
+
+| Run | Throughput | Approx. elapsed | Failures |
+|---|---:|---:|---:|
+| 1 | **35.184 M msg/s** | ~56–58 s | 0 |
+| 2 | **34.543 M msg/s** | ~56–58 s | 0 |
+| 3 | **35.587 M msg/s** | ~56–58 s | 0 |
+
+**Median: 35.184 M msg/s.** Prometheus accounting was exact in every run. The previous Topic Alias end-to-end implementation measured **2.469 M msg/s**, making this about a **14.25×** improvement.
+
+Fresh regression gates on the same source keep benchmark categories separate:
+
+- **500M full-topic QoS0 end-to-end:** **33.415 M msg/s**, 0 failures, exact counter accounting.
+- **500M Topic Alias QoS0 ingest with `--sendfile`:** **150.808 M msg/s**, 0 failures, exact counter accounting.
+- Functional release gates: **51/51 Rust**, **25/25 raw MQTT v5**, **10/10 SIGKILL/restart**, **6/6 integration**.
+
+The profile of the final Topic Alias E2E candidate is dominated by kernel copy/VM work (~30.07% `__arch_copy_to_user`, ~9.82% `__arch_copy_from_user`, ~5.86% page clear); the alias scanner is ~2.81% and outbound queue work ~0.56%. This is why additional routing-side hashing/micro-optimization is no longer the main bottleneck.
+
+Do not compare these E2E figures directly with the `2.1.2.1` 10B ingest ceiling: ingest and subscriber delivery exercise different datapaths.
+
 ## V2 2.1.2.1 — Topic Alias ingest: 161M normal-host median / 211M optimized ceiling
 
 `2.1.2.1` keeps the MQTT correctness/flow-control behavior of `2.1.2.0`, adds Client→Server Topic Alias, a zero-route ARM64 fast path, and a Linux-only native benchmark backend `--sendfile`. Results below use 128-byte payloads and ordered QoS1 completion markers. Docker remains supported but is not used for native ceiling figures.
@@ -336,6 +360,6 @@ Each performance case below used a fresh native broker and fresh SQLite DB. `PIP
 - **~50M full-topic QoS0 end-to-end (13 clients, window 1024):** **33.203 M msg/s**, 0 failures, Prometheus delta exactly **49,999,989**.
 - **200k QoS1 end-to-end:** **221.82k msg/s**, 0 failures, Prometheus delta exactly **200,000**.
 - **200k hybrid PQC TLS QoS0:** data phase **7.458 M msg/s**, 0 failures, `X25519MLKEM768` on **10/10** connections, setup p50 **197.0 ms** / p95 **233.2 ms**; Prometheus delta **200,010** includes the 10 completion markers.
-- Functional gates: **45/45 Rust**, **24/24 raw MQTT v5**, **10/10 SIGKILL/restart**, **6/6 integration**.
+- Functional gates at the `2.1.2.1` release point: **45/45 Rust**, **24/24 raw MQTT v5**, **10/10 SIGKILL/restart**, **6/6 integration**.
 
 Do not compare the 161/211 M/s Topic Alias figures directly to full-topic ingest as if the wire format were identical, and do not compare ingest to end-to-end routing. Topic Alias is a standard MQTT 5 optimization that removes repeated Topic Name bytes after a mapping is established; all benchmark categories remain separately labeled.

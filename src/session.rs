@@ -8,7 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::codec::{Packet, Publish, PublishProperties, encode_packet, encode_publish_qos0};
+use crate::codec::{
+    Packet, Publish, PublishProperties, encode_packet, encode_publish_qos0,
+    encode_publish_qos0_with_topic_alias,
+};
 use crate::latency::LatencyHistogram;
 use crate::router::{TopicRouter, topic_matches_filter};
 
@@ -513,6 +516,12 @@ struct PendingWill {
     username: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct OutboundTopicAliasState {
+    topic_to_alias: HashMap<String, u16>,
+    established: HashSet<u16>,
+}
+
 /// Represents an active or offline client session
 pub struct ClientSession {
     pub client_id: String,
@@ -528,6 +537,10 @@ pub struct ClientSession {
     /// Highest Topic Alias value this server advertised for Client -> Server PUBLISH.
     /// This is connection-local and deliberately not inherited by persistent Sessions.
     pub topic_alias_maximum: u16,
+    /// Highest Topic Alias value the peer advertised in CONNECT for Server -> Client PUBLISH.
+    /// Connection-local; never inherited by persistent Sessions.
+    pub outbound_topic_alias_maximum: AtomicU16,
+    outbound_topic_alias_state: Mutex<OutboundTopicAliasState>,
     pub session_expiry_interval: AtomicU32,
     pub connected: AtomicBool,
     pub will: RwLock<Option<WillMessage>>,
@@ -537,6 +550,8 @@ pub struct ClientSession {
 
     // Topic aliases sent by the client: Alias ID -> Topic String
     pub topic_aliases: RwLock<HashMap<u16, String>>,
+    /// Connection-local mutation epoch for Client->Server Topic Alias mappings.
+    pub topic_alias_epoch: AtomicU64,
 
     // Subscription/quota state
     pub subscriptions: RwLock<HashSet<String>>,
@@ -584,11 +599,14 @@ impl ClientSession {
             receive_maximum,
             maximum_packet_size,
             topic_alias_maximum,
+            outbound_topic_alias_maximum: AtomicU16::new(0),
+            outbound_topic_alias_state: Mutex::new(OutboundTopicAliasState::default()),
             session_expiry_interval: AtomicU32::new(session_expiry_interval),
             connected: AtomicBool::new(true),
             will: RwLock::new(None),
             sender,
             topic_aliases: RwLock::new(HashMap::new()),
+            topic_alias_epoch: AtomicU64::new(0),
             subscriptions: RwLock::new(HashSet::new()),
             published_messages: AtomicU64::new(0),
             next_packet_id: AtomicU16::new(1),
@@ -600,6 +618,51 @@ impl ClientSession {
             outbound_active: Mutex::new(HashSet::new()),
             disconnect_requested: AtomicBool::new(false),
             disconnect_notify: Notify::new(),
+        }
+    }
+
+    #[inline]
+    pub fn inbound_topic_alias_epoch(&self) -> u64 {
+        self.topic_alias_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn set_inbound_topic_alias(&self, alias: u16, topic: &str) {
+        self.topic_aliases.write().insert(alias, topic.to_string());
+        self.topic_alias_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn set_outbound_topic_alias_maximum(&self, maximum: u16) {
+        self.outbound_topic_alias_maximum
+            .store(maximum, Ordering::Release);
+    }
+
+    /// Returns the connection-local Server->Client alias for `topic` and whether the
+    /// peer has already received a mapping PUBLISH for it. New aliases are assigned
+    /// monotonically from 1 and are never inherited across Network Connections.
+    pub fn outbound_topic_alias_for(&self, topic: &str) -> Option<(u16, bool)> {
+        let maximum = self.outbound_topic_alias_maximum.load(Ordering::Acquire);
+        if maximum == 0 {
+            return None;
+        }
+        let mut state = self.outbound_topic_alias_state.lock();
+        if let Some(&alias) = state.topic_to_alias.get(topic) {
+            return Some((alias, state.established.contains(&alias)));
+        }
+        if state.topic_to_alias.len() >= maximum as usize {
+            return None;
+        }
+        let alias = (state.topic_to_alias.len() + 1) as u16;
+        if alias == 0 || alias > maximum {
+            return None;
+        }
+        state.topic_to_alias.insert(topic.to_string(), alias);
+        Some((alias, false))
+    }
+
+    pub fn mark_outbound_topic_alias_established(&self, topic: &str, alias: u16) {
+        let mut state = self.outbound_topic_alias_state.lock();
+        if state.topic_to_alias.get(topic).copied() == Some(alias) {
+            state.established.insert(alias);
         }
     }
 
@@ -2054,8 +2117,24 @@ impl BrokerState {
         // Maximum Packet Size is connection-scoped. Offline queued messages are retained
         // until a future connection declares its own limit.
         if session.connected.load(Ordering::Acquire) {
+            let mut establish_outbound_alias = None;
             let preview = if qos == 0 && properties.is_empty() {
-                encode_publish_qos0(topic, payload, retain, subscription_identifier)
+                if !retain && subscription_identifier.is_none() {
+                    if let Some((alias, established)) = session.outbound_topic_alias_for(topic) {
+                        if !established {
+                            establish_outbound_alias = Some(alias);
+                        }
+                        encode_publish_qos0_with_topic_alias(
+                            if established { "" } else { topic },
+                            payload,
+                            alias,
+                        )
+                    } else {
+                        encode_publish_qos0(topic, payload, retain, subscription_identifier)
+                    }
+                } else {
+                    encode_publish_qos0(topic, payload, retain, subscription_identifier)
+                }
             } else {
                 let preview = Packet::Publish(Publish {
                     dup: false,
@@ -2075,7 +2154,12 @@ impl BrokerState {
                 return;
             }
             if qos == 0 {
-                let _ = self.send_to_session(&session, preview).await;
+                let sent = self.send_to_session(&session, preview).await;
+                if sent {
+                    if let Some(alias) = establish_outbound_alias {
+                        session.mark_outbound_topic_alias_established(topic, alias);
+                    }
+                }
                 return;
             }
         } else if qos == 0 {
@@ -2410,6 +2494,58 @@ impl BrokerState {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn inbound_topic_alias_epoch_changes_on_mapping_updates() {
+        let queue = Arc::new(OutboundQueue::new(8));
+        let session = ClientSession::new(
+            "alias-source".into(),
+            None,
+            true,
+            true,
+            true,
+            60,
+            u16::MAX,
+            268_435_455,
+            32,
+            0,
+            queue,
+        );
+        let before = session.inbound_topic_alias_epoch();
+        session.set_inbound_topic_alias(1, "a");
+        let mapped = session.inbound_topic_alias_epoch();
+        assert_ne!(mapped, before);
+        session.set_inbound_topic_alias(1, "b");
+        assert_ne!(session.inbound_topic_alias_epoch(), mapped);
+        assert_eq!(
+            session.topic_aliases.read().get(&1).map(String::as_str),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn outbound_topic_alias_respects_connection_maximum_and_establishment() {
+        let queue = Arc::new(OutboundQueue::new(8));
+        let session = ClientSession::new(
+            "alias-target".into(),
+            None,
+            true,
+            true,
+            true,
+            60,
+            u16::MAX,
+            268_435_455,
+            32,
+            0,
+            queue,
+        );
+        assert_eq!(session.outbound_topic_alias_for("a"), None);
+        session.set_outbound_topic_alias_maximum(1);
+        assert_eq!(session.outbound_topic_alias_for("a"), Some((1, false)));
+        assert_eq!(session.outbound_topic_alias_for("b"), None);
+        session.mark_outbound_topic_alias_established("a", 1);
+        assert_eq!(session.outbound_topic_alias_for("a"), Some((1, true)));
+    }
 
     #[test]
     fn policy_parsing_is_stable() {

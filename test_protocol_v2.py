@@ -257,6 +257,7 @@ class RawClient:
         session_expiry=0,
         receive_maximum=None,
         maximum_packet_size=None,
+        topic_alias_maximum=None,
         will=None,
         timeout=3.0,
         user=USER,
@@ -272,6 +273,11 @@ class RawClient:
             session_expiry=session_expiry,
             receive_maximum=receive_maximum,
             maximum_packet_size=maximum_packet_size,
+            raw_connect_properties=(
+                bytes([0x22]) + struct.pack("!H", topic_alias_maximum)
+                if topic_alias_maximum is not None
+                else None
+            ),
             will=will,
             user=user,
             password=password,
@@ -892,6 +898,54 @@ def test_topic_alias_lifecycle_and_routing():
     sub.disconnect()
 
 
+def test_bidirectional_topic_alias_remap_fast_route():
+    topic_a = "protocol/v2/alias/remap/a"
+    topic_b = "protocol/v2/alias/remap/b"
+    sub_a = RawClient("proto_alias_bidir_a", topic_alias_maximum=1)
+    sub_b = RawClient("proto_alias_bidir_b", topic_alias_maximum=1)
+    sub_a.subscribe(topic_a, qos=0)
+    sub_b.subscribe(topic_b, qos=0)
+    pub = RawClient("proto_alias_bidir_pub")
+
+    # Alias 1 is connection-local and may legally be remapped by a later PUBLISH.
+    pub.sock.sendall(publish_packet(topic_a, b"a1", properties={"topic_alias": 1}))
+    pub.sock.sendall(publish_packet("", b"a2", properties={"topic_alias": 1}))
+    pub.sock.sendall(publish_packet(topic_b, b"b1", properties={"topic_alias": 1}))
+    pub.sock.sendall(publish_packet("", b"b2", properties={"topic_alias": 1}))
+
+    def receive_resolved(client, mappings):
+        header, body = client.expect_type(3)
+        msg = parse_publish(header, body)
+        alias = msg["parsed_properties"]["topic_alias"]
+        topic = msg["topic"]
+        if alias is not None:
+            assert alias == 1, msg
+            if topic:
+                mappings[alias] = topic
+            else:
+                assert alias in mappings, "server reused Topic Alias before mapping"
+                topic = mappings[alias]
+        return topic, msg["payload"], msg["topic"], alias
+
+    map_a, map_b = {}, {}
+    got_a = [receive_resolved(sub_a, map_a), receive_resolved(sub_a, map_a)]
+    got_b = [receive_resolved(sub_b, map_b), receive_resolved(sub_b, map_b)]
+    assert [(topic, payload) for topic, payload, _, _ in got_a] == [
+        (topic_a, b"a1"),
+        (topic_a, b"a2"),
+    ], got_a
+    assert [(topic, payload) for topic, payload, _, _ in got_b] == [
+        (topic_b, b"b1"),
+        (topic_b, b"b2"),
+    ], got_b
+    # First outbound packet establishes the mapping; second reuses empty Topic Name.
+    assert got_a[0][2] == topic_a and got_a[0][3] == 1 and got_a[1][2] == ""
+    assert got_b[0][2] == topic_b and got_b[0][3] == 1 and got_b[1][2] == ""
+    assert no_packet(sub_a, 0.2) and no_packet(sub_b, 0.2)
+
+    pub.disconnect(); sub_a.disconnect(); sub_b.disconnect()
+
+
 def test_publish_property_protocol_errors():
     # Client->Server Subscription Identifier is a Protocol Error (0x82).
     bad_subid = RawClient("proto_bad_publish_subid")
@@ -1181,6 +1235,7 @@ if __name__ == "__main__":
         ("started QoS2 continues after expiry", test_started_qos2_continues_after_expiry),
         ("Will application properties", test_will_application_properties),
         ("Topic Alias lifecycle/routing/reset", test_topic_alias_lifecycle_and_routing),
+        ("bidirectional Topic Alias remap fast-route", test_bidirectional_topic_alias_remap_fast_route),
         ("PUBLISH property protocol errors", test_publish_property_protocol_errors),
         ("UNSUBSCRIBE/UNSUBACK + filter validation", test_unsubscribe_unsuback_and_filter_validation),
         ("server-assigned ClientID + CONNACK limits", test_server_assigned_client_id_and_connack_limits),

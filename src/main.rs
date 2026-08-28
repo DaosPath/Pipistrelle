@@ -338,6 +338,7 @@ where
         session_expiry_interval,
         client_receive_maximum,
         client_maximum_packet_size,
+        client_outbound_topic_alias_maximum,
         username,
         password,
         will,
@@ -351,6 +352,8 @@ where
                 let client_receive_maximum = pkt.properties.receive_maximum.unwrap_or(u16::MAX);
                 let client_maximum_packet_size =
                     pkt.properties.max_packet_size.unwrap_or(268_435_455);
+                let client_outbound_topic_alias_maximum =
+                    pkt.properties.topic_alias_maximum.unwrap_or(0);
                 let username = pkt.username.map(|s| s.to_string());
                 let password = pkt
                     .password
@@ -371,6 +374,7 @@ where
                     session_expiry_interval,
                     client_receive_maximum,
                     client_maximum_packet_size,
+                    client_outbound_topic_alias_maximum,
                     username,
                     password,
                     will,
@@ -599,6 +603,7 @@ where
         session_expiry_interval,
         tx,
     ));
+    session.set_outbound_topic_alias_maximum(client_outbound_topic_alias_maximum);
     *session.will.write() = will;
     if session_present {
         if let Some(old) = existing.as_ref() {
@@ -784,7 +789,10 @@ where
     let mut fast_ingest_layout = FastIngestLayout::default();
     let mut fast_ingest_alias_layout = FastIngestLayout::default();
     let mut fast_route_layout = FastIngestLayout::default();
+    let mut fast_route_alias_layout = FastIngestLayout::default();
     let mut fast_exact_route = FastExactRouteCache::default();
+    let mut fast_alias_route = FastAliasRouteCache::default();
+    let mut fast_alias_egress = FastAliasEgressCache::default();
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
         loop {
             if session.disconnect_requested() {
@@ -817,11 +825,17 @@ where
                     if bytes_read_from_socket >= read_reserve_target.saturating_sub(512) {
                         saturated_reads = saturated_reads.saturating_add(1);
                         let read_buffer_max = if session.allow_all_write
-                            && fast_ingest_alias_layout.total_len != 0
                             && !state.bridge_active.load(Ordering::Relaxed)
+                            && fast_ingest_alias_layout.total_len != 0
                             && !state.router.has_routes()
                         {
-                            CLIENT_READ_BUFFER_MAX_FAST_ALIAS
+                            CLIENT_READ_BUFFER_MAX_FAST_ALIAS_INGEST
+                        } else if session.allow_all_write
+                            && !state.bridge_active.load(Ordering::Relaxed)
+                            && fast_route_alias_layout.total_len != 0
+                            && state.router.has_only_exact_routes()
+                        {
+                            CLIENT_READ_BUFFER_MAX_FAST_ALIAS_ROUTE
                         } else {
                             CLIENT_READ_BUFFER_MAX_HOT
                         };
@@ -927,6 +941,254 @@ where
                                                 );
                                             }
                                             continue;
+                                        }
+                                    }
+                                }
+
+                                if session.topic_alias_maximum > 0 {
+                                    let alias_batch = scan_zero_route_qos0_alias_batch(
+                                        &read_buf,
+                                        state.maximum_packet_size,
+                                        &mut fast_route_alias_layout,
+                                        &session,
+                                    );
+                                    if alias_batch.messages != 0 {
+                                        if let Some((target, topic, outbound_alias)) =
+                                            resolve_fast_alias_exact_route(
+                                                &state,
+                                                &session,
+                                                &fast_route_alias_layout,
+                                                &mut fast_exact_route,
+                                                &mut fast_alias_route,
+                                            )
+                                        {
+                                            let session_epoch =
+                                                state.session_epoch.load(Ordering::Acquire);
+                                            if route_epoch == state.router.mutation_epoch()
+                                                && session_epoch == fast_exact_route.session_epoch
+                                                && !state.bridge_active.load(Ordering::Relaxed)
+                                            {
+                                                let input_alias = fast_route_alias_layout.alias;
+                                                if let (Some(input_alias), Some((alias, established))) =
+                                                    (input_alias, outbound_alias)
+                                                {
+                                                    if input_alias == alias {
+                                                        let total = fast_route_alias_layout.total_len;
+                                                        let payload_offset =
+                                                            fast_route_alias_layout.prefix.len();
+                                                        let count = alias_batch.messages as usize;
+                                                        if total != 0
+                                                            && payload_offset <= total
+                                                            && alias_batch.bytes
+                                                                == total.saturating_mul(count)
+                                                        {
+                                                            let mapping_ready = if established {
+                                                                true
+                                                            } else {
+                                                                let payload = &read_buf
+                                                                    [payload_offset..total];
+                                                                let mapping = crate::codec::
+                                                                    encode_publish_qos0_with_topic_alias(
+                                                                        &topic, payload, alias,
+                                                                    );
+                                                                let sent = state
+                                                                    .send_to_session(
+                                                                        &target, mapping,
+                                                                    )
+                                                                    .await;
+                                                                if sent {
+                                                                    target
+                                                                        .mark_outbound_topic_alias_established(
+                                                                            &topic, alias,
+                                                                        );
+                                                                    if fast_alias_route.outbound_alias == Some(alias) {
+                                                                        fast_alias_route.outbound_established = true;
+                                                                    }
+                                                                }
+                                                                sent
+                                                            };
+                                                            if mapping_ready {
+                                                                let routed = read_buf
+                                                                    .split_to(alias_batch.bytes)
+                                                                    .freeze();
+                                                                let direct_count = if established {
+                                                                    count
+                                                                } else {
+                                                                    count.saturating_sub(1)
+                                                                };
+                                                                let direct = if established {
+                                                                    routed
+                                                                } else {
+                                                                    routed.slice(total..)
+                                                                };
+                                                                let start = session
+                                                                    .published_messages
+                                                                    .fetch_add(
+                                                                        alias_batch.messages,
+                                                                        Ordering::Relaxed,
+                                                                    );
+                                                                let samples =
+                                                                    sampled_sequences_in_range(
+                                                                        start,
+                                                                        alias_batch.messages,
+                                                                        state
+                                                                            .publish_route_latency_sample_rate
+                                                                            as u64,
+                                                                    );
+                                                                let route_started = (samples != 0)
+                                                                    .then(fast_route_timestamp);
+                                                                if direct_count != 0 {
+                                                                    let _ = state
+                                                                        .send_bytes_batch_to_session(
+                                                                            &target,
+                                                                            direct,
+                                                                            total,
+                                                                            direct_count,
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                                if let Some(started) = route_started {
+                                                                    state.publish_route_latency.record_repeated(
+                                                                        fast_route_elapsed(started),
+                                                                        samples,
+                                                                    );
+                                                                }
+                                                                continue;
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let total = fast_route_alias_layout.total_len;
+                                                        let payload_offset =
+                                                            fast_route_alias_layout.prefix.len();
+                                                        let count = alias_batch.messages as usize;
+                                                        if total != 0
+                                                            && payload_offset <= total
+                                                            && alias_batch.bytes
+                                                                == total.saturating_mul(count)
+                                                        {
+                                                            let mapping_ready = if established {
+                                                                true
+                                                            } else {
+                                                                let payload = &read_buf
+                                                                    [payload_offset..total];
+                                                                let mapping = crate::codec::
+                                                                    encode_publish_qos0_with_topic_alias(
+                                                                        &topic, payload, alias,
+                                                                    );
+                                                                let sent = state
+                                                                    .send_to_session(&target, mapping)
+                                                                    .await;
+                                                                if sent {
+                                                                    target
+                                                                        .mark_outbound_topic_alias_established(
+                                                                            &topic, alias,
+                                                                        );
+                                                                    if fast_alias_route.outbound_alias == Some(alias) {
+                                                                        fast_alias_route.outbound_established = true;
+                                                                    }
+                                                                }
+                                                                sent
+                                                            };
+                                                            if mapping_ready {
+                                                                let source_start = if established { 0 } else { total };
+                                                                let direct_count = if established {
+                                                                    count
+                                                                } else {
+                                                                    count.saturating_sub(1)
+                                                                };
+                                                                let rewritten = if direct_count == 0 {
+                                                                    Some(bytes::Bytes::new())
+                                                                } else {
+                                                                    rewrite_fast_alias_batch(
+                                                                        &read_buf[source_start..alias_batch.bytes],
+                                                                        FastIngestBatch {
+                                                                            bytes: alias_batch.bytes - source_start,
+                                                                            messages: direct_count as u64,
+                                                                        },
+                                                                        &fast_route_alias_layout,
+                                                                        alias,
+                                                                    )
+                                                                };
+                                                                if let Some(rewritten) = rewritten {
+                                                                    read_buf.advance(alias_batch.bytes);
+                                                                    let start = session
+                                                                        .published_messages
+                                                                        .fetch_add(
+                                                                            alias_batch.messages,
+                                                                            Ordering::Relaxed,
+                                                                        );
+                                                                    let samples =
+                                                                        sampled_sequences_in_range(
+                                                                            start,
+                                                                            alias_batch.messages,
+                                                                            state
+                                                                                .publish_route_latency_sample_rate
+                                                                                as u64,
+                                                                        );
+                                                                    let route_started = (samples != 0)
+                                                                        .then(fast_route_timestamp);
+                                                                    if direct_count != 0 {
+                                                                        let _ = state
+                                                                            .send_bytes_batch_to_session(
+                                                                                &target,
+                                                                                rewritten,
+                                                                                total,
+                                                                                direct_count,
+                                                                            )
+                                                                            .await;
+                                                                    }
+                                                                    if let Some(started) = route_started {
+                                                                        state.publish_route_latency.record_repeated(
+                                                                            fast_route_elapsed(started),
+                                                                            samples,
+                                                                        );
+                                                                    }
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if let Some((routed, packet_len)) =
+                                                    expand_fast_alias_batch(
+                                                        &read_buf[..alias_batch.bytes],
+                                                        alias_batch,
+                                                        &fast_route_alias_layout,
+                                                        &topic,
+                                                        &mut fast_alias_egress,
+                                                    )
+                                                {
+                                                    read_buf.advance(alias_batch.bytes);
+                                                    let start = session.published_messages.fetch_add(
+                                                        alias_batch.messages,
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    let samples = sampled_sequences_in_range(
+                                                        start,
+                                                        alias_batch.messages,
+                                                        state.publish_route_latency_sample_rate
+                                                            as u64,
+                                                    );
+                                                    let route_started = (samples != 0)
+                                                        .then(fast_route_timestamp);
+                                                    let _ = state
+                                                        .send_bytes_batch_to_session(
+                                                            &target,
+                                                            routed,
+                                                            packet_len,
+                                                            alias_batch.messages as usize,
+                                                        )
+                                                        .await;
+                                                    if let Some(started) = route_started {
+                                                        state.publish_route_latency.record_repeated(
+                                                            fast_route_elapsed(started),
+                                                            samples,
+                                                        );
+                                                    }
+                                                    continue;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1105,7 +1367,8 @@ fn topic_contains_wildcard(topic: &str) -> bool {
 
 const CLIENT_READ_BUFFER_INITIAL: usize = 4 * 1024;
 const CLIENT_READ_BUFFER_MAX_HOT: usize = 128 * 1024;
-const CLIENT_READ_BUFFER_MAX_FAST_ALIAS: usize = 512 * 1024;
+const CLIENT_READ_BUFFER_MAX_FAST_ALIAS_INGEST: usize = 512 * 1024;
+const CLIENT_READ_BUFFER_MAX_FAST_ALIAS_ROUTE: usize = 128 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FastIngestBatch {
@@ -1117,6 +1380,7 @@ struct FastIngestBatch {
 struct FastIngestLayout {
     total_len: usize,
     topic: Option<Arc<str>>,
+    alias: Option<u16>,
     prefix: Vec<u8>,
     prefix32: [u8; 32],
     mask32: [u8; 32],
@@ -1133,6 +1397,7 @@ impl FastIngestLayout {
     #[inline]
     fn cache_prefix(&mut self, prefix: &[u8], total_len: usize) {
         self.total_len = total_len;
+        self.alias = None;
         self.prefix.clear();
         self.prefix.extend_from_slice(prefix);
         self.prefix32 = [0; 32];
@@ -1345,19 +1610,18 @@ impl FastExactRouteCache {
     }
 }
 
-fn resolve_fast_exact_route(
+fn resolve_fast_exact_route_topic(
     state: &BrokerState,
     publisher: &ClientSession,
-    layout: &FastIngestLayout,
+    topic: &str,
     cache: &mut FastExactRouteCache,
 ) -> Option<Arc<ClientSession>> {
-    let topic = layout.topic.as_ref()?;
     let route_epoch = state.router.mutation_epoch();
     let session_epoch = state.session_epoch.load(Ordering::Acquire);
 
     if cache.route_epoch == route_epoch
         && cache.session_epoch == session_epoch
-        && cache.topic.as_deref() == Some(topic.as_ref())
+        && cache.topic.as_deref() == Some(topic)
     {
         if let Some(target) = cache.target.as_ref() {
             if target.connected.load(Ordering::Acquire) {
@@ -1369,7 +1633,7 @@ fn resolve_fast_exact_route(
     cache.invalidate();
     cache.route_epoch = route_epoch;
     cache.session_epoch = session_epoch;
-    cache.topic = Some(topic.clone());
+    cache.topic = Some(Arc::<str>::from(topic));
 
     if !state.router.has_only_exact_routes() {
         return None;
@@ -1392,11 +1656,232 @@ fn resolve_fast_exact_route(
     Some(target)
 }
 
-/// Scans a contiguous run of the simplest valid MQTT v5 PUBLISH form used by the
-/// zero-route ingest path: QoS0, DUP=0, RETAIN=0, ASCII Topic Name, zero properties.
-/// Any other legal form falls back to the full codec; malformed forms are likewise
-/// left to the full codec so reason-code behavior remains centralized and unchanged.
-#[inline]
+fn resolve_fast_exact_route(
+    state: &BrokerState,
+    publisher: &ClientSession,
+    layout: &FastIngestLayout,
+    cache: &mut FastExactRouteCache,
+) -> Option<Arc<ClientSession>> {
+    resolve_fast_exact_route_topic(state, publisher, layout.topic.as_deref()?, cache)
+}
+
+#[derive(Default)]
+struct FastAliasRouteCache {
+    route_epoch: u64,
+    session_epoch: u64,
+    alias_epoch: u64,
+    alias: u16,
+    topic: Option<Arc<str>>,
+    target: Option<Arc<ClientSession>>,
+    outbound_alias: Option<u16>,
+    outbound_established: bool,
+}
+
+impl FastAliasRouteCache {
+    fn invalidate(&mut self) {
+        self.topic = None;
+        self.target = None;
+        self.outbound_alias = None;
+        self.outbound_established = false;
+    }
+}
+
+fn resolve_fast_alias_exact_route(
+    state: &BrokerState,
+    publisher: &ClientSession,
+    layout: &FastIngestLayout,
+    exact_cache: &mut FastExactRouteCache,
+    alias_cache: &mut FastAliasRouteCache,
+) -> Option<(Arc<ClientSession>, Arc<str>, Option<(u16, bool)>)> {
+    let alias = layout.alias?;
+    let route_epoch = state.router.mutation_epoch();
+    let session_epoch = state.session_epoch.load(Ordering::Acquire);
+    let alias_epoch = publisher.inbound_topic_alias_epoch();
+
+    if alias_cache.alias == alias
+        && alias_cache.route_epoch == route_epoch
+        && alias_cache.session_epoch == session_epoch
+        && alias_cache.alias_epoch == alias_epoch
+    {
+        if let (Some(topic), Some(target)) =
+            (alias_cache.topic.as_ref(), alias_cache.target.as_ref())
+        {
+            if target.connected.load(Ordering::Acquire) {
+                return Some((
+                    target.clone(),
+                    topic.clone(),
+                    alias_cache
+                        .outbound_alias
+                        .map(|outbound| (outbound, alias_cache.outbound_established)),
+                ));
+            }
+        }
+    }
+
+    alias_cache.invalidate();
+    alias_cache.alias = alias;
+    alias_cache.route_epoch = route_epoch;
+    alias_cache.session_epoch = session_epoch;
+    alias_cache.alias_epoch = alias_epoch;
+
+    let topic = {
+        let aliases = publisher.topic_aliases.read();
+        Arc::<str>::from(aliases.get(&alias)?.as_str())
+    };
+    let target = resolve_fast_exact_route_topic(state, publisher, &topic, exact_cache)?;
+    let outbound = target.outbound_topic_alias_for(&topic);
+    alias_cache.topic = Some(topic.clone());
+    alias_cache.target = Some(target.clone());
+    if let Some((outbound_alias, established)) = outbound {
+        alias_cache.outbound_alias = Some(outbound_alias);
+        alias_cache.outbound_established = established;
+    }
+    Some((target, topic, outbound))
+}
+
+#[derive(Debug, Default)]
+struct FastAliasEgressCache {
+    topic: Option<Arc<str>>,
+    input_total_len: usize,
+    payload_offset: usize,
+    packet_len: usize,
+    prefix: Vec<u8>,
+    prefix32: [u8; 32],
+    fast_prefix32: bool,
+}
+
+impl FastAliasEgressCache {
+    fn prepare(&mut self, topic: &Arc<str>, layout: &FastIngestLayout) -> Option<()> {
+        let payload_offset = layout.prefix.len();
+        if payload_offset > layout.total_len || topic.len() > u16::MAX as usize {
+            return None;
+        }
+        if self.topic.as_deref() == Some(topic.as_ref())
+            && self.input_total_len == layout.total_len
+            && self.payload_offset == payload_offset
+            && self.packet_len != 0
+        {
+            return Some(());
+        }
+
+        let payload_len = layout.total_len.checked_sub(payload_offset)?;
+        let remaining_len = 2usize
+            .checked_add(topic.len())?
+            .checked_add(1)?
+            .checked_add(payload_len)?;
+        if remaining_len > 268_435_455 {
+            return None;
+        }
+
+        self.prefix.clear();
+        self.prefix.reserve(1 + 4 + 2 + topic.len() + 1);
+        self.prefix.push(0x30);
+        crate::codec::encode_varint(remaining_len as u32, &mut self.prefix);
+        self.prefix
+            .extend_from_slice(&(topic.len() as u16).to_be_bytes());
+        self.prefix.extend_from_slice(topic.as_bytes());
+        self.prefix.push(0); // Topic Alias is connection-local and is not forwarded.
+        self.packet_len = self.prefix.len().checked_add(payload_len)?;
+        self.prefix32 = [0; 32];
+        self.fast_prefix32 = self.prefix.len() <= 32 && self.packet_len >= 32;
+        if self.fast_prefix32 {
+            self.prefix32[..self.prefix.len()].copy_from_slice(&self.prefix);
+        }
+        self.input_total_len = layout.total_len;
+        self.payload_offset = payload_offset;
+        self.topic = Some(topic.clone());
+        Some(())
+    }
+}
+
+fn expand_fast_alias_batch(
+    buf: &[u8],
+    batch: FastIngestBatch,
+    layout: &FastIngestLayout,
+    topic: &Arc<str>,
+    cache: &mut FastAliasEgressCache,
+) -> Option<(bytes::Bytes, usize)> {
+    cache.prepare(topic, layout)?;
+    let count = usize::try_from(batch.messages).ok()?;
+    if count == 0 || batch.bytes != layout.total_len.checked_mul(count)? || batch.bytes > buf.len()
+    {
+        return None;
+    }
+    let payload_len = layout.total_len.checked_sub(cache.payload_offset)?;
+    let output_len = cache.packet_len.checked_mul(count)?;
+    let mut output = Vec::<u8>::with_capacity(output_len);
+    unsafe { output.set_len(output_len) };
+
+    #[cfg(target_arch = "aarch64")]
+    if cache.fast_prefix32 && payload_len == 128 {
+        use std::arch::aarch64::{vld1q_u8, vst1q_u8};
+        unsafe {
+            let prefix0 = vld1q_u8(cache.prefix32.as_ptr());
+            let prefix1 = vld1q_u8(cache.prefix32.as_ptr().add(16));
+            let source = buf.as_ptr();
+            let destination = output.as_mut_ptr();
+            for index in 0..count {
+                let source_payload = source.add(index * layout.total_len + cache.payload_offset);
+                let dest_packet = destination.add(index * cache.packet_len);
+                vst1q_u8(dest_packet, prefix0);
+                vst1q_u8(dest_packet.add(16), prefix1);
+                for lane in 0..8usize {
+                    let value = vld1q_u8(source_payload.add(lane * 16));
+                    vst1q_u8(dest_packet.add(cache.prefix.len() + lane * 16), value);
+                }
+            }
+        }
+        return Some((bytes::Bytes::from(output), cache.packet_len));
+    }
+
+    unsafe {
+        let source = buf.as_ptr();
+        let destination = output.as_mut_ptr();
+        for index in 0..count {
+            let input_start = index * layout.total_len;
+            let dest_packet = destination.add(index * cache.packet_len);
+            std::ptr::copy_nonoverlapping(cache.prefix.as_ptr(), dest_packet, cache.prefix.len());
+            std::ptr::copy_nonoverlapping(
+                source.add(input_start + cache.payload_offset),
+                dest_packet.add(cache.prefix.len()),
+                payload_len,
+            );
+        }
+    }
+    Some((bytes::Bytes::from(output), cache.packet_len))
+}
+
+fn rewrite_fast_alias_batch(
+    buf: &[u8],
+    batch: FastIngestBatch,
+    layout: &FastIngestLayout,
+    outbound_alias: u16,
+) -> Option<bytes::Bytes> {
+    let count = usize::try_from(batch.messages).ok()?;
+    if count == 0
+        || layout.total_len == 0
+        || layout.prefix.len() < 2
+        || batch.bytes != layout.total_len.checked_mul(count)?
+        || batch.bytes > buf.len()
+    {
+        return None;
+    }
+    let alias_offset = layout.prefix.len().checked_sub(2)?;
+    if alias_offset + 2 > layout.total_len {
+        return None;
+    }
+    let mut output = buf[..batch.bytes].to_vec();
+    let alias = outbound_alias.to_be_bytes();
+    for index in 0..count {
+        let offset = index
+            .checked_mul(layout.total_len)?
+            .checked_add(alias_offset)?;
+        output[offset] = alias[0];
+        output[offset + 1] = alias[1];
+    }
+    Some(bytes::Bytes::from(output))
+}
+
 fn scan_zero_route_qos0_batch(
     buf: &[u8],
     maximum_packet_size: usize,
@@ -1618,6 +2103,7 @@ fn scan_zero_route_qos0_alias_batch(
         let prefix_end = prop_start + 4;
         layout.cache_prefix(&buf[offset..prefix_end], total);
         layout.topic = None;
+        layout.alias = Some(alias);
         messages += 1;
         offset += total;
     }
@@ -1789,10 +2275,7 @@ async fn process_client_packet(
                             )
                             .await;
                         }
-                        session
-                            .topic_aliases
-                            .write()
-                            .insert(alias, pkt.topic.to_string());
+                        session.set_inbound_topic_alias(alias, pkt.topic);
                         Cow::Borrowed(pkt.topic)
                     }
                 }
@@ -2407,6 +2890,89 @@ mod fast_ingest_tests {
         let stopped = scan_zero_route_qos0_alias_batch(&batch, 1024 * 1024, &mut layout, &session);
         assert_eq!(stopped.messages, 7);
         assert_eq!(stopped.bytes, 7 * packet_len);
+    }
+
+    #[test]
+    fn alias_fast_egress_expands_to_full_topic_and_preserves_variable_payloads() {
+        let tx = Arc::new(OutboundQueue::new(1));
+        let session = ClientSession::new(
+            "alias-egress".into(),
+            None,
+            true,
+            true,
+            true,
+            60,
+            u16::MAX,
+            268_435_455,
+            32,
+            0,
+            tx,
+        );
+        let topic = "bench/native/alias-egress";
+        session.topic_aliases.write().insert(1, topic.into());
+
+        let mut input = Vec::new();
+        let mut expected = Vec::new();
+        for lane in 0..16u8 {
+            let mut payload = [b'x'; 128];
+            payload[0] = lane;
+            input.extend_from_slice(&crate::codec::encode_publish_qos0_with_topic_alias(
+                "", &payload, 1,
+            ));
+            expected.extend_from_slice(&crate::codec::encode_publish_qos0(
+                topic, &payload, false, None,
+            ));
+        }
+
+        let mut layout = FastIngestLayout::default();
+        let batch = scan_zero_route_qos0_alias_batch(&input, 1024 * 1024, &mut layout, &session);
+        assert_eq!(batch.messages, 16);
+        assert_eq!(layout.alias, Some(1));
+        let resolved = Arc::<str>::from(topic);
+        let mut cache = FastAliasEgressCache::default();
+        let (expanded, packet_len) =
+            expand_fast_alias_batch(&input, batch, &layout, &resolved, &mut cache).unwrap();
+        assert_eq!(expanded.as_ref(), expected.as_slice());
+        assert_eq!(packet_len * 16, expected.len());
+    }
+
+    #[test]
+    fn alias_rewrite_changes_only_alias_and_preserves_payloads() {
+        let tx = Arc::new(OutboundQueue::new(1));
+        let session = ClientSession::new(
+            "alias-rewrite".into(),
+            None,
+            true,
+            true,
+            true,
+            60,
+            u16::MAX,
+            268_435_455,
+            32,
+            0,
+            tx,
+        );
+        session
+            .topic_aliases
+            .write()
+            .insert(1, "bench/rewrite".into());
+        let mut input = Vec::new();
+        let mut expected = Vec::new();
+        for lane in 0..16u8 {
+            let mut payload = [b'x'; 128];
+            payload[0] = lane;
+            input.extend_from_slice(&crate::codec::encode_publish_qos0_with_topic_alias(
+                "", &payload, 1,
+            ));
+            expected.extend_from_slice(&crate::codec::encode_publish_qos0_with_topic_alias(
+                "", &payload, 2,
+            ));
+        }
+        let mut layout = FastIngestLayout::default();
+        let batch = scan_zero_route_qos0_alias_batch(&input, 1024 * 1024, &mut layout, &session);
+        assert_eq!(batch.messages, 16);
+        let rewritten = rewrite_fast_alias_batch(&input, batch, &layout, 2).unwrap();
+        assert_eq!(rewritten.as_ref(), expected.as_slice());
     }
 
     #[test]

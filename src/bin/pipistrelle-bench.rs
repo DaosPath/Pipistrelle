@@ -56,6 +56,7 @@ struct Args {
     window: usize,
     mode: Mode,
     topic_alias: bool,
+    accept_topic_alias: u16,
     sendfile: bool,
     username: String,
     password: String,
@@ -94,6 +95,7 @@ struct Report {
     payload_bytes: usize,
     window: usize,
     topic_alias: bool,
+    accept_topic_alias: u16,
     sendfile: bool,
     elapsed_seconds: f64,
     messages_per_second: f64,
@@ -178,7 +180,12 @@ fn prepare_sendfile_client(
     let mut stream = std::net::TcpStream::connect((args.host.as_str(), args.port))?;
     stream.set_nodelay(true)?;
     let client_id = format!("pipistrelle_native_bench_{index}");
-    stream.write_all(&encode_connect(&client_id, &args.username, &args.password))?;
+    stream.write_all(&encode_connect(
+        &client_id,
+        &args.username,
+        &args.password,
+        args.accept_topic_alias,
+    ))?;
     let (header, body) = read_packet_sync(&mut stream)?;
     if header >> 4 != 2 || body.len() < 2 || body[1] != 0 {
         return Err(format!("CONNECT rejected: header=0x{header:02x}, body={body:?}").into());
@@ -311,6 +318,7 @@ fn run_sendfile_benchmark(args: &Args) -> Result<(), BenchError> {
         payload_bytes: args.payload_bytes,
         window: args.window,
         topic_alias: args.topic_alias,
+        accept_topic_alias: args.accept_topic_alias,
         sendfile: true,
         elapsed_seconds: elapsed,
         messages_per_second: if elapsed > 0.0 {
@@ -426,6 +434,7 @@ async fn main() -> Result<(), BenchError> {
         payload_bytes: args.payload_bytes,
         window: args.window,
         topic_alias: args.topic_alias,
+        accept_topic_alias: args.accept_topic_alias,
         sendfile: false,
         elapsed_seconds: elapsed,
         messages_per_second: if elapsed > 0.0 {
@@ -536,6 +545,7 @@ async fn run_worker_inner(
     let reader_received_notify = received_notify.clone();
     let reader_puback_notify = puback_notify.clone();
     let fast_qos0_loopback = args.mode == Mode::Loopback && args.qos == 0;
+    let accept_topic_alias = args.accept_topic_alias;
     let reader = tokio::spawn(async move {
         reader_loop(
             read_half,
@@ -545,6 +555,7 @@ async fn run_worker_inner(
             reader_received_notify,
             reader_puback_notify,
             fast_qos0_loopback,
+            accept_topic_alias,
         )
         .await
     });
@@ -649,7 +660,12 @@ async fn setup_client(
     let (mut stream, group) = open_stream(args).await?;
     let client_id = format!("pipistrelle_native_bench_{index}");
     stream
-        .write_all(&encode_connect(&client_id, &args.username, &args.password))
+        .write_all(&encode_connect(
+            &client_id,
+            &args.username,
+            &args.password,
+            args.accept_topic_alias,
+        ))
         .await?;
     let (header, body) = read_packet(&mut stream).await?;
     if header >> 4 != 2 || body.len() < 2 || body[1] != 0 {
@@ -722,6 +738,7 @@ async fn reader_loop<R, W>(
     received_notify: Arc<Notify>,
     puback_notify: Arc<Notify>,
     fast_qos0_loopback: bool,
+    accept_topic_alias: u16,
 ) -> Result<(), BenchError>
 where
     R: AsyncRead + Unpin,
@@ -730,6 +747,7 @@ where
     let mut read_buf = BytesMut::with_capacity(256 * 1024);
     let mut ack_batch = Vec::with_capacity(16 * 1024);
     let mut qos0_layout = FastQos0ReadLayout::default();
+    let mut server_topic_aliases = std::collections::HashMap::<u16, Vec<u8>>::new();
 
     loop {
         let n = reader.read_buf(&mut read_buf).await?;
@@ -762,7 +780,19 @@ where
                     let qos = (header >> 1) & 0x03;
                     received_batch += 1;
                     if fast_qos0_loopback && qos == 0 {
-                        qos0_layout.cache(&read_buf[..body_start], packet_len);
+                        let prefix_end = if accept_topic_alias != 0 {
+                            match validate_server_topic_alias(
+                                body,
+                                accept_topic_alias,
+                                &mut server_topic_aliases,
+                            )? {
+                                Some(payload_offset) => body_start + payload_offset,
+                                None => body_start,
+                            }
+                        } else {
+                            body_start
+                        };
+                        qos0_layout.cache(&read_buf[..prefix_end], packet_len);
                     }
                     if qos == 1 {
                         if let Some(packet_id) = parse_publish_packet_id(body, qos)? {
@@ -795,33 +825,43 @@ where
 #[derive(Debug, Default)]
 struct FastQos0ReadLayout {
     packet_len: usize,
-    fixed_header_len: usize,
-    fixed_header: [u8; 5],
+    prefix_len: usize,
+    prefix: [u8; 32],
     header_word: u32,
     header_mask: u32,
     scalar4: bool,
+    scalar9_word: u64,
+    scalar9_tail: u8,
+    scalar9: bool,
 }
 
 impl FastQos0ReadLayout {
-    fn cache(&mut self, fixed_header: &[u8], packet_len: usize) {
-        if fixed_header.is_empty() || fixed_header.len() > self.fixed_header.len() {
+    fn cache(&mut self, prefix: &[u8], packet_len: usize) {
+        if prefix.is_empty() || prefix.len() > self.prefix.len() || packet_len < prefix.len() {
             self.packet_len = 0;
             return;
         }
         self.packet_len = packet_len;
-        self.fixed_header_len = fixed_header.len();
-        self.fixed_header = [0; 5];
-        self.fixed_header[..fixed_header.len()].copy_from_slice(fixed_header);
-        self.scalar4 = fixed_header.len() <= 4 && packet_len >= 4;
+        self.prefix_len = prefix.len();
+        self.prefix = [0; 32];
+        self.prefix[..prefix.len()].copy_from_slice(prefix);
+        self.scalar4 = prefix.len() <= 4 && packet_len >= 4;
         self.header_word = 0;
         self.header_mask = 0;
         if self.scalar4 {
             let mut word = [0u8; 4];
             let mut mask = [0u8; 4];
-            word[..fixed_header.len()].copy_from_slice(fixed_header);
-            mask[..fixed_header.len()].fill(0xff);
+            word[..prefix.len()].copy_from_slice(prefix);
+            mask[..prefix.len()].fill(0xff);
             self.header_word = u32::from_ne_bytes(word);
             self.header_mask = u32::from_ne_bytes(mask);
+        }
+        self.scalar9 = prefix.len() == 9 && packet_len >= 9;
+        self.scalar9_word = 0;
+        self.scalar9_tail = 0;
+        if self.scalar9 {
+            self.scalar9_word = u64::from_ne_bytes(prefix[..8].try_into().unwrap());
+            self.scalar9_tail = prefix[8];
         }
     }
 }
@@ -834,12 +874,30 @@ struct FastReadBatch {
 
 #[inline]
 fn scan_qos0_read_batch(buf: &[u8], layout: &FastQos0ReadLayout) -> FastReadBatch {
-    if layout.packet_len == 0 || layout.fixed_header_len == 0 {
+    if layout.packet_len == 0 || layout.prefix_len == 0 {
         return FastReadBatch::default();
     }
     let mut offset = 0usize;
     let mut messages = 0usize;
-    if layout.scalar4 {
+    if layout.scalar9 {
+        let sixteen = layout.packet_len.saturating_mul(16);
+        while offset + sixteen <= buf.len() {
+            let mut any = 0u64;
+            let mut tails = 0u8;
+            unsafe {
+                for lane in 0..16 {
+                    let ptr = buf.as_ptr().add(offset + lane * layout.packet_len);
+                    any |= std::ptr::read_unaligned(ptr.cast::<u64>()) ^ layout.scalar9_word;
+                    tails |= *ptr.add(8) ^ layout.scalar9_tail;
+                }
+            }
+            if any != 0 || tails != 0 {
+                break;
+            }
+            offset += sixteen;
+            messages += 16;
+        }
+    } else if layout.scalar4 {
         let sixteen = layout.packet_len.saturating_mul(16);
         while offset + sixteen <= buf.len() {
             let mut any = 0u32;
@@ -858,15 +916,18 @@ fn scan_qos0_read_batch(buf: &[u8], layout: &FastQos0ReadLayout) -> FastReadBatc
         }
     }
     while offset + layout.packet_len <= buf.len() {
-        if layout.scalar4 {
+        let matches = if layout.scalar9 {
+            let ptr = unsafe { buf.as_ptr().add(offset) };
+            let word = unsafe { std::ptr::read_unaligned(ptr.cast::<u64>()) };
+            word == layout.scalar9_word && unsafe { *ptr.add(8) } == layout.scalar9_tail
+        } else if layout.scalar4 {
             let actual =
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(offset).cast::<u32>()) };
-            if ((actual ^ layout.header_word) & layout.header_mask) != 0 {
-                break;
-            }
-        } else if buf[offset..offset + layout.fixed_header_len]
-            != layout.fixed_header[..layout.fixed_header_len]
-        {
+            ((actual ^ layout.header_word) & layout.header_mask) == 0
+        } else {
+            buf[offset..offset + layout.prefix_len] == layout.prefix[..layout.prefix_len]
+        };
+        if !matches {
             break;
         }
         offset += layout.packet_len;
@@ -878,8 +939,84 @@ fn scan_qos0_read_batch(buf: &[u8], layout: &FastQos0ReadLayout) -> FastReadBatc
     }
 }
 
-/// Returns fixed header, body offset and total packet length when a complete MQTT
-/// packet is already buffered. Parsing never allocates and handles partial varints.
+fn validate_server_topic_alias(
+    body: &[u8],
+    maximum: u16,
+    mappings: &mut std::collections::HashMap<u16, Vec<u8>>,
+) -> io::Result<Option<usize>> {
+    if body.len() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short PUBLISH body",
+        ));
+    }
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let topic_end = 2usize
+        .checked_add(topic_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "topic length overflow"))?;
+    if topic_end >= body.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short PUBLISH topic",
+        ));
+    }
+    let mut pos = topic_end;
+    let (properties_len, properties_len_bytes) = decode_bench_varint(&body[pos..])?;
+    pos += properties_len_bytes;
+    let properties_end = pos
+        .checked_add(properties_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "property length overflow"))?;
+    if properties_end > body.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short PUBLISH properties",
+        ));
+    }
+    if properties_len == 0 {
+        return Ok(None);
+    }
+    if properties_len != 3 || body[pos] != 0x23 {
+        return Ok(None);
+    }
+    let alias = u16::from_be_bytes([body[pos + 1], body[pos + 2]]);
+    if alias == 0 || alias > maximum {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid server Topic Alias",
+        ));
+    }
+    let topic = &body[2..topic_end];
+    if topic.is_empty() {
+        if !mappings.contains_key(&alias) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "server used Topic Alias before mapping",
+            ));
+        }
+    } else {
+        mappings.insert(alias, topic.to_vec());
+    }
+    Ok(Some(properties_end))
+}
+
+fn decode_bench_varint(input: &[u8]) -> io::Result<(usize, usize)> {
+    let mut value = 0usize;
+    let mut multiplier = 1usize;
+    for (index, &byte) in input.iter().take(4).enumerate() {
+        value = value
+            .checked_add(((byte & 0x7f) as usize).saturating_mul(multiplier))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "varint overflow"))?;
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+        multiplier = multiplier.saturating_mul(128);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "malformed varint",
+    ))
+}
+
 fn try_packet_bounds(buf: &[u8]) -> io::Result<Option<(u8, usize, usize)>> {
     if buf.len() < 2 {
         return Ok(None);
@@ -964,13 +1101,24 @@ where
     ))
 }
 
-fn encode_connect(client_id: &str, username: &str, password: &str) -> Vec<u8> {
+fn encode_connect(
+    client_id: &str,
+    username: &str,
+    password: &str,
+    accept_topic_alias: u16,
+) -> Vec<u8> {
     let mut body = Vec::new();
     put_utf8(&mut body, "MQTT");
     body.push(5);
     body.push(0x02 | 0x80 | 0x40); // clean start + username + password
     body.extend_from_slice(&60u16.to_be_bytes());
-    body.push(0); // CONNECT properties length
+    let mut properties = Vec::new();
+    if accept_topic_alias != 0 {
+        properties.push(0x22); // Topic Alias Maximum
+        properties.extend_from_slice(&accept_topic_alias.to_be_bytes());
+    }
+    encode_varint(properties.len(), &mut body);
+    body.extend_from_slice(&properties);
     put_utf8(&mut body, client_id);
     put_utf8(&mut body, username);
     put_binary(&mut body, password.as_bytes());
@@ -1223,6 +1371,7 @@ fn parse_args() -> Result<Args, BenchError> {
         window: 1024,
         mode: Mode::Loopback,
         topic_alias: false,
+        accept_topic_alias: 0,
         sendfile: false,
         username: env::var("PIPISTRELLE_BENCH_USER").unwrap_or_else(|_| "admin".to_string()),
         password: env::var("PIPISTRELLE_BENCH_PASSWORD").unwrap_or_else(|_| "admin123".to_string()),
@@ -1257,6 +1406,7 @@ fn parse_args() -> Result<Args, BenchError> {
             "--window" => args.window = value(&mut i)?.parse()?,
             "--mode" => args.mode = Mode::parse(value(&mut i)?)?,
             "--topic-alias" => args.topic_alias = true,
+            "--accept-topic-alias" => args.accept_topic_alias = value(&mut i)?.parse()?,
             "--sendfile" => args.sendfile = true,
             "--username" => args.username = value(&mut i)?.to_string(),
             "--password" => args.password = value(&mut i)?.to_string(),
@@ -1320,6 +1470,7 @@ fn print_help() {
          --qos 0|1                MQTT QoS (default 0)\n\
          --window N               batch/in-flight window (default 1024)\n\
          --topic-alias            use MQTT 5 Topic Alias after first counted PUBLISH\n\
+         --accept-topic-alias N   advertise Server->Client Topic Alias Maximum (0 disables)\n\
          --sendfile               Linux ingest backend: memfd -> TCP sendfile for QoS0\n\
          --host HOST              broker host (default 127.0.0.1)\n\
          --port PORT              broker port (1883 TCP, 8883 TLS)\n\
@@ -1348,6 +1499,42 @@ mod tests {
         for cut in 0..packet.len() {
             assert_eq!(try_packet_bounds(&packet[..cut]).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn connect_can_advertise_server_to_client_topic_alias_maximum() {
+        let packet = encode_connect("client", "user", "pass", 7);
+        let (_, body_start, packet_len) = try_packet_bounds(&packet).unwrap().unwrap();
+        let body = &packet[body_start..packet_len];
+        // MQTT(6 bytes) + level + flags + keepalive = 10 bytes before properties.
+        let properties_len = body[10] as usize;
+        assert_eq!(properties_len, 3);
+        assert_eq!(&body[11..14], &[0x22, 0x00, 0x07]);
+    }
+
+    #[test]
+    fn server_topic_alias_requires_mapping_before_reuse() {
+        let mut mappings = std::collections::HashMap::new();
+        let unmapped = encode_publish_topic_alias("", b"x", 1);
+        let (_, body_start, packet_len) = try_packet_bounds(&unmapped).unwrap().unwrap();
+        assert!(
+            validate_server_topic_alias(&unmapped[body_start..packet_len], 8, &mut mappings)
+                .is_err()
+        );
+
+        let mapping = encode_publish_topic_alias("bench/native/1", b"x", 1);
+        let (_, body_start, packet_len) = try_packet_bounds(&mapping).unwrap().unwrap();
+        assert!(
+            validate_server_topic_alias(&mapping[body_start..packet_len], 8, &mut mappings)
+                .unwrap()
+                .is_some()
+        );
+        let (_, body_start, packet_len) = try_packet_bounds(&unmapped).unwrap().unwrap();
+        assert!(
+            validate_server_topic_alias(&unmapped[body_start..packet_len], 8, &mut mappings)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
