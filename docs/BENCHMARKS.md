@@ -267,6 +267,29 @@ Controlled Orange Pi tuning reached a best short validated run of **38.981 M msg
 
 Release engineering in `2.1.2.3` also adds reproducible CI, RustSec/CodeQL security checks and a pinned Rust 1.98.0 toolchain.
 
+### 1T end-to-end endurance validation
+
+The final `2.1.2.3` Orange Pi validation ran two independent one-trillion-message endurance cases. This is a long-duration correctness and stability check, not a production capacity or SLA claim.
+
+Common workload:
+
+- **Target:** `1,000,000,000,000` MQTT v5 PUBLISH messages per run.
+- **Transport:** TCP loopback, native Rust/Tokio generator, no Python/Paho.
+- **Routing:** end-to-end loopback; each client publishes to a topic and receives the routed message back.
+- **Clients:** 16; `62,500,000,000` messages per client.
+- **Payload:** 128 bytes; QoS 0; Topic Alias enabled with `accept-topic-alias=1`.
+- **Order:** fresh `window=1280` run followed by a fresh `window=1024` run on the same Orange Pi.
+- **Accounting:** Prometheus `pipistrelle_messages_published_total` delta had to equal exactly 1T; the benchmark result also required `failures=0`.
+
+| Window | Duration | Throughput | Payload throughput | Prometheus delta | Failures | Peak RSS | Peak temp |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1280 | 26,992.242 s (7 h 29 min 52 s) | **37.048 M msg/s** | **4,522.422 MiB/s** | **1,000,000,000,000** | **0** | 191.9 MiB | 55 °C |
+| 1024 | 28,731.509 s (7 h 58 min 52 s) | **34.805 M msg/s** | **4,248.656 MiB/s** | **1,000,000,000,000** | **0** | 172.8 MiB | 57 °C |
+
+Both runs finished with `status=ok` and `bench_exit=0`. The release runner also returned `window_1280_runner_rc=0` and `window_1024_runner_rc=0`. The full local evidence is retained under `bench-results/v2.1.2.3/1t-hardened-series-20260828-040803-1cb2127/` (ignored by Git), including the exact-image hashes, start/end markers, Prometheus snapshots, telemetry and machine-readable summaries.
+
+These 1T results should not be compared directly with the short `38–39 M msg/s` tuning result, the earlier ~2B-message release baseline, or the separate ingest/`--sendfile` ceilings. They exercise the end-to-end routing path for many hours and are reported separately to keep workload semantics visible.
+
 ## V2 2.1.2.2 — Topic Alias end-to-end routing
 
 `2.1.2.2` adds Server→Client Topic Alias negotiation and a specialized exact-route fast path while preserving connection-local alias semantics. The receiving client must advertise a non-zero Topic Alias Maximum in CONNECT. The broker sends the first mapping as full Topic Name + alias and may then send zero-length Topic Name + alias. Publisher-side alias remaps invalidate the fast-route cache through a connection-local epoch.

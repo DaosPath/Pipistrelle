@@ -31,6 +31,19 @@ Los números de ingest y end-to-end representan datapaths distintos y se reporta
 
 ---
 
+### Validación de resistencia 1T en Orange Pi
+
+La versión `2.1.2.3` cerró la ronda con dos ejecuciones independientes de **1.000.000.000.000 de mensajes MQTT v5 QoS 0 end-to-end**. Cada ejecución usó 16 clientes, 62.500.000.000 mensajes por cliente, payload de 128 bytes, TCP loopback, Topic Alias y el generador nativo Rust/Tokio. El contador de Prometheus se comparó antes y después de cada corrida para confirmar exactamente 1T de mensajes publicados.
+
+| Ventana | Duración | Rendimiento | Payload | Resultado |
+| :--- | ---: | ---: | ---: | :--- |
+| `1280` | 7 h 29 min 52 s | **37.048 M msg/s** | **4.522 MiB/s** | **1T exacto · 0 fallos · 55 °C máx.** |
+| `1024` | 7 h 58 min 52 s | **34.805 M msg/s** | **4.249 MiB/s** | **1T exacto · 0 fallos · 57 °C máx.** |
+
+Las dos corridas terminaron con `status=ok`, `bench_exit=0` y deltas Prometheus exactos de `1.000.000.000.000`. El RSS máximo observado fue de **191,9 MiB** en la primera ventana y **172,8 MiB** en la segunda. Es una prueba de resistencia y corrección bajo una carga larga, no una promesa de capacidad de producción, latencia ni SLA. La metodología detallada está en [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); los artefactos locales se guardan bajo `bench-results/` y no se versionan.
+
+---
+
 ## <img src="https://api.iconify.design/lucide:rocket.svg?color=%233b82f6" width="24" height="24" style="vertical-align: middle; margin-right: 8px;" /> Características Destacadas
 
 *   **Arquitectura Zero-Copy & Concurrente:** El decodificador de paquetes (`src/codec.rs`) realiza cortes de memoria (*slices*) directamente del búfer de red utilizando tiempos de vida de Rust, minimizando las asignaciones de memoria y maximizando el rendimiento bajo alta concurrencia de clientes.
