@@ -1,177 +1,177 @@
-# Pipistrelle — Roadmap hacia 3.0.0.0
+# Pipistrelle — Roadmap to 3.0.0.0
 
-Este documento fija el plan de evolución de Pipistrelle desde la release estable actual `2.1.2.3` hasta `3.0.0.0`.
+This document defines Pipistrelle's evolution from the current stable release 2.1.2.3 to 3.0.0.0.
 
-La intención es evitar saltos de versión artificiales: cada minor de la serie `2.x` debe representar una etapa de producto claramente terminada. `3.0.0.0` queda reservado para el cambio arquitectónico mayor: Pipistrelle como plataforma MQTT distribuida, con clustering y alta disponibilidad estables.
+The goal is to avoid artificial version jumps: every minor release in the 2.x series must represent a clearly completed product stage. Version 3.0.0.0 is reserved for the major architectural change: Pipistrelle as a distributed MQTT platform with stable clustering and high availability.
 
-## Reglas del roadmap
+## Roadmap rules
 
-- La versión pública de Pipistrelle usa **cuatro componentes**: `MAJOR.MINOR.PATCH.BUILD`.
-- Cargo mantiene SemVer normal de tres componentes internamente.
-- No se avanza de etapa solo porque una feature “funcione”; cada release debe pasar sus gates de protocolo, persistencia, seguridad, integración y rendimiento.
-- No se sacrifica correctness MQTT, backpressure, seguridad o durabilidad para recuperar un benchmark.
-- Los fast-paths de QoS0 deben mantenerse aislados de trabajo que solo pertenece a rutas protocol-heavy.
-- `3.0.0.0` no se publica mientras clustering/HA siga siendo experimental.
+- Public Pipistrelle versions use **four components**: MAJOR.MINOR.PATCH.BUILD.
+- Cargo keeps standard three-component SemVer internally.
+- A stage does not advance merely because a feature works; every release must pass protocol, persistence, security, integration and performance gates.
+- MQTT correctness, backpressure, security and durability are never sacrificed to recover a benchmark.
+- QoS 0 fast paths must remain isolated from work that belongs only to protocol-heavy paths.
+- 3.0.0.0 is not published while clustering/HA remains experimental.
 
 ---
 
-## Baseline actual — 2.1.2.3
+## Current baseline — 2.1.2.3
 
-Estado actual publicado:
+Current published state:
 
 - MQTT v5 QoS 0/1/2.
 - Retained messages.
 - Last Will + Will Delay + crash persistence.
 - Persistent Sessions + Session Expiry.
-- ClientID takeover con `DISCONNECT 0x8E`.
+- ClientID takeover with DISCONNECT 0x8E.
 - Principal-bound Session hardening.
 - PUBLISH/Will application properties.
 - Message Expiry.
 - UNSUBSCRIBE / UNSUBACK.
-- Receive Maximum bilateral.
-- Maximum Packet Size bilateral.
+- Bilateral Receive Maximum.
+- Bilateral Maximum Packet Size.
 - Server-assigned ClientID.
-- CONNECT fragmentado sobre TCP.
-- Validación MQTT UTF-8 / varint más estricta.
-- TLS 1.3 + perfil híbrido PQC `X25519MLKEM768`.
-- Prometheus, `/health`, `/info`.
-- Colas bounded, backpressure, slow-consumer policy.
+- Fragmented CONNECT parsing over TCP.
+- Strict MQTT UTF-8 / variable-byte-integer validation.
+- TLS 1.3 + hybrid PQC profile X25519MLKEM768.
+- Prometheus, /health and /info.
+- Bounded queues, backpressure and slow-consumer policy.
 - Bounded bridge queue.
-- Topic Alias bidireccional por Network Connection: máximo Client→Server anunciado en CONNACK y máximo Server→Client respetando lo anunciado por el peer en CONNECT; mapping/remap/reset connection-local.
-- Fast-path ARM64/NEON de ingest QoS0 aislado del routing general.
-- SVE gather fast-path opcional para Topic Alias QoS0 E2E en Linux/AArch64, con fallback escalar exacto.
-- CI de protocolo/restart, RustSec, CodeQL y Dependabot como gates de ingeniería.
+- Bidirectional per-Network-Connection Topic Alias: Client→Server maximum advertised in CONNACK and Server→Client maximum respecting the peer's CONNECT advertisement; connection-local mapping/remap/reset.
+- Isolated ARM64/NEON QoS 0 ingest fast path.
+- Optional SVE gather fast path for Topic Alias QoS 0 E2E on Linux/AArch64, with exact scalar fallback.
+- Protocol/restart CI, RustSec, CodeQL and Dependabot engineering gates.
 
-Gates de referencia de la Orange Pi:
+Orange Pi reference gates:
 
-- QoS0 ingest full-topic: ~58 M msg/s nativo en el hot path validado. MQTT 5 Topic Alias: gate sostenido de 10B con mediana **163.550 M msg/s** en host normal y techo optimizado separado de **216.437 M msg/s** de mediana (3×10B, todas >200M).
-- QoS0 full-topic end-to-end: **33.415 M msg/s** en la regresión fresca de 500M. Topic Alias end-to-end: **35.184 M msg/s** de mediana en el release sostenido `2.1.2.2`; `2.1.2.3` elevó el tuning controlado a la zona ~38–39 M/s con un mejor run corto de **38.981 M/s**.
-- PQC híbrido operativo.
-- RAM del broker alrededor de ~100–150 MiB en los gates QoS0 actuales.
+- Full-topic QoS 0 ingest: approximately 58 M msg/s on the validated native hot path. MQTT 5 Topic Alias: sustained 10B gate with a median of **163.550 M msg/s** on the normal host and a separate optimized ceiling of **216.437 M msg/s** median (3×10B, all above 200M).
+- Full-topic QoS 0 end-to-end: **33.415 M msg/s** in the fresh 500M regression. Topic Alias end-to-end: **35.184 M msg/s** median in the sustained 2.1.2.2 release gate; 2.1.2.3 reached the controlled ~38–39 M/s tuning range with a best short run of **38.981 M/s**.
+- Hybrid PQC is operational.
+- Broker RAM is approximately 100–150 MiB in current QoS 0 gates.
 
 ---
 
-# 2.1.3.0 — Cierre MQTT 5 / compliance hardening
+# 2.1.3.0 — MQTT 5 completion / compliance hardening
 
-Objetivo: reducir la deuda restante del protocolo antes de entrar en features de producto.
+Objective: reduce remaining protocol debt before adding product features.
 
-## Trabajo principal
+## Main work
 
 - Enhanced AUTH state machine.
 - Authentication Method / Authentication Data.
-- AUTH packet y reason codes asociados.
+- AUTH packet and associated reason codes.
 - Request Problem Information.
 - Request Response Information.
-- Response Information cuando sea aplicable.
-- Server Reference / redirect semantics que decidamos soportar.
-- Revisión de todos los CONNECT/CONNACK singleton properties.
-- Revisión de reason codes por packet family.
-- Fuzzing del codec MQTT.
-- Corpus de malformed packets.
-- Shared subscription edge cases.
-- UTF-8 MQTT exhaustive corpus.
-- Packet Identifier lifecycle tests exhaustivos.
-- Disconnect/error matrix por violación de protocolo.
+- Response Information where applicable.
+- Server Reference / redirect semantics that we decide to support.
+- Review of all CONNECT/CONNACK singleton properties.
+- Review of reason codes by packet family.
+- MQTT codec fuzzing.
+- Malformed-packet corpus.
+- Shared-subscription edge cases.
+- Exhaustive MQTT UTF-8 corpus.
+- Exhaustive Packet Identifier lifecycle tests.
+- Disconnect/error matrix for protocol violations.
 
 ## Gates
 
-- Suite raw MQTT ampliada.
-- Fuzzing sin crashes/panics.
-- Malformed corpus reproducible.
-- No regresión de los gates 20M ingest / 2M end-to-end fuera de variación normal.
-- No declarar “MQTT v5 100% compliant” hasta validar contra una suite externa/interoperabilidad más amplia.
+- Expanded raw MQTT suite.
+- Fuzzing with no crashes or panics.
+- Reproducible malformed corpus.
+- No regression in the 20M ingest / 2M end-to-end gates beyond normal variance.
+- Do not declare “MQTT v5 100% compliant” until a broader external interoperability suite has been validated.
 
 ---
 
 # 2.2.0.0 — Management REST API
 
-Objetivo: convertir Pipistrelle de proceso broker a servicio administrable.
+Objective: turn Pipistrelle from a broker process into an administrable service.
 
-## API prevista
+## Planned API
 
-- Estado del broker.
-- Lista de clientes.
-- Cliente por ClientID.
-- Conexiones activas.
-- Sessions online/offline.
+- Broker status.
+- Client list.
+- Client by ClientID.
+- Active connections.
+- Online/offline Sessions.
 - Subscriptions.
 - Retained messages.
 - Pending Wills.
-- QoS inflight.
+- In-flight QoS state.
 - Slow consumers.
 - Bridge state.
-- Métricas resumidas.
-- Disconnect remoto de clientes.
-- Eliminar Session.
-- Eliminar retained message.
-- Inspección de configuración efectiva.
+- Summary metrics.
+- Remote client disconnect.
+- Session deletion.
+- Retained-message deletion.
+- Effective configuration inspection.
 
-## Seguridad
+## Security
 
-- API separada del listener MQTT.
-- Bind seguro por defecto.
-- Autenticación de administración.
-- RBAC básico para operaciones destructivas.
-- Audit log para cambios administrativos.
+- API separate from the MQTT listener.
+- Secure bind by default.
+- Administration authentication.
+- Basic RBAC for destructive operations.
+- Audit log for administrative changes.
 
 ## Gates
 
-- API versionada (`/api/v1`).
-- Ninguna operación destructiva sin auth.
-- Tests de concurrencia con clientes conectándose/desconectándose mientras se consulta la API.
-- La API no debe tomar locks globales largos que degraden routing.
+- Versioned API at /api/v1.
+- No destructive operation without authentication.
+- Concurrency tests with clients connecting/disconnecting while the API is queried.
+- The API must not hold long global locks that degrade routing.
 
 ---
 
 # 2.3.0.0 — Pipistrelle Control Center
 
-Objetivo: interfaz web operativa sobre la Management API.
+Objective: provide an operational web interface on top of the Management API.
 
-## Vistas principales
+## Main views
 
 - Overview.
-- Throughput actual.
+- Current throughput.
 - CPU / RAM.
 - Connections.
 - Sessions.
 - Subscriptions.
-- Retained.
-- QoS inflight.
+- Retained messages.
+- In-flight QoS.
 - Wills.
 - TLS / PQC handshakes.
 - Slow consumers.
 - Bridge status.
 
-## Cliente individual
+## Individual client view
 
 - ClientID.
-- Usuario/principal.
+- User/principal.
 - IP.
-- TLS / cipher / KX.
+- TLS / cipher / key exchange.
 - Session Expiry.
 - Subscriptions.
 - Queued messages.
-- QoS inflight.
+- In-flight QoS.
 - Last Will.
 - Disconnect.
 - Delete Session.
 
 ## Gates
 
-- UI usa exclusivamente API pública/estable.
-- Ninguna lógica crítica vive solo en frontend.
-- Funciona bien desde escritorio y móvil.
-- No expone secretos de configuración.
+- The UI uses only the public/stable API.
+- No critical logic lives only in the frontend.
+- Works well on desktop and mobile.
+- Does not expose configuration secrets.
 
 ---
 
 # 2.4.0.0 — Persistence Engine v2
 
-Objetivo: dejar de tratar SQLite por operación como solución definitiva para rutas QoS pesadas.
+Objective: stop treating one SQLite operation per message as the final solution for heavy QoS paths.
 
-Esta etapa es especialmente importante para recuperar QoS1/QoS2 sin relajar compliance.
+This stage is especially important for improving QoS1/QoS2 without relaxing compliance.
 
-## Arquitectura objetivo
+## Target architecture
 
 ```text
 MQTT state changes
@@ -185,78 +185,78 @@ batch writer
 storage backend
 ```
 
-## Trabajo principal
+## Main work
 
-- Capa de abstracción de persistence.
-- WAL propio o journal append-oriented.
-- Batching de commits.
+- Persistence abstraction layer.
+- Custom WAL or append-oriented journal.
+- Commit batching.
 - Group commit.
-- Menos fsync/transaction por mensaje.
-- Cola persistente ordenada.
-- Recovery determinista.
+- Fewer fsyncs/transactions per message.
+- Ordered persistent queue.
+- Deterministic recovery.
 - Compaction / cleanup.
-- Métricas de storage latency.
-- Métricas de queue depth.
-- Backpressure del storage.
-- Mantener compatibilidad/migración desde SQLite existente.
+- Storage-latency metrics.
+- Queue-depth metrics.
+- Storage backpressure.
+- Compatibility/migration from existing SQLite state.
 
 ## Gates
 
-- Crash recovery con SIGKILL.
-- Cero pérdida de estado ya ACKeado como durable.
-- QoS1/QoS2 mejoran claramente frente a `2.1.2.0`.
-- Recovery de millones de registros medible y documentado.
-- No introducir corrupción después de power-loss-style restart tests.
+- Crash recovery with SIGKILL.
+- Zero loss of state already acknowledged as durable.
+- Clear QoS1/QoS2 improvement over 2.1.2.0.
+- Measurable and documented recovery of millions of records.
+- No corruption after power-loss-style restart tests.
 
 ---
 
-# 2.5.0.0 — Seguridad avanzada / Enterprise Auth
+# 2.5.0.0 — Advanced Security / Enterprise Auth
 
-Objetivo: pasar de auth/ACL local sólido a una plataforma integrable con identidad empresarial.
+Objective: evolve from solid local auth/ACLs into an identity platform suitable for enterprise integration.
 
-## Backends previstos
+## Planned backends
 
 - File/local credentials.
 - SQL auth backend.
 - JWT.
 - OAuth2/OIDC validation.
 - mTLS certificate identity.
-- LDAP/Directory integration si aporta valor real.
-- Backend custom mediante extensión/WASM cuando exista.
+- LDAP/Directory integration if it provides real value.
+- Custom backend through an extension/WASM API when available.
 
 ## Authorization
 
 - Roles.
-- Policies por topic.
-- Variables como `${clientId}` / principal.
-- QoS permitidos.
-- retain permitido/no permitido.
-- shared subscription permitido/no permitido.
-- límites por principal.
+- Topic policies.
+- Variables such as clientId and principal.
+- Allowed QoS levels.
+- Retain allowed/denied.
+- Shared-subscription allowed/denied.
+- Per-principal limits.
 
-## Protección
+## Protection
 
 - Connection-rate limits.
 - Per-client publish-rate limits.
 - Subscription-rate limits.
-- Auth brute-force protection.
-- Certificate revocation strategy.
+- Authentication brute-force protection.
+- Certificate-revocation strategy.
 - Audit log.
 
 ## Gates
 
 - Fail closed.
-- Rotación de credenciales sin reinicio cuando sea posible.
-- Tests de privilege escalation.
-- ACL/session ownership no puede cruzar principals.
+- Credential rotation without restart where practical.
+- Privilege-escalation tests.
+- ACL/session ownership must never cross principals.
 
 ---
 
 # 2.6.0.0 — Backup / Restore / Disaster Recovery
 
-Objetivo: que un operador pueda proteger y reconstruir un broker en producción.
+Objective: allow an operator to protect and rebuild a production broker.
 
-## CLI objetivo
+## Target CLI
 
 ```text
 pipistrelle backup create
@@ -265,46 +265,45 @@ pipistrelle backup verify
 pipistrelle backup restore
 ```
 
-## Estado incluido
+## Included state
 
 - Sessions.
 - Subscriptions.
-- Retained.
+- Retained messages.
 - Wills.
-- QoS inflight.
-- Offline queues.
-- Metadata necesaria del persistence engine.
+- In-flight QoS state.
+- Metadata required by the persistence engine.
 
-## Trabajo adicional
+## Additional work
 
-- Backup consistente mientras el broker sigue operativo.
+- Consistent backup while the broker remains operational.
 - Checksums.
-- Formato versionado.
-- Restore dry-run.
-- Backup encryption opcional.
+- Versioned format.
+- Restore dry run.
+- Optional backup encryption.
 - Retention policies.
 
 ## Gates
 
-- Restore byte/semantic equivalent del estado.
-- Restore sobre una máquina nueva.
-- Prueba de desastre: borrar data dir → restore → clientes reanudan Session.
+- Byte/semantic-equivalent state after restore.
+- Restore onto a new machine.
+- Disaster test: delete the data directory, restore, then resume client Sessions.
 
 ---
 
-# 2.7.0.0 — Observabilidad y diagnóstico avanzado
+# 2.7.0.0 — Advanced observability and diagnostics
 
-Objetivo: que Pipistrelle sea fácil de operar bajo carga y fácil de depurar.
+Objective: make Pipistrelle easy to operate under load and easy to debug.
 
-## Trabajo principal
+## Main work
 
 - OpenTelemetry.
 - Structured tracing.
-- Per-client trace temporal.
-- Per-topic statistics opcionales/sampled.
-- Storage latency histograms.
+- Temporary per-client tracing.
+- Optional/sampled per-topic statistics.
+- Storage-latency histograms.
 - Routing latency.
-- Auth latency.
+- Authentication latency.
 - Queue depth.
 - Slow-consumer explorer.
 - Session churn.
@@ -312,7 +311,7 @@ Objetivo: que Pipistrelle sea fácil de operar bajo carga y fácil de depurar.
 - Bridge latency/reconnect state.
 - Diagnostic bundle.
 
-## Ejemplo de tooling
+## Tooling examples
 
 ```text
 pipistrelle trace client sensor-921
@@ -321,22 +320,22 @@ pipistrelle diagnose create
 
 ## Gates
 
-- Tracing disabled = impacto mínimo.
-- Sampling configurable.
-- Diagnostic bundle sin secretos.
-- Métricas documentadas y estables.
+- Tracing disabled means negligible impact.
+- Configurable sampling.
+- Diagnostic bundles contain no secrets.
+- Metrics are documented and stable.
 
 ---
 
 # 2.8.0.0 — Extension System / WASM
 
-Objetivo: crear un ecosistema de extensiones sin permitir que plugins arbitrarios comprometan el broker.
+Objective: build an extension ecosystem without allowing arbitrary plugins to compromise the broker.
 
-## Dirección preferida
+## Preferred direction
 
-**WASM sandboxed extensions**.
+**Sandboxed WASM extensions.**
 
-## Hooks iniciales
+## Initial hooks
 
 ```text
 on_connect
@@ -349,31 +348,31 @@ on_disconnect
 on_will
 ```
 
-## Requisitos
+## Requirements
 
-- Memory limit por plugin.
+- Memory limit per plugin.
 - CPU/fuel limit.
 - Timeout.
-- No acceso al filesystem/red por defecto.
+- No filesystem/network access by default.
 - Capability-based permissions.
-- Hot reload cuando sea seguro.
+- Hot reload where safe.
 - Versioned SDK.
-- Plugin crash no tumba Pipistrelle.
+- A plugin crash must not bring down Pipistrelle.
 
 ## Gates
 
-- Plugin infinito no bloquea routing.
-- Plugin panic/trap no tumba broker.
-- Hooks pueden desactivarse sin overhead apreciable.
-- ABI/SDK versionado.
+- An infinite plugin cannot block routing.
+- A plugin panic/trap cannot bring down the broker.
+- Hooks can be disabled without appreciable overhead.
+- ABI/SDK is versioned.
 
 ---
 
-# 2.9.0.0 — Clustering experimental / Beta
+# 2.9.0.0 — Experimental clustering / Beta
 
-Objetivo: primer Pipistrelle distribuido. **Todavía no HA estable ni 3.0.**
+Objective: build the first distributed Pipistrelle. **This is not stable HA or 3.0 yet.**
 
-## Fase 1 — Membership
+## Phase 1 — Membership
 
 - Node identity.
 - Discovery.
@@ -382,7 +381,7 @@ Objetivo: primer Pipistrelle distribuido. **Todavía no HA estable ni 3.0.**
 - Node join/leave.
 - Failure detection.
 
-## Fase 2 — Distributed routing
+## Phase 2 — Distributed routing
 
 ```text
 Publisher → Node A
@@ -391,20 +390,20 @@ Subscriber → Node C
         message arrives
 ```
 
-- Topic routing entre nodos.
+- Topic routing between nodes.
 - Subscription propagation.
-- Shared subscription ownership inicial.
+- Initial shared-subscription ownership.
 
-## Fase 3 — Session ownership
+## Phase 3 — Session ownership
 
 - ClientID owner node.
-- Takeover entre nodos.
+- Cross-node takeover.
 - Session location lookup.
-- Reconnect a nodo diferente.
+- Reconnect to a different node.
 
-## Fase 4 — Replicated state
+## Phase 4 — Replicated state
 
-- Retained.
+- Retained messages.
 - Sessions.
 - Subscriptions.
 - Offline queues.
@@ -412,20 +411,20 @@ Subscriber → Node C
 - Wills.
 - Session Expiry.
 
-## Estado esperado de 2.9
+## Expected 2.9 state
 
 - Experimental/beta.
-- Posibles restricciones documentadas.
-- No prometer zero-downtime todavía.
-- No llamar al cluster “production HA” hasta superar los gates de 3.0.
+- Documented limitations.
+- No zero-downtime promise yet.
+- Do not call the cluster “production HA” until it passes the 3.0 gates.
 
 ---
 
-# 3.0.0.0 — Clustering estable + High Availability
+# 3.0.0.0 — Stable clustering + High Availability
 
-`3.0.0.0` solo existe cuando el cluster deja de ser experimental.
+3.0.0.0 exists only when the cluster is no longer experimental.
 
-Este es el cambio de significado del producto:
+This is the product's change in meaning:
 
 ```text
 Pipistrelle 2.x
@@ -434,10 +433,10 @@ standalone MQTT broker
         ↓
 
 Pipistrelle 3.x
- distributed MQTT platform
+distributed MQTT platform
 ```
 
-## Arquitectura objetivo
+## Target architecture
 
 ```text
                  Load Balancer
@@ -451,100 +450,173 @@ Pipistrelle 3.x
               replicated state
 ```
 
-## Requisitos para poder llamarlo 3.0
+## Requirements for calling it 3.0
 
-### Alta disponibilidad
+### High availability
 
-- Muerte de un nodo no detiene el servicio completo.
-- Clientes pueden reconectar a otro nodo.
-- Session state recuperable desde otro nodo.
-- Retained sigue disponible.
-- Wills se manejan correctamente en node failure.
-- QoS1/QoS2 no se corrompen con failover.
+- Failure of one node does not stop the complete service.
+- Clients can reconnect to another node.
+- Session state is recoverable from another node.
+- Retained messages remain available.
+- Wills are handled correctly during node failure.
+- QoS1/QoS2 state is not corrupted by failover.
 
-### Routing distribuido
+### Distributed routing
 
-- Publisher y subscriber pueden estar en nodos distintos.
-- Wildcards funcionan cross-node.
-- Shared subscriptions tienen ownership/fairness bien definidos.
-- No hay loops de routing.
+- Publisher and subscriber can be on different nodes.
+- Wildcards work across nodes.
+- Shared subscriptions have well-defined ownership/fairness.
+- No routing loops.
 
-### Estado
+### State
 
-- Replicación con consistencia explícitamente documentada.
-- No split-brain silencioso.
-- Recovery tras partition.
+- Replication consistency is explicitly documented.
+- No silent split brain.
+- Recovery after partition.
 - Node rejoin.
-- Rebalance.
+- Rebalancing.
 
-### Operación
+### Operations
 
 - Rolling restart.
 - Rolling upgrade.
 - Node drain.
 - Cluster health API.
-- Replication lag metrics.
-- Backup/restore cluster-aware.
+- Replication-lag metrics.
+- Cluster-aware backup/restore.
 
-### Plataforma
+### Platform
 
-- Management API cluster-aware.
-- Control Center cluster-aware.
-- Security/policies consistentes en todos los nodos.
-- Extensions con modelo claro en cluster.
+- Cluster-aware Management API.
+- Cluster-aware Control Center.
+- Consistent security/policies on every node.
+- Clear extension behavior in a cluster.
 
-## Gate definitivo de 3.0
+## Definitive 3.0 gate
 
-Prueba mínima obligatoria:
+Minimum mandatory test:
 
 ```text
 Subscriber → Node C
 Publisher  → Node A
 
-mensaje A→C funciona
+A→C message delivery works
 
 SIGKILL Node A
 
-cluster sigue operativo
-publisher reconecta a Node B
-subscriber conserva Session
-retained sigue disponible
-QoS state continúa correctamente
+cluster remains operational
+publisher reconnects to Node B
+subscriber keeps its Session
+retained messages remain available
+QoS state continues correctly
 
-Node A vuelve
+Node A returns
 rejoin + sync
-sin split-brain
+no split brain
 ```
 
-Además:
+Also required:
 
-- Stress multi-node prolongado.
-- Network partition tests.
-- Packet loss/reordering en cluster bus.
+- Prolonged multi-node stress.
+- Network-partition tests.
+- Packet loss/reordering on the cluster bus.
 - Node crash loops.
-- Recovery de persistence.
-- Upgrade desde 2.9.x.
-- Benchmark distribuido documentado.
+- Persistence recovery.
+- Upgrade from 2.9.x.
+- Documented distributed benchmark.
 
-Solo después de estos gates se publica `3.0.0.0`.
-
----
-
-# Lo que NO debemos hacer antes de tiempo
-
-- No llamar `3.0` a un cluster que apenas conecta dos nodos.
-- No meter UI antes de tener Management API estable.
-- No meter Data Policies complejas antes de persistence/observability/cluster foundations.
-- No sacrificar MQTT correctness por benchmarks.
-- No sustituir bounded queues por unbounded queues para subir throughput.
-- No ocultar regresiones QoS1/QoS2 detrás de números QoS0.
-- No afirmar “MQTT v5 100% conforme” sin validación externa suficiente.
+Only after these gates may 3.0.0.0 be published.
 
 ---
 
-# Ideas posteriores o paralelas, no bloqueantes para 3.0
+# What we must NOT do too early
 
-Estas pueden entrar cuando su base correspondiente esté madura, pero no deben distraer de la secuencia principal:
+- Do not call a cluster that merely connects two nodes “3.0”.
+- Do not add a UI before the Management API is stable.
+- Do not add complex Data Policies before persistence, observability and cluster foundations.
+- Do not sacrifice MQTT correctness for benchmarks.
+- Do not replace bounded queues with unbounded queues to increase throughput.
+- Do not hide QoS1/QoS2 regressions behind QoS0 numbers.
+- Do not claim “MQTT v5 100% compliant” without sufficient external validation.
+
+---
+
+# Later or parallel ideas that do not block 3.0
+
+These can be introduced when their corresponding foundation is mature, but they must not distract from the main sequence:
+
+## Pipistrelle Edge AI — optional edge-inference specialization
+
+Objective: use local NPU accelerators to turn selected MQTT flows into inference pipelines without contaminating the main broker hot path.
+
+The product separation must remain explicit:
+
+```text
+Pipistrelle Core
+pure MQTT broker / maximum performance
+
+        + optional
+
+Pipistrelle Edge AI
+MQTT + accelerated local inference rules
+```
+
+The first implementation should prefer an **isolated sidecar or extension** over direct dataplane integration. Inference must never run inline in critical routing if it can block MQTT clients.
+
+### Target flow
+
+```text
+MQTT PUBLISH
+     ↓
+topic/rule match
+     ↓
+bounded inference queue
+     ↓
+NPU / accelerator backend
+     ↓
+local model
+     ↓
+result published back through MQTT
+```
+
+### Main work
+
+- NPU backend for Orange Pi 6 / CIX when the driver/runtime is stable in our Linux stack.
+- Accelerator-backend abstraction to avoid coupling Pipistrelle to one vendor.
+- topic → model → output-topic rules.
+- Local model registry and safe hot reload.
+- Optional batching by model.
+- Inference timeouts.
+- Bounded queues and backpressure separate from normal MQTT outbound queues.
+- Explicit optional CPU fallback.
+- Metrics for inferences/s, p50/p95/p99 latency, queue depth, timeouts and failures.
+
+### Initial use cases
+
+- Camera → object detection → detections topic.
+- Audio → event classification → alerts topic.
+- Industrial telemetry → anomaly detection → incident topic.
+- Sensors → local classification/prediction → derived topic.
+- Compatible payloads → embeddings/classification → MQTT result.
+
+### Preferred integration
+
+After 2.8.0.0, Edge AI should be able to live as an isolated extension/capability: on_publish selects the work, inference runs outside the broker's critical executor and the result returns through a stable internal API.
+
+### Mandatory gates
+
+- Edge AI disabled means negligible impact on Pipistrelle Core.
+- A failing model/NPU/runtime cannot bring down the broker.
+- No inference queue may be unbounded.
+- A slow model cannot block MQTT routing for unrelated clients.
+- Overload/backpressure policy is explicit and tested.
+- Core and Edge AI benchmarks are reported separately; TOPS must not be mixed with MQTT msg/s.
+- Prolonged soak tests with active inference are required before production readiness.
+- Validate at least one real end-to-end pipeline: PUBLISH → NPU inference → result PUBLISH.
+
+This line does not replace Pipistrelle Core. It is a specialization for edge deployments where MQTT networking and local inference share one node.
+
+Additional possible work:
 
 - JSON Schema validation.
 - Protobuf schema validation.
@@ -555,30 +627,31 @@ Estas pueden entrar cuando su base correspondiente esté madura, pero no deben d
 - Cloud bridge packs.
 - Helm chart.
 - Kubernetes Operator.
-- Multi-arch release automation.
-- Optional post-quantum signatures cuando exista interoperabilidad práctica suficiente.
+- Multi-architecture release automation.
+- Optional post-quantum signatures when practical interoperability is available.
 
 ---
 
-# Resumen de versiones
+# Version summary
 
-| Versión | Objetivo principal |
+| Version | Primary objective |
 |---|---|
-| `2.1.2.0` | MQTT flow-control/compliance sólido |
-| `2.1.2.1` | Topic Alias inbound + >200M/s optimized ingest ceiling |
-| `2.1.2.2` | Topic Alias bidireccional + ~35M/s E2E fast-route |
-| `2.1.2.3` | Baseline actual: SVE Topic Alias E2E + CI/security hardening (~38–39M/s tuning) |
-| `2.1.3.0` | Cierre restante de MQTT 5 + fuzzing/compliance |
-| `2.2.0.0` | Management REST API |
-| `2.3.0.0` | Control Center / Web UI |
-| `2.4.0.0` | Persistence Engine v2 / WAL / batching |
-| `2.5.0.0` | Seguridad avanzada / enterprise auth / quotas |
-| `2.6.0.0` | Backup, restore y disaster recovery |
-| `2.7.0.0` | Observabilidad, tracing y diagnóstico |
-| `2.8.0.0` | Extensiones WASM sandboxed |
-| `2.9.0.0` | Clustering experimental / beta |
-| `3.0.0.0` | Clustering estable + High Availability |
+| 2.1.2.0 | Solid MQTT flow control/compliance |
+| 2.1.2.1 | Inbound Topic Alias + >200M/s optimized ingest ceiling |
+| 2.1.2.2 | Bidirectional Topic Alias + ~35M/s E2E fast route |
+| 2.1.2.3 | Current baseline: SVE Topic Alias E2E + CI/security hardening (~38–39M/s tuning) |
+| 2.1.3.0 | Remaining MQTT 5 completion + fuzzing/compliance |
+| 2.2.0.0 | Management REST API |
+| 2.3.0.0 | Control Center / Web UI |
+| 2.4.0.0 | Persistence Engine v2 / WAL / batching |
+| 2.5.0.0 | Advanced security / enterprise auth / quotas |
+| 2.6.0.0 | Backup, restore and disaster recovery |
+| 2.7.0.0 | Observability, tracing and diagnostics |
+| 2.8.0.0 | Sandboxed WASM extensions |
+| 2.9.0.0 | Experimental / beta clustering |
+| 3.0.0.0 | Stable clustering + High Availability |
+| Edge AI | Parallel specialization: MQTT + accelerated local NPU inference without contaminating Core |
 
 ---
 
-Este roadmap es deliberadamente secuencial. Las versiones pueden recibir builds/patches intermedios (`2.4.0.1`, `2.4.0.2`, etc.) sin consumir un nuevo minor mientras una etapa todavía se está endureciendo.
+This roadmap is deliberately sequential. Versions may receive intermediate builds/patches such as 2.4.0.1 or 2.4.0.2 without consuming a new minor version while a stage is still being hardened.
